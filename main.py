@@ -197,6 +197,7 @@ def main() -> None:
     from desktop_pet.pet_window import PetWindow
     from desktop_pet.speech_bubble import SpeechBubble
     from desktop_pet.heard_text import HeardText
+    from desktop_pet.countdown_timer import CountdownTimer
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -394,6 +395,9 @@ def main() -> None:
     heard_text = HeardText()
     heard_text.set_anchor_widget(pet_window)
 
+    countdown = CountdownTimer()
+    countdown.set_anchor_widget(pet_window)
+
     # ── Connect signals → slots ──────────────────────────────────────────────
 
     def _on_state_changed(state_name: str) -> None:
@@ -480,6 +484,8 @@ def main() -> None:
     pet_controller.move_to.connect(_on_move_to, Qt.QueuedConnection)
     pet_controller.grab_run_start.connect(pet_window.start_grab_run, Qt.QueuedConnection)
     pet_controller.grab_run_stop.connect(pet_window.stop_grab_run, Qt.QueuedConnection)
+    pet_controller.countdown_start.connect(countdown.start_countdown, Qt.QueuedConnection)
+    pet_controller.countdown_stop.connect(countdown.stop_countdown, Qt.QueuedConnection)
 
     # Wire cursor grab callback to agent loop (defined after both exist)
     if agent_loop:

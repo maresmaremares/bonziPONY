@@ -438,6 +438,7 @@ class AgentLoop:
         self._mess_mouse_count = 0
         if self._enforcement.active:
             self._enforcement = EnforcementMode()
+            self._hide_countdown()
             logger.info("Enforcement cleared along with directives.")
         if count:
             logger.info("All %d directive(s) cleared.", count)
@@ -521,6 +522,9 @@ class AgentLoop:
         self.save_directives()
         logger.info("Enforcement mode started: %.0fs for %r", duration_s, directive_goal)
         print(f"[ENFORCEMENT STARTED] Monitoring for {duration_s:.0f}s — goal: \"{directive_goal}\"")
+        # Show countdown timer on the pet
+        if self._robot and hasattr(self._robot, 'countdown_start'):
+            self._robot.countdown_start.emit(int(duration_s))
 
     def _check_enforcement(self) -> None:
         """Enforcement mode — IMMEDIATELY detect any mouse/keyboard input, ask if done."""
@@ -642,6 +646,7 @@ class AgentLoop:
                 logger.info("Enforcement completed: %r", goal)
                 break
         self._enforcement = EnforcementMode()
+        self._hide_countdown()
         self.save_directives()
         self._llm.inject_history(
             f"(User confirmed they completed \"{goal}\" during enforcement.)",
@@ -732,6 +737,7 @@ class AgentLoop:
                     if any(kw in response_lower for kw in _STOP):
                         self._speak("ugh, fine. but you still need to do it.")
                         self._enforcement = EnforcementMode()
+                        self._hide_countdown()
                         self.save_directives()
                         return
 
@@ -1684,6 +1690,11 @@ class AgentLoop:
             logger.info("Routine fired [%s]: %r", schedule_desc, r.goal)
 
     # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _hide_countdown(self) -> None:
+        """Hide the countdown timer on the pet."""
+        if self._robot and hasattr(self._robot, 'countdown_stop'):
+            self._robot.countdown_stop.emit()
 
     def _log_action(self, description: str) -> None:
         """Record an action for context in future ticks."""

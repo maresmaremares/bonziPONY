@@ -64,6 +64,8 @@ class PetController(QObject):
     move_to = pyqtSignal(str)               # screen region name
     grab_run_start = pyqtSignal()           # start grab-cursor run animation
     grab_run_stop = pyqtSignal()            # stop grab-cursor run animation
+    countdown_start = pyqtSignal(int)       # start countdown timer (seconds)
+    countdown_stop = pyqtSignal()           # hide countdown timer
 
     def __init__(self) -> None:
         super().__init__()
