@@ -40,6 +40,7 @@ vision:
   device_index: 0              # webcam index (0 = default camera)
   screen_capture: true         # enable screenshot capture
   screen_max_width: 1280       # downscale screenshots to this width
+  screen_vision: api           # "api" = LLM describe_screen, "moondream" = local model (~2GB RAM)
 
 conversation:
   timeout_s: 60                # seconds to stay in conversation mode after speaking

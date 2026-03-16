@@ -78,6 +78,7 @@ class VisionConfig:
     device_index: int = 0
     screen_capture: bool = True
     screen_max_width: int = 1280
+    screen_vision: str = "api"  # "api" = main LLM describe_screen, "moondream" = local model
 
 
 @dataclass
@@ -242,6 +243,7 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
             device_index=vision_raw.get("device_index", 0),
             screen_capture=vision_raw.get("screen_capture", True),
             screen_max_width=vision_raw.get("screen_max_width", 1280),
+            screen_vision=vision_raw.get("screen_vision", "api"),
         ),
         robot=RobotConfig(
             enabled=robot_raw.get("enabled", False),

@@ -142,6 +142,7 @@ class Pipeline:
                     self._on_conversation_end()
                 except Exception:
                     pass
+            self._transition(PipelineState.IDLE)
             return
 
         # If LLM signaled end on first turn (e.g. user said "goodnight")
@@ -700,8 +701,9 @@ class Pipeline:
         """Inject screen or camera vision based on context.
 
         - Webcam: ONLY when user explicitly asks (camera keywords).
-        - Screen (main LLM): ONLY when user explicitly asks (screen keywords).
-        - Moondream (local): every message — cheap background screen context.
+        - Screen: when user explicitly asks, or randomly for background context.
+        - Vision provider controlled by config.vision.screen_vision:
+          "api" = main LLM describe_screen, "moondream" = local model.
         """
         text_lower = user_text.lower()
 
@@ -710,17 +712,25 @@ class Pipeline:
         if camera_triggered and self.config.vision.enabled:
             return self._inject_camera_vision(user_text)
 
-        # Check if user explicitly asked about screen — use the main LLM for quality
+        # Check if user explicitly asked about screen — always use main LLM for explicit requests
         screen_triggered = any(kw in text_lower for kw in self._SCREEN_KEYWORDS)
         if screen_triggered and self.config.vision.screen_capture:
             return self._inject_screen(user_text)
 
-        # 20% main LLM screenshot, 80% Moondream
+        # Background screen context — only if screen capture is enabled
         if not self.config.vision.screen_capture:
             return user_text
-        if random.random() < 0.2 and hasattr(self.llm, "describe_screen"):
+
+        use_moondream = self.config.vision.screen_vision == "moondream"
+
+        if use_moondream and self.moondream and self.moondream.loaded:
+            return self._inject_moondream_screen(user_text)
+
+        # API mode: 20% chance per message to keep costs down
+        if not use_moondream and random.random() < 0.2 and hasattr(self.llm, "describe_screen"):
             return self._inject_screen(user_text)
-        return self._inject_moondream_screen(user_text)
+
+        return user_text
 
     def _inject_camera_vision(self, user_text: str) -> str:
         """Inject webcam image description into user text."""
@@ -798,7 +808,8 @@ class Pipeline:
                 return
 
             description = None
-            if self.moondream and self.moondream.available:
+            use_moondream = self.config.vision.screen_vision == "moondream"
+            if use_moondream and self.moondream and self.moondream.loaded:
                 description = self.moondream.describe(jpeg)
             elif hasattr(self.llm, "describe_screen"):
                 description = self.llm.describe_screen(jpeg)

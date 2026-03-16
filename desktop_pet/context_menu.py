@@ -639,6 +639,10 @@ class ContextMenuBuilder:
                          lambda c: self._set("vision", "screen_capture", c))
         self._add_toggle(feat_menu, "Webcam", cfg.vision.enabled,
                          lambda c: self._set("vision", "enabled", c))
+        self._radio_submenu(feat_menu, "Screen Vision", [
+            ("API (LLM)", "api"),
+            ("Moondream (Local)", "moondream"),
+        ], cfg.vision.screen_vision, lambda v: self._set_screen_vision(v))
 
         menu.addSeparator()
 
@@ -735,6 +739,9 @@ class ContextMenuBuilder:
         update_act = menu.addAction("Check for Updates...")
         update_act.triggered.connect(lambda: self._check_for_updates(parent))
 
+        restart_act = menu.addAction("Restart")
+        restart_act.triggered.connect(self._restart)
+
         quit_act = menu.addAction("Quit")
         quit_act.triggered.connect(self.on_quit if self.on_quit else QApplication.quit)
 
@@ -785,6 +792,17 @@ class ContextMenuBuilder:
         setattr(obj, key, value)
         _save_yaml_value(f"{section}.{key}", value, self.config_path)
         logger.info("Config: %s.%s = %s", section, key, value)
+
+    def _set_screen_vision(self, provider: str) -> None:
+        """Switch between API and Moondream screen vision.  Requires restart for Moondream."""
+        self._set("vision", "screen_vision", provider)
+        if provider == "moondream":
+            QMessageBox.information(
+                None, "Screen Vision",
+                "Moondream (local) selected.\n\n"
+                "Requires ~2 GB RAM and the 'transformers' package.\n"
+                "Restart the app to load the model.",
+            )
 
     def _set_conversation_only(self, enabled: bool) -> None:
         """Toggle conversation-only mode: disable all computer control features."""
@@ -1212,6 +1230,14 @@ class ContextMenuBuilder:
                 subprocess.Popen(["notepad", str(p)])
             except Exception as exc:
                 logger.warning("Failed to open %s: %s", path, exc)
+
+    # ── Restart ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _restart() -> None:
+        """Restart the application."""
+        from core.updater import restart_application
+        restart_application()
 
     # ── Self-updater ─────────────────────────────────────────────────────
 

@@ -190,6 +190,7 @@ class AgentLoop:
         transcriber=None,
         tts_config=None,
         moondream=None,
+        vision_config=None,
     ) -> None:
         self._config = config
         self._monitor = screen_monitor
@@ -204,6 +205,7 @@ class AgentLoop:
         self._screen = screen_capture  # optional, for occasional screenshots
         self._moondream = moondream    # optional, cheap local vision model
         self._transcriber = transcriber  # for enforcement mic listening
+        self._vision_config = vision_config  # for screen_vision setting
 
         self.directives: List[Directive] = []
         self._action_log: List[str] = []         # recent actions, capped at 15
@@ -1482,8 +1484,9 @@ class AgentLoop:
     def _maybe_grab_screenshot(self) -> Optional[str]:
         """Occasionally take a screenshot for richer context. Returns description or None.
 
-        Uses Moondream (local) when available to avoid burning API calls.
-        Falls back to the main LLM's describe_screen if Moondream isn't loaded.
+        Respects vision.screen_vision setting:
+        - "moondream": use local model (only if loaded), fall back to API
+        - "api": always use the main LLM's describe_screen
         """
         if self._screen is None:
             return None
@@ -1493,15 +1496,17 @@ class AgentLoop:
             jpeg = self._screen.grab()
             if jpeg is None:
                 return None
-            # 80% main LLM for detail, 20% Moondream to save some calls
-            if random.random() < 0.8 and hasattr(self._llm, "describe_screen"):
-                description = self._llm.describe_screen(jpeg)
-            elif self._moondream and self._moondream.available:
+
+            use_moondream = (
+                self._vision_config
+                and getattr(self._vision_config, "screen_vision", "api") == "moondream"
+            )
+            description = None
+            if use_moondream and self._moondream and self._moondream.loaded:
                 description = self._moondream.describe(jpeg)
             elif hasattr(self._llm, "describe_screen"):
                 description = self._llm.describe_screen(jpeg)
-            else:
-                return None
+
             if description:
                 logger.info("Agent screenshot: %s", description)
             return description

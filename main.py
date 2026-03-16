@@ -162,10 +162,11 @@ def main() -> None:
             screen = None
 
     moondream = None
-    if screen:
+    if screen and config.vision.screen_vision == "moondream":
         try:
             from vision.moondream import MoondreamDescriber
             moondream = MoondreamDescriber(use_gpu=config.watch_mode.use_gpu if config.watch_mode else False)
+            moondream.start_background_load()
         except Exception as exc:
             logger.warning("Moondream not available: %s", exc)
             moondream = None
@@ -247,6 +248,7 @@ def main() -> None:
             transcriber=transcriber,
             tts_config=config.tts,
             moondream=moondream,
+            vision_config=config.vision,
         )
 
     # Prune stale user profile events on startup
@@ -394,6 +396,7 @@ def main() -> None:
         pet_window.pause_roaming()
 
     def _on_conversation_ended() -> None:
+        pet_window.set_listening(False)  # Safety net — always clear mic indicator
         pet_window.clear_override()
         pet_window.resume_roaming()
         speech_bubble.hide_bubble()

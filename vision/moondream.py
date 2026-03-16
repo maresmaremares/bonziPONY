@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -16,43 +17,86 @@ _PROMPT = (
 
 
 class MoondreamDescriber:
-    """Lazy-loaded Moondream2 vision model for local screen descriptions."""
+    """Moondream2 vision model for local screen descriptions.
+
+    The model is loaded ONLY via ``start_background_load()`` — never lazily
+    during a pipeline call.  This prevents the 1–2 GB download / load from
+    blocking conversations or crashing the app.
+    """
 
     def __init__(self, use_gpu: bool = False) -> None:
         self._model = None
         self._tokenizer = None
         self._device = "cuda" if use_gpu else "cpu"
         self._available = True
+        self._loading = False
+        self._lock = threading.Lock()
+
+    # ── Loading ──────────────────────────────────────────────────────────
+
+    def start_background_load(self) -> None:
+        """Kick off model loading in a daemon thread.  Safe to call multiple times."""
+        with self._lock:
+            if self._model is not None or self._loading or not self._available:
+                return
+            self._loading = True
+        t = threading.Thread(target=self._load, daemon=True, name="moondream-loader")
+        t.start()
 
     def _load(self) -> bool:
-        """Lazy-load model on first use."""
-        if self._model is not None:
-            return True
+        """Load model.  Called from background thread only."""
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            free_gb = mem.available / (1024 ** 3)
+            if free_gb < 2.0:
+                logger.warning(
+                    "Moondream skipped — only %.1f GB RAM free (need ≥2 GB).", free_gb
+                )
+                self._available = False
+                self._loading = False
+                return False
+        except ImportError:
+            pass  # psutil not installed, skip the check
+
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer
 
             model_id = "vikhyatk/moondream2"
             logger.info("Loading Moondream2 (%s)...", self._device)
-            self._tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-            self._model = AutoModelForCausalLM.from_pretrained(
+            tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+            model = AutoModelForCausalLM.from_pretrained(
                 model_id, trust_remote_code=True,
             ).to(self._device).eval()
+            with self._lock:
+                self._tokenizer = tokenizer
+                self._model = model
+                self._loading = False
             logger.info("Moondream2 ready on %s.", self._device)
             return True
         except Exception as exc:
             logger.warning("Moondream2 failed to load: %s", exc)
-            self._available = False
+            with self._lock:
+                self._available = False
+                self._loading = False
             return False
+
+    # ── Properties ───────────────────────────────────────────────────────
 
     @property
     def available(self) -> bool:
         return self._available
 
+    @property
+    def loaded(self) -> bool:
+        """True only if model is already in memory."""
+        return self._model is not None
+
+    # ── Inference ────────────────────────────────────────────────────────
+
     def describe(self, jpeg_bytes: bytes) -> Optional[str]:
-        """Describe a screenshot using Moondream. Returns text or None."""
-        if not self._available:
-            return None
-        if not self._load():
+        """Describe a screenshot.  Returns None if model isn't loaded yet."""
+        if not self._available or self._model is None:
             return None
         try:
             from PIL import Image

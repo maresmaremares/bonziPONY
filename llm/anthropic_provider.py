@@ -75,16 +75,22 @@ class AnthropicProvider(LLMProvider):
             max_tokens=self.max_tokens,
         )
 
-        # If the response was truncated (hit token limit), retry with a much
-        # higher limit so long-form content (WRITE_NOTEPAD etc.) isn't cut off.
+        # If the response was truncated (hit token limit), retry with a higher limit.
+        # WRITE_NOTEPAD gets unlimited (16k) so she can write as much as she wants.
         if getattr(response, "stop_reason", None) == "max_tokens":
-            logger.info("Response truncated at %d tokens — retrying with extended limit.", self.max_tokens)
+            partial = response.content[0].text if response.content else ""
+            if "WRITE_NOTEPAD" in partial:
+                retry_tokens = 16384
+                logger.info("WRITE_NOTEPAD truncated — retrying with %d tokens.", retry_tokens)
+            else:
+                retry_tokens = max(self.max_tokens * 4, 4096)
+                logger.info("Response truncated — retrying with %d tokens.", retry_tokens)
             response = self._call_with_retry(
                 model=self.model,
                 system=get_system_prompt(),
                 messages=self._history,
                 temperature=self.temperature,
-                max_tokens=max(self.max_tokens * 4, 4096),
+                max_tokens=retry_tokens,
             )
 
         assistant_text = response.content[0].text if response.content else ""

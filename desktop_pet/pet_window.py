@@ -516,6 +516,7 @@ class PetWindow(QWidget):
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton and self._show_mic:
             # Clicking while listening → stop recording, process what we have
+            self._show_mic = False  # Clear immediately so next click can drag
             self.listen_interrupted.emit()
             return
         if event.button() == Qt.LeftButton:
