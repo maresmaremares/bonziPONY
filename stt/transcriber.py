@@ -30,6 +30,40 @@ logger = logging.getLogger(__name__)
 SAMPLE_RATE = 16000
 CHANNELS = 1
 
+# Common Whisper hallucinations when processing silence/noise
+_WHISPER_HALLUCINATIONS = {
+    "", "thank you.", "thanks for watching.", "thank you for watching.",
+    "bye.", "goodbye.", "you", "the", "i", "a", "so", "okay",
+    "thanks.", "thank you!", "bye!", "hmm.", "hm.", "ah.",
+    "subtitles by the amara.org community",
+    "subscribe", "like and subscribe",
+    "please subscribe", "thanks for watching",
+    "thank you for listening", "thank you so much for watching",
+    "see you next time", "see you in the next video",
+    "music", "applause", "laughter",
+}
+
+
+def _is_whisper_hallucination(text: str) -> bool:
+    """Check if transcribed text is a known Whisper hallucination."""
+    if not text:
+        return True
+    clean = text.strip().lower()
+    # Exact match against known hallucinations
+    if clean in _WHISPER_HALLUCINATIONS:
+        return True
+    # Single character or just punctuation
+    if len(clean) <= 2:
+        return True
+    # Music/sound markers: ♪, [Music], (music), etc.
+    if clean.startswith(("♪", "[", "(")) and len(clean) < 20:
+        return True
+    # Repeated single word/character: "you you you you"
+    words = clean.split()
+    if len(words) >= 3 and len(set(words)) == 1:
+        return True
+    return False
+
 
 class _ListenInterrupted(Exception):
     """Raised by the stream wrapper when listening is interrupted by user click."""
@@ -79,6 +113,10 @@ class Transcriber:
         self._whisper_model = None  # lazy-loaded
         self._stop_event = threading.Event()
 
+        # Called right after recording finishes, before Whisper runs
+        # Lets the GUI transition away from LISTEN state immediately
+        self.on_recording_done = None
+
         # Speaker verification — lazy-loaded, only if profile exists
         self._voice_filter = None
         self._voice_filter_checked = False
@@ -101,9 +139,9 @@ class Transcriber:
             self._recognizer.non_speaking_duration = 0.5
             # Let the library auto-adjust energy threshold based on ambient noise
             self._recognizer.dynamic_energy_threshold = True
-            self._recognizer.energy_threshold = 100
-            self._recognizer.dynamic_energy_adjustment_damping = 0.08
-            self._recognizer.dynamic_energy_ratio = 1.3
+            self._recognizer.energy_threshold = 150
+            self._recognizer.dynamic_energy_adjustment_damping = 0.10
+            self._recognizer.dynamic_energy_ratio = 1.4
             logger.info(
                 "Recognizer initialized (pause_threshold=%.1fs)",
                 self._recognizer.pause_threshold,
@@ -189,6 +227,13 @@ class Transcriber:
                     logger.debug("Speech start timeout — no speech detected.")
                     return None
 
+            # Recording done — notify GUI so mic icon goes away before Whisper runs
+            if self.on_recording_done:
+                try:
+                    self.on_recording_done()
+                except Exception:
+                    pass
+
             # Get raw audio for voice filter check and Whisper transcription
             audio_data = audio.get_raw_data(convert_rate=SAMPLE_RATE, convert_width=2)
             audio_f32 = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
@@ -210,6 +255,9 @@ class Transcriber:
                 )
                 text = result.get("text", "").strip()
                 if text:
+                    if _is_whisper_hallucination(text):
+                        logger.debug("Whisper hallucination filtered: %r", text)
+                        return None
                     logger.debug("Transcription: %r", text)
                     return text
                 else:

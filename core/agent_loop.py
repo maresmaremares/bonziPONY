@@ -193,6 +193,7 @@ class AgentLoop:
         moondream=None,
         vision_config=None,
         on_grab_cursor=None,
+        vision_llm=None,
     ) -> None:
         self._config = config
         self._monitor = screen_monitor
@@ -209,6 +210,7 @@ class AgentLoop:
         self._transcriber = transcriber  # for enforcement mic listening
         self._vision_config = vision_config  # for screen_vision setting
         self._on_grab_cursor = on_grab_cursor  # callback for cursor grab (main thread)
+        self._vision_llm = vision_llm  # dedicated vision model (optional)
 
         self.directives: List[Directive] = []
         self._action_log: List[str] = []         # recent actions, capped at 15
@@ -436,12 +438,13 @@ class AgentLoop:
         self.directives.clear()
         self._action_log.clear()
         self._mess_mouse_count = 0
-        if self._enforcement.active:
+        was_enforcing = self._enforcement.active
+        if was_enforcing:
             self._enforcement = EnforcementMode()
             self._hide_countdown()
-            logger.info("Enforcement cleared along with directives.")
-        if count:
-            logger.info("All %d directive(s) cleared.", count)
+        if count or was_enforcing:
+            logger.info("Cleared %d directive(s)%s.", count, " + enforcement" if was_enforcing else "")
+            print(f"[Agent] Cleared {count} directive(s){' + enforcement' if was_enforcing else ''}.", flush=True)
         self.save_directives()
 
     def delay_directive(self, minutes: int, goal_keyword: str = "") -> bool:
@@ -628,6 +631,12 @@ class AgentLoop:
                 speech_start_timeout_s=timeout,
                 initial_discard_ms=400,
             )
+            # Filter hallucinations
+            if text:
+                from stt.transcriber import _is_whisper_hallucination
+                if _is_whisper_hallucination(text):
+                    logger.debug("Filtered hallucination in enforcement listen: %r", text)
+                    return None
             return text
         except Exception as exc:
             logger.warning("Enforcement listen failed: %s", exc)
@@ -1464,14 +1473,20 @@ class AgentLoop:
             if self._on_state_change:
                 self._on_state_change("LISTEN")
 
-            # Listen with a generous timeout — user might need a moment
+            # Listen with a short timeout — don't wait too long for a reply
             user_text = self._transcriber.listen(
-                speech_start_timeout_s=8.0,
+                speech_start_timeout_s=5.0,
                 initial_discard_ms=600,
             )
 
             if not user_text or not user_text.strip():
                 logger.debug("No reply to spontaneous speech — moving on.")
+                return
+
+            # Filter Whisper hallucinations
+            from stt.transcriber import _is_whisper_hallucination
+            if _is_whisper_hallucination(user_text):
+                logger.debug("Filtered hallucination in listen_for_reply: %r", user_text)
                 return
 
             logger.info("User replied to spontaneous speech: %r", user_text)
@@ -1525,13 +1540,16 @@ class AgentLoop:
                     logger.debug("Spontaneous conversation ended by LLM.")
                     break
 
-                # Listen again
+                # Listen again (short timeout, filter hallucinations)
                 if self._on_state_change:
                     self._on_state_change("LISTEN")
                 user_text = self._transcriber.listen(
-                    speech_start_timeout_s=8.0,
+                    speech_start_timeout_s=5.0,
                     initial_discard_ms=600,
                 )
+                if user_text and _is_whisper_hallucination(user_text):
+                    logger.debug("Filtered hallucination in reply loop: %r", user_text)
+                    user_text = None
 
         except Exception as exc:
             logger.warning("Listen-for-reply failed: %s", exc)
@@ -1601,6 +1619,8 @@ class AgentLoop:
             description = None
             if use_moondream and self._moondream and self._moondream.loaded:
                 description = self._moondream.describe(jpeg)
+            elif self._vision_llm:
+                description = self._vision_llm.describe_screen(jpeg)
             elif hasattr(self._llm, "describe_screen"):
                 description = self._llm.describe_screen(jpeg)
 

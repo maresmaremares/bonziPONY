@@ -107,6 +107,84 @@ def _save_yaml_value(key_path: str, value, config_path: str = "config.yaml") -> 
         logger.warning("Failed to save config %s: %s", key_path, exc)
 
 
+def _save_yaml_list(key_path: str, values: list, config_path: str = "config.yaml") -> None:
+    """Save a list value (like api_keys) to config.yaml, replacing any existing list."""
+    try:
+        path = Path(config_path)
+        if not path.exists():
+            return
+        lines = path.read_text(encoding="utf-8").splitlines(True)
+
+        parts = key_path.split(".")
+        if len(parts) != 2:
+            return
+        section, key = parts
+
+        in_section = False
+        found_key = False
+        key_line = -1
+        # Track lines belonging to the old list (- "item" lines after the key)
+        list_start = -1
+        list_end = -1
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+
+            if not stripped.startswith("#") and (stripped == f"{section}:" or stripped.startswith(f"{section}:")):
+                in_section = True
+                continue
+
+            if in_section and stripped and not line[0].isspace() and ":" in stripped:
+                in_section = False
+                continue
+
+            if in_section and stripped.startswith(f"{key}:"):
+                key_line = i
+                found_key = True
+                # Check if it's an inline list like "api_keys: []"
+                after_colon = stripped[len(key) + 1:].strip()
+                if after_colon.startswith("["):
+                    # Inline list — just replace the whole line
+                    break
+                # Block list — find the extent of "- item" lines
+                list_start = i + 1
+                list_end = i + 1
+                for j in range(i + 1, len(lines)):
+                    sj = lines[j].strip()
+                    if sj.startswith("- "):
+                        list_end = j + 1
+                    elif sj == "" or sj.startswith("#"):
+                        continue  # skip blank/comment lines within list
+                    else:
+                        break
+                break
+
+        if not found_key:
+            return
+
+        indent = len(lines[key_line]) - len(lines[key_line].lstrip())
+        item_indent = " " * (indent + 2)
+
+        if not values:
+            # Empty list
+            lines[key_line] = " " * indent + f"{key}: []\n"
+            if list_start >= 0 and list_end > list_start:
+                del lines[list_start:list_end]
+        else:
+            # Write as block list
+            lines[key_line] = " " * indent + f"{key}:\n"
+            new_items = [f'{item_indent}- "{v}"\n' for v in values]
+            if list_start >= 0 and list_end > list_start:
+                lines[list_start:list_end] = new_items
+            else:
+                for idx, item in enumerate(new_items):
+                    lines.insert(key_line + 1 + idx, item)
+
+        path.write_text("".join(lines), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to save config list %s: %s", key_path, exc)
+
+
 # ── Audio device enumeration ───────────────────────────────────────────────
 
 def _list_audio_devices() -> List[Tuple[int, str, bool]]:
@@ -563,6 +641,8 @@ class ContextMenuBuilder:
         ack_player=None,
         on_provider_change: Optional[Callable[[str], None]] = None,
         tts=None,
+        vision_llm=None,
+        on_vision_llm_change: Optional[Callable[[], None]] = None,
     ) -> None:
         self.config = config
         self.config_path = config_path
@@ -574,6 +654,8 @@ class ContextMenuBuilder:
         self.ack_player = ack_player
         self.on_provider_change = on_provider_change
         self.tts = tts
+        self.vision_llm = vision_llm
+        self.on_vision_llm_change = on_vision_llm_change
 
     # ── Main builder ──────────────────────────────────────────────────────
 
@@ -692,6 +774,32 @@ class ContextMenuBuilder:
         model_choices = self._get_model_choices()
         self._radio_submenu(menu, "LLM Model", model_choices, cfg.llm.model,
             lambda v: self._apply_model(v))
+
+        # ── Vision LLM submenu ────────────────────────────────────────
+        vlm_menu = menu.addMenu("Vision LLM")
+        vlm_cfg = cfg.vision_llm
+        if vlm_cfg:
+            self._add_toggle(vlm_menu, "Enabled", vlm_cfg.enabled,
+                             lambda c: self._set_vlm("enabled", c))
+            vlm_menu.addSeparator()
+            self._radio_submenu_into(vlm_menu, [
+                ("Gemini", "gemini"),
+                ("OpenAI", "openai"),
+                ("OpenRouter", "openrouter"),
+            ], vlm_cfg.provider, lambda v: self._apply_vlm_provider(v))
+            vlm_menu.addSeparator()
+            vlm_model_act = vlm_menu.addAction(f"Model: {vlm_cfg.model}...")
+            vlm_model_act.triggered.connect(lambda: self._set_vlm_model(parent))
+            nkeys = len(vlm_cfg.api_keys)
+            vlm_keys_act = vlm_menu.addAction(f"API Keys ({nkeys})...")
+            vlm_keys_act.triggered.connect(lambda: self._set_vlm_api_keys(parent))
+            vlm_url_label = vlm_cfg.base_url or "(auto)"
+            vlm_url_act = vlm_menu.addAction(f"Base URL: {vlm_url_label}...")
+            vlm_url_act.triggered.connect(lambda: self._set_vlm_base_url(parent))
+            vlm_max_act = vlm_menu.addAction(f"Max Reqs/Key/Day: {vlm_cfg.max_requests_per_key_per_day}...")
+            vlm_max_act.triggered.connect(lambda: self._set_vlm_max_requests(parent))
+        else:
+            vlm_menu.addAction("(not configured)").setEnabled(False)
 
         # ── Character picker ──────────────────────────────────────────
         from llm.prompt import get_character_name
@@ -992,6 +1100,90 @@ class ContextMenuBuilder:
         self.config.llm.model = model_id
         _save_yaml_value("llm.model", model_id, self.config_path)
         logger.info("LLM model changed to: %s", model_id)
+
+    # ── Vision LLM setters ─────────────────────────────────────────────
+
+    def _set_vlm(self, key: str, value) -> None:
+        """Update a vision_llm config field and persist."""
+        vlm_cfg = self.config.vision_llm
+        if not vlm_cfg:
+            return
+        setattr(vlm_cfg, key, value)
+        _save_yaml_value(f"vision_llm.{key}", value, self.config_path)
+        logger.info("Vision LLM: %s = %s", key, value)
+        if self.on_vision_llm_change:
+            self.on_vision_llm_change()
+
+    def _apply_vlm_provider(self, provider: str) -> None:
+        """Switch vision LLM provider."""
+        self._set_vlm("provider", provider)
+
+    def _set_vlm_model(self, parent: QWidget) -> None:
+        from PyQt5.QtWidgets import QInputDialog
+        vlm_cfg = self.config.vision_llm
+        if not vlm_cfg:
+            return
+        model, ok = QInputDialog.getText(
+            parent, "Vision LLM Model",
+            "Enter the model name for Vision LLM:",
+            QLineEdit.Normal, vlm_cfg.model,
+        )
+        if ok and model.strip():
+            self._set_vlm("model", model.strip())
+
+    def _set_vlm_api_keys(self, parent: QWidget) -> None:
+        """Dialog to manage vision LLM API keys."""
+        vlm_cfg = self.config.vision_llm
+        if not vlm_cfg:
+            return
+        from PyQt5.QtWidgets import QInputDialog
+        current = "\n".join(vlm_cfg.api_keys)
+        text, ok = QInputDialog.getMultiLineText(
+            parent, "Vision LLM API Keys",
+            "Enter API keys (one per line).\n"
+            "Keys rotate automatically to spread rate limits.",
+            current,
+        )
+        if not ok:
+            return
+        keys = [k.strip() for k in text.strip().splitlines() if k.strip()]
+        vlm_cfg.api_keys = keys
+        _save_yaml_list("vision_llm.api_keys", keys, self.config_path)
+        logger.info("Vision LLM: updated %d API keys", len(keys))
+        if self.on_vision_llm_change:
+            self.on_vision_llm_change()
+
+    def _set_vlm_base_url(self, parent: QWidget) -> None:
+        from PyQt5.QtWidgets import QInputDialog
+        vlm_cfg = self.config.vision_llm
+        if not vlm_cfg:
+            return
+        url, ok = QInputDialog.getText(
+            parent, "Vision LLM Base URL",
+            "Enter base URL (leave blank for auto-detect):",
+            QLineEdit.Normal, vlm_cfg.base_url or "",
+        )
+        if not ok:
+            return
+        url = url.strip() or None
+        vlm_cfg.base_url = url
+        _save_yaml_value("vision_llm.base_url", url, self.config_path)
+        logger.info("Vision LLM base_url: %s", url)
+        if self.on_vision_llm_change:
+            self.on_vision_llm_change()
+
+    def _set_vlm_max_requests(self, parent: QWidget) -> None:
+        from PyQt5.QtWidgets import QInputDialog
+        vlm_cfg = self.config.vision_llm
+        if not vlm_cfg:
+            return
+        val, ok = QInputDialog.getInt(
+            parent, "Vision LLM Max Requests",
+            "Max requests per API key per day:",
+            vlm_cfg.max_requests_per_key_per_day, 1, 10000,
+        )
+        if ok:
+            self._set_vlm("max_requests_per_key_per_day", val)
 
     def _apply_scale(self, scale: float) -> None:
         """Change sprite scale (live reload)."""

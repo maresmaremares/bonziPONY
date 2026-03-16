@@ -1,0 +1,163 @@
+"""Dedicated vision LLM provider with API key cycling.
+
+Uses a separate (cheaper/faster) model for describe_screen/describe_image
+calls, cycling through multiple API keys to spread rate limits.
+"""
+
+from __future__ import annotations
+
+import base64
+import logging
+import time
+from datetime import date
+from typing import List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+class VisionProvider:
+    """Lightweight vision-only provider with round-robin key cycling."""
+
+    def __init__(
+        self,
+        api_keys: List[str],
+        model: str = "gemini-2.5-flash",
+        base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai",
+        max_requests_per_key_per_day: int = 100,
+        temperature: float = 0.3,
+    ) -> None:
+        from openai import OpenAI
+
+        if not api_keys:
+            raise ValueError("VisionProvider requires at least one API key.")
+
+        self._api_keys = api_keys
+        self._model = model
+        self._base_url = base_url
+        self._max_per_key = max_requests_per_key_per_day
+        self._temperature = temperature
+
+        # One client per key
+        self._clients: List[OpenAI] = []
+        for key in api_keys:
+            self._clients.append(OpenAI(api_key=key, base_url=base_url))
+
+        # Daily request counters: {key_index: count}
+        self._daily_counts: List[int] = [0] * len(api_keys)
+        self._count_date: date = date.today()
+        self._current_index: int = 0
+
+        logger.info(
+            "VisionProvider: %d key(s), model=%s, max %d req/key/day",
+            len(api_keys), model, max_requests_per_key_per_day,
+        )
+
+    def _reset_if_new_day(self) -> None:
+        """Reset counters at midnight."""
+        today = date.today()
+        if today != self._count_date:
+            self._daily_counts = [0] * len(self._api_keys)
+            self._count_date = today
+            self._current_index = 0
+            logger.info("VisionProvider: daily counters reset.")
+
+    def _next_client(self) -> Optional["OpenAI"]:
+        """Get the next available client, cycling through keys.
+        Returns None if all keys are exhausted for today."""
+        self._reset_if_new_day()
+        n = len(self._clients)
+        for _ in range(n):
+            idx = self._current_index % n
+            if self._daily_counts[idx] < self._max_per_key:
+                self._daily_counts[idx] += 1
+                self._current_index = (idx + 1) % n
+                remaining = sum(
+                    self._max_per_key - c for c in self._daily_counts
+                )
+                if self._daily_counts[idx] % 20 == 0:
+                    logger.info(
+                        "VisionProvider: key %d used %d/%d today (%d total remaining)",
+                        idx, self._daily_counts[idx], self._max_per_key, remaining,
+                    )
+                return self._clients[idx]
+            self._current_index = (idx + 1) % n
+        logger.warning("VisionProvider: all keys exhausted for today!")
+        return None
+
+    def describe_screen(self, jpeg_bytes: bytes) -> Optional[str]:
+        """Describe what's on a computer screen."""
+        client = self._next_client()
+        if client is None:
+            return None
+
+        b64 = base64.standard_b64encode(jpeg_bytes).decode("utf-8")
+        try:
+            t0 = time.time()
+            response = client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are observing a computer screen. Describe what you see concisely in 2-3 sentences. "
+                            "Focus on: which applications/windows are open, what content is displayed, any notable "
+                            "text or activity. Ignore the small animated pony sprite — that's you."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                            },
+                            {"type": "text", "text": "What's on the screen?"},
+                        ],
+                    },
+                ],
+                max_tokens=200,
+                temperature=self._temperature,
+            )
+            elapsed = time.time() - t0
+            logger.info("[TIMING] vision describe_screen() took %.2fs", elapsed)
+            return response.choices[0].message.content or None
+        except Exception as exc:
+            logger.warning("VisionProvider describe_screen failed: %s", exc)
+            return None
+
+    def describe_image(self, jpeg_bytes: bytes) -> Optional[str]:
+        """Describe what's in an image (webcam)."""
+        client = self._next_client()
+        if client is None:
+            return None
+
+        b64 = base64.standard_b64encode(jpeg_bytes).decode("utf-8")
+        try:
+            t0 = time.time()
+            response = client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a precise visual observer. Describe what you see in the image concisely in 1-3 sentences. Focus on people, objects, environment, and notable details.",
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                            },
+                            {"type": "text", "text": "What do you see?"},
+                        ],
+                    },
+                ],
+                max_tokens=150,
+                temperature=self._temperature,
+            )
+            elapsed = time.time() - t0
+            logger.info("[TIMING] vision describe_image() took %.2fs", elapsed)
+            return response.choices[0].message.content or None
+        except Exception as exc:
+            logger.warning("VisionProvider describe_image failed: %s", exc)
+            return None

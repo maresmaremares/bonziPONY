@@ -79,12 +79,16 @@ class OpenAIProvider(LLMProvider):
                 messages.append({"role": "assistant", "content": f"(I am {name}. I stay in character at all times.)"})
         messages.extend(self._history)
 
+        t0 = time.time()
         response = self._call_with_retry(
             model=self.model,
             messages=messages,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
+        elapsed = time.time() - t0
+        logger.info("[TIMING] chat() API call took %.2fs", elapsed)
+        print(f"[LLM] chat() took {elapsed:.2f}s", flush=True)
 
         # If the response was truncated (hit token limit), retry with a higher limit.
         # WRITE_NOTEPAD gets unlimited (16k) so she can write as much as she wants.
@@ -97,12 +101,16 @@ class OpenAIProvider(LLMProvider):
             else:
                 retry_tokens = max(self.max_tokens * 4, 4096)
                 logger.info("Response truncated — retrying with %d tokens.", retry_tokens)
+            t0 = time.time()
             response = self._call_with_retry(
                 model=self.model,
                 messages=messages,
                 temperature=self.temperature,
                 max_tokens=retry_tokens,
             )
+            elapsed = time.time() - t0
+            logger.info("[TIMING] chat() retry API call took %.2fs", elapsed)
+            print(f"[LLM] chat() retry took {elapsed:.2f}s", flush=True)
 
         assistant_text = response.choices[0].message.content or ""
         assistant_text = self._strip_think(assistant_text)
@@ -130,6 +138,7 @@ class OpenAIProvider(LLMProvider):
     def generate_once(self, prompt: str, max_tokens: int | None = None) -> str:
         """One-shot call — does not touch self._history."""
         from llm.prompt import get_system_prompt
+        t0 = time.time()
         response = self._call_with_retry(
             model=self.model,
             messages=[
@@ -139,12 +148,16 @@ class OpenAIProvider(LLMProvider):
             temperature=self.temperature,
             max_tokens=max_tokens or self.max_tokens,
         )
+        elapsed = time.time() - t0
+        logger.info("[TIMING] generate_once() took %.2fs", elapsed)
+        print(f"[LLM] generate_once() took {elapsed:.2f}s", flush=True)
         return self._strip_think(response.choices[0].message.content or "")
 
     def describe_image(self, jpeg_bytes: bytes) -> Optional[str]:
         """One-shot vision call — returns a plain description of the image."""
         b64 = base64.standard_b64encode(jpeg_bytes).decode("utf-8")
         try:
+            t0 = time.time()
             response = self._call_with_retry(
                 model=self.model,
                 messages=[
@@ -165,6 +178,8 @@ class OpenAIProvider(LLMProvider):
                 ],
                 max_tokens=150,
             )
+            elapsed = time.time() - t0
+            logger.info("[TIMING] describe_image() took %.2fs", elapsed)
             return response.choices[0].message.content or None
         except Exception as exc:
             logger.warning("Vision call failed (model may not support images): %s", exc)
@@ -174,6 +189,7 @@ class OpenAIProvider(LLMProvider):
         """One-shot vision call — describe what's on a computer screen."""
         b64 = base64.standard_b64encode(jpeg_bytes).decode("utf-8")
         try:
+            t0 = time.time()
             response = self._call_with_retry(
                 model=self.model,
                 messages=[
@@ -198,6 +214,8 @@ class OpenAIProvider(LLMProvider):
                 ],
                 max_tokens=200,
             )
+            elapsed = time.time() - t0
+            logger.info("[TIMING] describe_screen() took %.2fs", elapsed)
             return response.choices[0].message.content or None
         except Exception as exc:
             logger.warning("Screen vision call failed (model may not support images): %s", exc)

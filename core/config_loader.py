@@ -82,6 +82,18 @@ class VisionConfig:
 
 
 @dataclass
+class VisionLLMConfig:
+    """Separate LLM for vision (screen/image description). Top-level config."""
+    enabled: bool = False
+    provider: str = "gemini"
+    model: str = "gemini-2.5-flash"
+    api_keys: List[str] = field(default_factory=list)
+    base_url: Optional[str] = None
+    max_requests_per_key_per_day: int = 100
+    temperature: float = 0.3
+
+
+@dataclass
 class DesktopControlConfig:
     enabled: bool = True
     allowed_apps: List[str] = field(default_factory=lambda: ["notepad", "calculator", "explorer"])
@@ -153,6 +165,7 @@ class AppConfig:
     agent: AgentConfig = None
     watch_mode: WatchModeConfig = None
     tts: TTSConfig = None
+    vision_llm: VisionLLMConfig = None
 
     def __post_init__(self):
         if self.desktop_pet is None:
@@ -165,6 +178,31 @@ class AppConfig:
             self.agent = AgentConfig()
         if self.watch_mode is None:
             self.watch_mode = WatchModeConfig()
+        if self.vision_llm is None:
+            self.vision_llm = VisionLLMConfig()
+
+
+def _parse_vision_llm(raw: dict | None) -> VisionLLMConfig | None:
+    """Parse the optional vision_llm sub-config."""
+    if not raw or not isinstance(raw, dict):
+        return None
+    keys = raw.get("api_keys", [])
+    if not keys:
+        # Single key fallback
+        single = raw.get("api_key", "")
+        if single:
+            keys = [single]
+    if not keys:
+        return None
+    return VisionLLMConfig(
+        enabled=raw.get("enabled", True),
+        provider=raw.get("provider", "gemini"),
+        model=raw.get("model", "gemini-2.5-flash"),
+        api_keys=keys,
+        base_url=raw.get("base_url"),
+        max_requests_per_key_per_day=raw.get("max_requests_per_key_per_day", 100),
+        temperature=raw.get("temperature", 0.3),
+    )
 
 
 def load_config(path: Path | str = "config.yaml") -> AppConfig:
@@ -193,6 +231,7 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
     agent_raw = raw.get("agent", {})
     wm_raw = raw.get("watch_mode", {})
     tts_raw = raw.get("tts", {})
+    vlm_raw = raw.get("vision_llm", {})
 
     # ── Env var fallbacks for secrets (config.yaml wins, env is backup) ─────
     llm_api_key = llm_raw.get("api_key", "") or os.environ.get("BONZI_LLM_API_KEY", "")
@@ -298,4 +337,5 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
             response_format=tts_raw.get("response_format", "pcm"),
             sample_rate=tts_raw.get("sample_rate", 24000),
         ),
+        vision_llm=_parse_vision_llm(vlm_raw or None),
     )

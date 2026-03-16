@@ -135,6 +135,26 @@ def main() -> None:
 
     llm_provider = get_provider(config)
 
+    # ── Dedicated vision LLM (optional — uses separate, cheaper model) ────
+    vision_llm = None
+    vlm_cfg = config.vision_llm
+    if vlm_cfg and vlm_cfg.enabled and vlm_cfg.api_keys:
+        try:
+            from llm.vision_provider import VisionProvider
+            from llm.factory import _KNOWN_BASE_URLS
+            base_url = vlm_cfg.base_url or _KNOWN_BASE_URLS.get(vlm_cfg.provider.lower())
+            vision_llm = VisionProvider(
+                api_keys=vlm_cfg.api_keys,
+                model=vlm_cfg.model,
+                base_url=base_url or "https://generativelanguage.googleapis.com/v1beta/openai",
+                max_requests_per_key_per_day=vlm_cfg.max_requests_per_key_per_day,
+                temperature=vlm_cfg.temperature,
+            )
+            logger.info("Dedicated vision LLM: %s (%d keys)", vlm_cfg.model, len(vlm_cfg.api_keys))
+        except Exception as exc:
+            logger.warning("Failed to init vision LLM, falling back to main LLM: %s", exc)
+            vision_llm = None
+
     # ── TTS provider selection ─────────────────────────────────────────────
     if config.tts.provider == "openai_compatible":
         from tts.openai_compatible_tts import OpenAICompatibleTTS
@@ -267,6 +287,7 @@ def main() -> None:
             moondream=moondream,
             vision_config=config.vision,
             on_grab_cursor=None,  # wired after _on_grab_cursor is defined
+            vision_llm=vision_llm,
         )
 
     # Compact user profile and prune stale events on startup
@@ -292,6 +313,7 @@ def main() -> None:
         agent_loop=agent_loop,
         screen_monitor=screen_monitor,
         moondream=moondream,
+        vision_llm=vision_llm,
     )
 
     # ── Context menu (right-click settings UI) ──────────────────────────────
@@ -367,6 +389,34 @@ def main() -> None:
         new_provider.reset_history()
         logger.info("LLM provider hot-swapped to: %s", provider_name)
 
+    def _on_vision_llm_change() -> None:
+        nonlocal vision_llm
+        vlm_cfg = config.vision_llm
+        if vlm_cfg and vlm_cfg.enabled and vlm_cfg.api_keys:
+            try:
+                from llm.vision_provider import VisionProvider
+                from llm.factory import _KNOWN_BASE_URLS
+                base_url = vlm_cfg.base_url or _KNOWN_BASE_URLS.get(vlm_cfg.provider.lower())
+                vision_llm = VisionProvider(
+                    api_keys=vlm_cfg.api_keys,
+                    model=vlm_cfg.model,
+                    base_url=base_url or "https://generativelanguage.googleapis.com/v1beta/openai",
+                    max_requests_per_key_per_day=vlm_cfg.max_requests_per_key_per_day,
+                    temperature=vlm_cfg.temperature,
+                )
+                logger.info("Vision LLM reloaded: %s (%d keys)", vlm_cfg.model, len(vlm_cfg.api_keys))
+            except Exception as exc:
+                logger.warning("Failed to reload vision LLM: %s", exc)
+                vision_llm = None
+        else:
+            vision_llm = None
+            logger.info("Vision LLM disabled")
+        # Update references
+        pipeline.vision_llm = vision_llm
+        if agent_loop:
+            agent_loop._vision_llm = vision_llm
+        menu_builder.vision_llm = vision_llm
+
     menu_builder = ContextMenuBuilder(
         config=config,
         config_path=str(Path(args.config)),
@@ -377,6 +427,8 @@ def main() -> None:
         ack_player=ack_player,
         on_provider_change=_on_provider_change,
         tts=tts,
+        vision_llm=vision_llm,
+        on_vision_llm_change=_on_vision_llm_change,
     )
     pet_window.set_menu_builder(menu_builder)
 
@@ -388,6 +440,10 @@ def main() -> None:
         on_conversation_start=pet_controller.on_conversation_start,
         on_conversation_end=pet_controller.on_conversation_end,
     )
+
+    # When recording finishes, immediately show THINK state so mic icon
+    # goes away before Whisper transcription runs (which can take seconds)
+    transcriber.on_recording_done = lambda: pet_controller.on_state_change("THINK")
 
     # Create speech bubble
     speech_bubble = SpeechBubble()

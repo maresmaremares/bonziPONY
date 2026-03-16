@@ -74,6 +74,7 @@ class Pipeline:
         agent_loop: AgentLoop | None = None,
         screen_monitor: ScreenMonitor | None = None,
         moondream=None,
+        vision_llm=None,
     ) -> None:
         self.config = config
         self.detector = detector
@@ -88,6 +89,7 @@ class Pipeline:
         self.agent_loop = agent_loop
         self.screen_monitor = screen_monitor
         self.moondream = moondream
+        self.vision_llm = vision_llm  # dedicated vision model (optional)
         self.state = PipelineState.IDLE
 
         self._recent_topics: List[str] = []
@@ -184,6 +186,12 @@ class Pipeline:
             if not user_text or not user_text.strip():
                 logger.debug("No follow-up speech — ending conversation.")
                 break
+
+            # Filter Whisper hallucinations (ambient noise transcribed as garbage)
+            from stt.transcriber import _is_whisper_hallucination
+            if _is_whisper_hallucination(user_text):
+                logger.debug("Filtered hallucination in follow-up: %r", user_text)
+                continue
 
             spoke = self._run_turn(play_ack=False, user_text=user_text)
             if self._last_end_conversation:
@@ -789,7 +797,8 @@ class Pipeline:
             return self._inject_moondream_screen(user_text)
 
         # API mode: 20% chance per message to keep costs down
-        if not use_moondream and random.random() < 0.2 and hasattr(self.llm, "describe_screen"):
+        has_vision = self.vision_llm or hasattr(self.llm, "describe_screen")
+        if not use_moondream and random.random() < 0.2 and has_vision:
             return self._inject_screen(user_text)
 
         return user_text
@@ -798,14 +807,15 @@ class Pipeline:
         """Inject webcam image description into user text."""
         if self.camera is None or not self.camera.available:
             return user_text
-        if not hasattr(self.llm, "describe_image"):
+        vlm = self.vision_llm
+        if vlm is None and not hasattr(self.llm, "describe_image"):
             return user_text
 
         try:
             jpeg = self.camera.grab()
             if jpeg is None:
                 return user_text
-            description = self.llm.describe_image(jpeg)
+            description = vlm.describe_image(jpeg) if vlm else self.llm.describe_image(jpeg)
             if not description:
                 return user_text
             logger.info("Camera vision: %s", description)
@@ -820,7 +830,8 @@ class Pipeline:
         if self.screen is None or not self.screen.available:
             logger.debug("Screen capture not available — skipping.")
             return user_text
-        if not hasattr(self.llm, "describe_screen"):
+        vlm = self.vision_llm
+        if vlm is None and not hasattr(self.llm, "describe_screen"):
             logger.debug("LLM has no describe_screen method.")
             return user_text
 
@@ -828,7 +839,7 @@ class Pipeline:
             jpeg = self.screen.grab()
             if jpeg is None:
                 return user_text
-            description = self.llm.describe_screen(jpeg)
+            description = vlm.describe_screen(jpeg) if vlm else self.llm.describe_screen(jpeg)
             if not description:
                 return user_text
             logger.info("Screen vision: %s", description)
@@ -873,6 +884,8 @@ class Pipeline:
             use_moondream = self.config.vision.screen_vision == "moondream"
             if use_moondream and self.moondream and self.moondream.loaded:
                 description = self.moondream.describe(jpeg)
+            elif self.vision_llm:
+                description = self.vision_llm.describe_screen(jpeg)
             elif hasattr(self.llm, "describe_screen"):
                 description = self.llm.describe_screen(jpeg)
 
