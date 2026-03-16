@@ -566,24 +566,12 @@ class DesktopController:
 
         # 3. Paste via clipboard (handles newlines, unicode, and is fast)
         try:
-            import ctypes
+            import win32clipboard
 
-            CF_UNICODETEXT = 13
-            kernel32 = ctypes.windll.kernel32
-            user32 = ctypes.windll.user32
-
-            # Encode text as UTF-16LE for Windows clipboard
-            encoded = text.encode("utf-16-le") + b"\x00\x00"
-
-            user32.OpenClipboard(0)
-            user32.EmptyClipboard()
-
-            hmem = kernel32.GlobalAlloc(0x0042, len(encoded))  # GMEM_MOVEABLE | GMEM_ZEROINIT
-            ptr = kernel32.GlobalLock(hmem)
-            ctypes.memmove(ptr, encoded, len(encoded))
-            kernel32.GlobalUnlock(hmem)
-            user32.SetClipboardData(CF_UNICODETEXT, hmem)
-            user32.CloseClipboard()
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+            win32clipboard.CloseClipboard()
 
             # Ctrl+V to paste
             self._pyautogui.hotkey("ctrl", "v")

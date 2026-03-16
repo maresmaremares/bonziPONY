@@ -371,41 +371,48 @@ class PetWindow(QWidget):
         self.set_override_animation(anim_name)
         logger.info("Timed override: '%s' for %ds", anim_name, seconds)
 
-    # Generic/boring behavior names to exclude from trick pool
+    # Behaviors that are just normal movement — not interesting as tricks
     _BORING_NAMES = {
         "stand", "walk", "walk_wings", "trot", "fly", "hover", "sleep",
-        "drag", "theme", "conga", "conga start", "ride", "ride-start",
+        "drag", "dash", "dash_ground", "gallop", "swim", "coaching",
+        "training", "beep", "dizzy",
     }
 
     def do_trick(self) -> None:
-        """Pick a cool/interesting behavior from the current character and play it."""
-        all_behaviors = list(self.behavior_manager.behaviors.values())
+        """Pick a cool/interesting behavior from the current character and play it.
 
-        # Filter to "interesting" behaviors: has effects, rare, or unique name
-        tricks = []
-        for b in all_behaviors:
+        Only picks visually distinct behaviors: ones with effects, or stationary
+        animations that aren't generic walk/stand/sleep. Skips boring movement.
+        """
+        # Priority 1: behaviors with visual effects (rainboom, crystalspark, etc.)
+        with_effects = [
+            b for b in self.behavior_manager.behaviors.values()
+            if b.effects and b.movement != MovementType.DRAGGED
+        ]
+
+        # Priority 2: stationary special animations (gala dress, rage, makerain, etc.)
+        specials = []
+        for b in self.behavior_manager.behaviors.values():
             name_lower = b.name.lower()
-            # Skip boring generic behaviors
             if name_lower in self._BORING_NAMES:
                 continue
-            # Skip chain-only behaviors that start with "theme" or "conga"
-            if any(name_lower.startswith(prefix) for prefix in ("theme", "conga", "banner")):
-                continue
-            # Skip drag behavior
             if b.movement == MovementType.DRAGGED:
                 continue
-            # Keep it if it has effects, or isn't a generic movement behavior
-            if b.effects or b.speed == 0 or name_lower not in self._BORING_NAMES:
-                tricks.append(b)
+            if any(name_lower.startswith(p) for p in ("theme", "conga", "banner", "ride")):
+                continue
+            # Only stationary or very slow behaviors — no generic running/flying
+            if b.speed <= 1.0:
+                specials.append(b)
 
-        if not tricks:
-            # Fallback: just pick any non-walk behavior
-            tricks = [b for b in all_behaviors if b.name.lower() != "stand"]
+        # Combine both pools, preferring effects (weighted 3x)
+        pool = with_effects * 3 + specials
+        if not pool:
+            pool = specials or with_effects
 
-        if not tricks:
+        if not pool:
             return
 
-        trick = random.choice(tricks)
+        trick = random.choice(pool)
         logger.info("Doing trick: '%s'", trick.name)
         self._start_behavior(trick)
 

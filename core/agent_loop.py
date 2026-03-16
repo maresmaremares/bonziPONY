@@ -1380,9 +1380,33 @@ class AgentLoop:
             # Conversational loop — keep going until CONVO:END or silence
             from llm.response_parser import parse_response
             while user_text and user_text.strip():
-                raw = self._llm.chat(user_text)
+                # Add context so the LLM stays in character (matches pipeline._run_turn)
+                enriched = user_text
+                enriched += (
+                    f"\n\n[System hint: You are {get_character_name()}. Stay in character. "
+                    "Reply naturally as yourself — do NOT break character or meta-analyze. "
+                    "Include [CONVO:CONTINUE] if you expect a reply or [CONVO:END] if done.]"
+                )
+                raw = self._llm.chat(enriched)
                 if not raw:
                     break
+
+                # Detect character break — retry once if the model slipped
+                from core.pipeline import Pipeline
+                if Pipeline._is_character_break(raw):
+                    logger.warning("Character break in spontaneous reply — retrying.")
+                    hist = getattr(self._llm, "_history", None)
+                    if hist and len(hist) >= 2:
+                        hist.pop()
+                        hist.pop()
+                    raw = self._llm.chat(enriched)
+                    if not raw:
+                        break
+                    if Pipeline._is_character_break(raw):
+                        if hist and len(hist) >= 2:
+                            hist.pop()
+                            hist.pop()
+                        break
 
                 parsed = parse_response(raw)
                 if parsed.text:

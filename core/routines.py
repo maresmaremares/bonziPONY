@@ -27,7 +27,7 @@ _ROUTINES_FILE = Path(__file__).parent.parent / "routines.json"
 _WAKE_STATE_FILE = Path(__file__).parent.parent / "wake_state.json"
 
 # How long the user must be idle before we consider them "asleep/away"
-AWAY_THRESHOLD_MS = 30 * 60 * 1000   # 30 minutes
+AWAY_THRESHOLD_MS = 3 * 60 * 1000   # 3 minutes
 
 
 @dataclass

@@ -386,21 +386,31 @@ class Pipeline:
 
             # Detect character break — model meta-analyzing the prompt instead of role-playing
             if self._is_character_break(raw_response):
-                logger.warning("Character break detected — retrying once.")
-                # Remove the broken exchange from history and retry
-                hist = getattr(self.llm, "_history", None)
-                if hist is not None and len(hist) >= 2:
-                    hist.pop()  # broken assistant response
-                    hist.pop()  # our user message (chat() will re-add it)
-                raw_response = self.llm.chat(user_text)
-                logger.info("LLM retry response: %r", raw_response)
-                if self._is_character_break(raw_response):
-                    logger.warning("Character break on retry — using fallback.")
-                    # Remove the second broken exchange too
+                # Try stripping the meta preamble first — the in-character part might be fine
+                stripped = self._strip_meta_preamble(raw_response)
+                if stripped != raw_response and not self._is_character_break(stripped):
+                    logger.warning("Character break detected — stripped meta preamble.")
+                    raw_response = stripped
+                    # Update history with the cleaned version
+                    hist = getattr(self.llm, "_history", None)
+                    if hist and hist[-1].get("role") == "assistant":
+                        hist[-1]["content"] = stripped
+                else:
+                    logger.warning("Character break detected — retrying once.")
+                    # Remove the broken exchange from history and retry
+                    hist = getattr(self.llm, "_history", None)
                     if hist is not None and len(hist) >= 2:
-                        hist.pop()
-                        hist.pop()
-                    raw_response = "hmm, uh, sorry I kinda spaced out for a second there. what were you saying? [CONVO:CONTINUE]"
+                        hist.pop()  # broken assistant response
+                        hist.pop()  # our user message (chat() will re-add it)
+                    raw_response = self.llm.chat(user_text)
+                    logger.info("LLM retry response: %r", raw_response)
+                    if self._is_character_break(raw_response):
+                        logger.warning("Character break on retry — using fallback.")
+                        # Remove the second broken exchange too
+                        if hist is not None and len(hist) >= 2:
+                            hist.pop()
+                            hist.pop()
+                        raw_response = "hmm, uh, sorry I kinda spaced out for a second there. what were you saying? [CONVO:CONTINUE]"
 
             from llm.response_parser import parse_response
             parsed: ParsedResponse = parse_response(raw_response)
@@ -573,7 +583,7 @@ class Pipeline:
         "looking at this document", "analyze this prompt",
         "let me understand what's happening",
         "roleplay", "role-play", "stay in character",
-        "the user is asking me to",
+        "the user is asking me to", "the user is asking",
         "i'm an assistant", "i am an assistant",
         "how can i help you today",
         "i'd be happy to help", "i'd be happy to assist",
@@ -581,12 +591,23 @@ class Pipeline:
         "text-to-speech engine",  # quoting our own system prompt
         "anti-slop rules",        # quoting our own system prompt
         "voice rules",            # quoting our own system prompt
+        "would respond",          # "here's how X would respond"
+        "the user wants",
     )
     # Strong signals — a single hit is enough
     _CHARACTER_BREAK_STRONG = (
         "system prompt", "character card", "character configuration",
         "i'm claude", "i am claude", "i'm chatgpt", "i am chatgpt",
         "as an ai assistant",
+        "based on this document", "based on this prompt",
+        "based on the document", "based on the prompt",
+        "here's how", "here is how",
+    )
+
+    # Regex to strip meta-analysis preamble before in-character content
+    _META_PREAMBLE_RE = re.compile(
+        r"^.*?(?:would respond|would say|here's (?:how|what)|in character)\s*[:]\s*\n*",
+        re.IGNORECASE | re.DOTALL,
     )
 
     @staticmethod
@@ -601,6 +622,15 @@ class Pipeline:
         # Two weak signals
         hits = sum(1 for phrase in Pipeline._CHARACTER_BREAK_PHRASES if phrase in lower)
         return hits >= 2
+
+    @staticmethod
+    def _strip_meta_preamble(response: str) -> str:
+        """Strip meta-analysis preamble if the response has in-character content after it."""
+        stripped = Pipeline._META_PREAMBLE_RE.sub("", response).strip()
+        # Only use stripped version if there's substantial content left
+        if stripped and len(stripped) > 20:
+            return stripped
+        return response
 
     # Phrases that signal the user is leaving or ending the conversation
     _USER_END_PHRASES = (
