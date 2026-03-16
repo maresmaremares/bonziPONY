@@ -53,6 +53,32 @@ _LEFTOVER_TAG_PATTERN = re.compile(r"\[(?:MOVETO|PERSIST|ANIM|ACTION|CONVO|DESKT
 # Strip <think>...</think> blocks from reasoning models (DeepSeek, QwQ, etc.)
 _THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
+# ── Speech sanitization patterns ──────────────────────────────────────────────
+# These strip content that should never be spoken aloud through TTS.
+
+# Code blocks: ```...``` or ```lang\n...\n```
+_CODE_BLOCK_PATTERN = re.compile(r"```[\s\S]*?```", re.DOTALL)
+# Inline code: `code`
+_INLINE_CODE_PATTERN = re.compile(r"`[^`]+`")
+# Markdown headers: # Header, ## Header, etc.
+_MD_HEADER_PATTERN = re.compile(r"^#{1,6}\s+.*$", re.MULTILINE)
+# Markdown bold/italic: **bold**, *italic*, __bold__, _italic_
+_MD_EMPHASIS_PATTERN = re.compile(r"(\*{1,3}|_{1,3})(.+?)\1")
+# Markdown links: [text](url)
+_MD_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+# Markdown images: ![alt](url)
+_MD_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+# Markdown list markers: - item, * item, 1. item (at start of line)
+_MD_LIST_PATTERN = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+", re.MULTILINE)
+# HTML tags: <div>, </span>, <br/>, etc.
+_HTML_TAG_PATTERN = re.compile(r"</?[a-zA-Z][^>]*>")
+# Raw URLs: http://... or https://...
+_URL_PATTERN = re.compile(r"https?://\S+")
+# Lines that look like code: indented 4+ spaces with code-like content
+_INDENTED_CODE_PATTERN = re.compile(r"^[ \t]{4,}\S.*$", re.MULTILINE)
+# Horizontal rules: --- or *** or ___
+_MD_HR_PATTERN = re.compile(r"^[\s]*[-*_]{3,}[\s]*$", re.MULTILINE)
+
 
 @dataclass
 class DesktopCommand:
@@ -263,9 +289,50 @@ def parse_response(raw: str) -> ParsedResponse:
     clean_text = _PERSIST_PATTERN.sub("", clean_text)
     clean_text = _MOVETO_PATTERN.sub("", clean_text)
     clean_text = _LEFTOVER_TAG_PATTERN.sub("", clean_text).strip()
+    # Sanitize for TTS — strip code, markdown, HTML, URLs
+    clean_text = sanitize_for_speech(clean_text)
     return ParsedResponse(text=clean_text, actions=actions, desktop_commands=desktop_commands,
                           directive=directive, timer=timer, routines=routines,
                           enforce_minutes=enforce_minutes, done_directive=done_directive,
                           delay_minutes=delay_minutes, delay_keyword=delay_keyword,
                           end_conversation=end_conversation,
                           persist_seconds=persist_seconds, moveto_region=moveto_region)
+
+
+def sanitize_for_speech(text: str) -> str:
+    """Strip code, markdown, HTML, and URLs from text destined for TTS.
+
+    This is the last line of defense — even if the LLM breaks character and
+    outputs code/markdown, the user won't hear raw syntax through speakers.
+    """
+    if not text:
+        return text
+
+    # Strip code blocks first (```...```) — these are never speakable
+    text = _CODE_BLOCK_PATTERN.sub("", text)
+    # Strip inline code (`code`)
+    text = _INLINE_CODE_PATTERN.sub("", text)
+    # Strip markdown images (before links, since images contain links)
+    text = _MD_IMAGE_PATTERN.sub("", text)
+    # Strip markdown links but keep the link text: [text](url) → text
+    text = _MD_LINK_PATTERN.sub(r"\1", text)
+    # Strip raw URLs
+    text = _URL_PATTERN.sub("", text)
+    # Strip HTML tags
+    text = _HTML_TAG_PATTERN.sub("", text)
+    # Strip markdown headers (# Header → Header)
+    text = _MD_HEADER_PATTERN.sub(lambda m: m.group(0).lstrip("# "), text)
+    # Strip markdown emphasis markers but keep text: **bold** → bold
+    text = _MD_EMPHASIS_PATTERN.sub(r"\2", text)
+    # Strip markdown list markers: "- item" → "item"
+    text = _MD_LIST_PATTERN.sub("", text)
+    # Strip horizontal rules
+    text = _MD_HR_PATTERN.sub("", text)
+    # Strip indented code lines
+    text = _INDENTED_CODE_PATTERN.sub("", text)
+    # Collapse multiple newlines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    # Collapse multiple spaces
+    text = re.sub(r"  +", " ", text)
+
+    return text.strip()

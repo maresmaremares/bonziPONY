@@ -68,13 +68,15 @@ class OpenAIProvider(LLMProvider):
         self._trim_history()
 
         messages = [{"role": "system", "content": get_system_prompt()}]
-        # Character prefill: if history is just this one message, inject an
-        # assistant greeting so the model sees itself already in-character.
-        # This dramatically reduces character breaks with proxy-routed models.
+        # Character prefill: inject an assistant greeting so the model sees
+        # itself already in-character.  Skip for Claude models (no prefill support).
         if len(self._history) == 1:
-            from llm.prompt import get_character_name
-            name = get_character_name()
-            messages.append({"role": "assistant", "content": f"(I am {name}. I stay in character at all times.)"})
+            model_lower = self.model.lower()
+            is_claude = any(k in model_lower for k in ("claude", "opus", "sonnet", "haiku"))
+            if not is_claude:
+                from llm.prompt import get_character_name
+                name = get_character_name()
+                messages.append({"role": "assistant", "content": f"(I am {name}. I stay in character at all times.)"})
         messages.extend(self._history)
 
         response = self._call_with_retry(

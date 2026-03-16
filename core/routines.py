@@ -72,6 +72,7 @@ class RoutineManager:
         self.routines: List[Routine] = []
         self._wake_time: Optional[datetime] = None   # when the user last "woke up"
         self._was_away: bool = True                   # default; overridden by _load_wake_state
+        self._away_since: Optional[datetime] = None   # when the user went away
         self._last_state_save: float = 0.0            # throttle disk writes
         self._load()
         self._load_wake_state()
@@ -178,6 +179,7 @@ class RoutineManager:
 
         if is_away and not self._was_away:
             self._was_away = True
+            self._away_since = datetime.now()
 
         # Throttle state saves to every ~30 seconds while user is active
         now = _time.monotonic()
@@ -186,6 +188,13 @@ class RoutineManager:
             self._save_wake_state()
 
         return None
+
+    @property
+    def away_duration_s(self) -> Optional[float]:
+        """How long the user was away (seconds).  Valid right after a wake event."""
+        if self._away_since is None:
+            return None
+        return (datetime.now() - self._away_since).total_seconds()
 
     @property
     def wake_time(self) -> Optional[datetime]:

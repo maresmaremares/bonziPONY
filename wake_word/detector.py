@@ -222,7 +222,8 @@ class WakeWordDetector:
                 continue
 
             try:
-                with sr.Microphone(**mic_kwargs) as source:
+                from stt.mic_lock import safe_microphone
+                with safe_microphone(**mic_kwargs) as source:
                     recognizer.adjust_for_ambient_noise(source, duration=0.3)
 
                     # Inner loop: listen while not paused/stopped

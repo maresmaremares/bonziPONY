@@ -605,21 +605,21 @@ class DesktopController:
             return False
 
     def alt_tab(self) -> None:
-        """Simulate Alt+Tab to yank the user out of fullscreen apps/games."""
+        """Send Win+D to minimize all windows and show the desktop."""
         self._enforce_cooldown()
         try:
             import ctypes
-            VK_MENU = 0x12  # Alt
-            VK_TAB = 0x09
+            VK_LWIN = 0x5B
+            VK_D = 0x44
             KEYEVENTF_KEYUP = 0x0002
             user32 = ctypes.windll.user32
-            user32.keybd_event(VK_MENU, 0, 0, 0)
-            user32.keybd_event(VK_TAB, 0, 0, 0)
-            user32.keybd_event(VK_TAB, 0, KEYEVENTF_KEYUP, 0)
-            user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-            logger.info("Alt+Tab sent")
+            user32.keybd_event(VK_LWIN, 0, 0, 0)
+            user32.keybd_event(VK_D, 0, 0, 0)
+            user32.keybd_event(VK_D, 0, KEYEVENTF_KEYUP, 0)
+            user32.keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0)
+            logger.info("Win+D sent (show desktop / minimize all)")
         except Exception as exc:
-            logger.warning("alt_tab failed: %s", exc)
+            logger.warning("alt_tab (Win+D) failed: %s", exc)
 
     def system_beep(self, frequency: int = 1000, duration_ms: int = 500) -> None:
         """Play an annoying system beep."""

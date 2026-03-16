@@ -51,11 +51,17 @@ class SpeechBubble(QWidget):
         self._thinking = False
         self._thinking_dots = 0
 
+        self._anchor_widget = None  # pet_window — follow its position
+
         self._typing_timer = QTimer(self)
         self._typing_timer.timeout.connect(self._typing_tick)
 
         self._thinking_timer = QTimer(self)
         self._thinking_timer.timeout.connect(self._thinking_tick)
+
+        self._follow_timer = QTimer(self)
+        self._follow_timer.setInterval(33)  # ~30 fps
+        self._follow_timer.timeout.connect(self._follow_tick)
 
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
@@ -63,6 +69,19 @@ class SpeechBubble(QWidget):
 
         self._font = QFont("Segoe UI", 10)
         self._font.setStyleStrategy(QFont.PreferAntialias)
+
+    def set_anchor_widget(self, widget) -> None:
+        """Set the pet window widget to follow. Bubble will track its position."""
+        self._anchor_widget = widget
+
+    def _follow_tick(self) -> None:
+        """Update bubble position to follow the pony while visible."""
+        if not self.isVisible() or self._anchor_widget is None:
+            return
+        w = self._anchor_widget
+        self._anchor_x = w.x() + w.width() // 2
+        self._anchor_y = w.y()
+        self._reposition()
 
     def show_thinking(self, anchor_x: int, anchor_y: int) -> None:
         """Show an animated '...' thinking bubble."""
@@ -79,6 +98,8 @@ class SpeechBubble(QWidget):
         self.show()
         self.raise_()
         self._thinking_timer.start(400)
+        if self._anchor_widget:
+            self._follow_timer.start()
 
     def _thinking_tick(self) -> None:
         """Cycle dots: . .. ... . .. ..."""
@@ -105,6 +126,8 @@ class SpeechBubble(QWidget):
         self.show()
         self.raise_()
         self._typing_timer.start(_TYPING_SPEED_MS)
+        if self._anchor_widget:
+            self._follow_timer.start()
 
     def hide_bubble(self) -> None:
         """Hide the speech bubble."""
@@ -112,6 +135,7 @@ class SpeechBubble(QWidget):
         self._thinking_timer.stop()
         self._typing_timer.stop()
         self._hide_timer.stop()
+        self._follow_timer.stop()
         self.hide()
 
     def paintEvent(self, event) -> None:

@@ -93,8 +93,9 @@ class Transcriber:
 
             self._recognizer = sr.Recognizer()
             # pause_threshold: seconds of non-speech before recording stops
-            # 2.0s = tolerates natural pauses without cutting off mid-thought
-            self._recognizer.pause_threshold = 2.0
+            # 1.3s = responds quickly after you stop talking but still handles
+            # natural mid-sentence pauses (breathing, thinking)
+            self._recognizer.pause_threshold = 1.3
             # non_speaking_duration: how much silence BEFORE speech to include
             # Helps capture the start of words that begin softly
             self._recognizer.non_speaking_duration = 0.5
@@ -148,6 +149,7 @@ class Transcriber:
             Use after TTS playback to flush echo/bleed from the input buffer.
         """
         import speech_recognition as sr
+        from stt.mic_lock import safe_microphone
 
         self._stop_event.clear()
         recognizer = self._get_recognizer()
@@ -157,7 +159,7 @@ class Transcriber:
             mic_kwargs["device_index"] = self.input_device_index
 
         try:
-            with sr.Microphone(**mic_kwargs) as source:
+            with safe_microphone(**mic_kwargs) as source:
                 # Calibrate to ambient noise — also drains any TTS echo from the buffer
                 calibrate_s = max(0.3, initial_discard_ms / 1000.0)
                 recognizer.adjust_for_ambient_noise(source, duration=calibrate_s)
@@ -170,12 +172,16 @@ class Transcriber:
 
                 timeout = speech_start_timeout_s if speech_start_timeout_s > 0 else None
                 try:
-                    audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=15)
+                    audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=30)
                 except _ListenInterrupted as exc:
                     logger.info("Listening interrupted — processing %d captured chunks.", len(exc.frames))
                     if not exc.frames:
                         return None
                     frame_data = b"".join(exc.frames)
+                    # Need at least ~0.5s of audio (8000 samples at 16kHz) for Whisper
+                    if len(frame_data) < SAMPLE_RATE:
+                        logger.info("Interrupted audio too short (%d bytes) — skipping.", len(frame_data))
+                        return None
                     audio = sr.AudioData(frame_data, SAMPLE_RATE, 2)
                 except sr.WaitTimeoutError:
                     logger.debug("Speech start timeout — no speech detected.")

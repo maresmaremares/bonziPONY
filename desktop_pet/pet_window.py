@@ -74,6 +74,10 @@ class PetWindow(QWidget):
         self._drag_offset = QPoint()
         self._was_roaming_before_drag = True
 
+        # Cursor grab state
+        self._grab_running = False
+        self._grab_run_timer: Optional[QTimer] = None
+
         # Setup window
         self._setup_window()
 
@@ -102,6 +106,26 @@ class PetWindow(QWidget):
             x = geom.x() + geom.width() // 2 - 100
             y = geom.y() + geom.height() - 250
             self.move(x, y)
+
+        # Reinforce stay-on-top via Win32 — Qt hint alone loses to browsers
+        # (deferred to first tick — HWND isn't valid until show())
+        self._topmost_counter = 290  # fires on first tick cycle
+
+    def _ensure_topmost(self) -> None:
+        """Use Win32 SetWindowPos to force HWND_TOPMOST."""
+        try:
+            import ctypes
+            hwnd = int(self.winId())
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_NOACTIVATE = 0x0010
+            HWND_TOPMOST = -1
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        except Exception:
+            pass
 
     def paintEvent(self, event) -> None:
         if self._current_anim is None or not self._current_anim.frames:
@@ -136,6 +160,12 @@ class PetWindow(QWidget):
     def _on_tick(self) -> None:
         """Main animation/movement tick (~60fps)."""
         now = time.monotonic()
+
+        # Re-assert topmost every ~5 seconds (300 ticks at 60fps)
+        self._topmost_counter += 1
+        if self._topmost_counter >= 300:
+            self._topmost_counter = 0
+            self._ensure_topmost()
 
         # Check timed override expiry
         if self._timed_override_until and now >= self._timed_override_until:
@@ -510,6 +540,79 @@ class PetWindow(QWidget):
     def get_anchor_point(self) -> tuple[int, int, int]:
         """Get (center_x, top_y, sprite_height) for speech bubble positioning."""
         return self.x() + self.width() // 2, self.y(), self.height()
+
+    def get_mouth_position(self) -> tuple[int, int]:
+        """Get approximate mouth position in screen coordinates.
+
+        MLP Desktop Ponies sprites follow a consistent template where the mouth
+        is roughly at 75% width from the back, 65% height from top.
+        """
+        if self._facing_right:
+            mouth_x = self.x() + int(self.width() * 0.75)
+        else:
+            mouth_x = self.x() + int(self.width() * 0.25)
+        mouth_y = self.y() + int(self.height() * 0.65)
+        return mouth_x, mouth_y
+
+    def start_grab_run(self) -> None:
+        """Force the pony into a fast run/trot animation with random direction changes."""
+        self._grab_running = True
+        self._roaming = True
+        # Cancel any overrides
+        self._override_anim_name = None
+        self._timed_override_until = 0.0
+        self._timed_anim_name = None
+        # Find a running/walking behavior for the animation
+        walk_behavior = None
+        for name in ("trot", "walk", "gallop", "dash", "dash_ground", "walk_wings"):
+            if name in self.behavior_manager.behaviors:
+                walk_behavior = self.behavior_manager.behaviors[name]
+                break
+        if walk_behavior:
+            self._current_behavior = walk_behavior
+            self._behavior_start_time = time.monotonic()
+            self._behavior_duration = 999.0  # won't expire during grab
+            self._current_anim, _ = self._load_behavior_anim(walk_behavior)
+            self._frame_index = 0
+            self._last_frame_time = time.monotonic()
+            if self._current_anim and self._current_anim.frames:
+                px = self._current_anim.frames[0]
+                self.setFixedSize(px.width(), px.height())
+        else:
+            self._pick_and_start_behavior()
+            self._behavior_duration = 999.0
+        # Fast movement
+        speed = 5
+        self._dx = speed if self._facing_right else -speed
+        self._dy = 0
+        # Schedule random direction changes every 1-2s
+        self._grab_run_timer = QTimer(self)
+        self._grab_run_timer.timeout.connect(self._grab_run_change_dir)
+        self._grab_run_timer.start(random.randint(800, 1800))
+
+    def _grab_run_change_dir(self) -> None:
+        """Change direction randomly during a grab run."""
+        if not self._grab_running:
+            return
+        self._facing_right = not self._facing_right
+        speed = 5
+        self._dx = speed if self._facing_right else -speed
+        self._dy = random.choice([-2, -1, 0, 1, 2])
+        self._update_facing()
+        # Keep behavior alive
+        self._behavior_start_time = time.monotonic()
+        self._behavior_duration = 999.0
+        if self._grab_run_timer:
+            self._grab_run_timer.setInterval(random.randint(800, 1800))
+
+    def stop_grab_run(self) -> None:
+        """Stop the grab run and return to normal roaming."""
+        self._grab_running = False
+        if self._grab_run_timer:
+            self._grab_run_timer.stop()
+            self._grab_run_timer = None
+        self._roaming = True
+        self._pick_and_start_behavior()
 
     # ── Mouse interaction ───────────────────────────────────────────────────
 

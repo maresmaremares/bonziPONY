@@ -55,12 +55,15 @@ class PetController(QObject):
     # Signals emitted from pipeline thread, received on GUI thread
     state_changed = pyqtSignal(str)          # PipelineState name
     speech_text = pyqtSignal(str)            # Text to show in bubble
+    heard_text = pyqtSignal(str)             # STT transcription to show
     conversation_started = pyqtSignal()
     conversation_ended = pyqtSignal()
     action_triggered = pyqtSignal(str)       # RobotAction name
     trick_requested = pyqtSignal()           # do a cool trick
     timed_override = pyqtSignal(str, int)    # (animation_name, seconds)
     move_to = pyqtSignal(str)               # screen region name
+    grab_run_start = pyqtSignal()           # start grab-cursor run animation
+    grab_run_stop = pyqtSignal()            # stop grab-cursor run animation
 
     def __init__(self) -> None:
         super().__init__()
@@ -89,6 +92,10 @@ class PetController(QObject):
     def on_speech_text(self, text: str) -> None:
         """Called when the pipeline has response text to display."""
         self.speech_text.emit(text)
+
+    def on_heard_text(self, text: str) -> None:
+        """Called when the STT transcribes what the user said."""
+        self.heard_text.emit(text)
 
     def on_conversation_start(self) -> None:
         """Called when a conversation begins."""

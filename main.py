@@ -65,6 +65,21 @@ def main() -> None:
     )
 
     logger = logging.getLogger(__name__)
+
+    # Enable faulthandler to capture segfaults / C-level crashes
+    import faulthandler
+    try:
+        # rainbow_dash.log → rainbow_CRASH.log (her mocked nickname)
+        log_path = Path(config.logging.log_file)
+        crash_name = log_path.stem.rsplit("_", 1)[0] + "_CRASH.log"
+        crash_log = log_path.parent / crash_name
+        crash_log.parent.mkdir(parents=True, exist_ok=True)
+        _crash_fh = open(crash_log, "w")
+        faulthandler.enable(file=_crash_fh, all_threads=True)
+        logger.info("Crash handler enabled → %s", crash_log)
+    except Exception:
+        faulthandler.enable()  # fallback: write to stderr
+
     logger.info("Desktop Pony is waking up!")
 
     # ── Pre-load torch BEFORE PyQt5 ───────────────────────────────────────────
@@ -181,6 +196,7 @@ def main() -> None:
     from desktop_pet.effect_renderer import EffectRenderer
     from desktop_pet.pet_window import PetWindow
     from desktop_pet.speech_bubble import SpeechBubble
+    from desktop_pet.heard_text import HeardText
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -249,6 +265,7 @@ def main() -> None:
             tts_config=config.tts,
             moondream=moondream,
             vision_config=config.vision,
+            on_grab_cursor=None,  # wired after _on_grab_cursor is defined
         )
 
     # Prune stale user profile events on startup
@@ -365,12 +382,17 @@ def main() -> None:
     pipeline.set_callbacks(
         on_state_change=pet_controller.on_state_change,
         on_speech_text=pet_controller.on_speech_text,
+        on_heard_text=pet_controller.on_heard_text,
         on_conversation_start=pet_controller.on_conversation_start,
         on_conversation_end=pet_controller.on_conversation_end,
     )
 
     # Create speech bubble
     speech_bubble = SpeechBubble()
+    speech_bubble.set_anchor_widget(pet_window)
+
+    heard_text = HeardText()
+    heard_text.set_anchor_widget(pet_window)
 
     # ── Connect signals → slots ──────────────────────────────────────────────
 
@@ -387,7 +409,12 @@ def main() -> None:
             ax, ay, ah = pet_window.get_anchor_point()
             speech_bubble.show_thinking(ax, ay)
 
+    def _on_heard_text(text: str) -> None:
+        """Show what the STT heard below the pony."""
+        heard_text.show_heard(text)
+
     def _on_speech_text(text: str) -> None:
+        heard_text.hide_heard()  # Replace with speech bubble
         if config.desktop_pet.speech_bubble:
             ax, ay, ah = pet_window.get_anchor_point()
             speech_bubble.show_text(text, ax, ay, sprite_h=ah)
@@ -400,6 +427,7 @@ def main() -> None:
         pet_window.clear_override()
         pet_window.resume_roaming()
         speech_bubble.hide_bubble()
+        heard_text.hide_heard()
 
     def _on_action_triggered(action_name: str) -> None:
         anim = PetController.get_animation_for_action(action_name)
@@ -412,11 +440,37 @@ def main() -> None:
     def _on_move_to(region: str) -> None:
         pet_window.move_to_region(region)
 
+    # ── Cursor grab (pony grabs the mouse and runs with it) ────────────
+
+    def _on_grab_cursor(duration: float) -> None:
+        """Pony grabs the cursor and runs around with it for `duration` seconds.
+        Called from pipeline thread — blocks like mess_with_mouse does.
+        Uses signals for animation start/stop (Qt thread safety)."""
+        import ctypes
+        import time as _time
+
+        # Signal main thread to start grab-run animation
+        pet_controller.grab_run_start.emit()
+        _time.sleep(0.1)  # let the animation start
+
+        end_time = _time.monotonic() + duration
+        while _time.monotonic() < end_time:
+            try:
+                mx, my = pet_window.get_mouth_position()
+                ctypes.windll.user32.SetCursorPos(mx, my)
+            except Exception:
+                pass
+            _time.sleep(0.016)  # ~60fps
+
+        # Signal main thread to stop grab-run animation
+        pet_controller.grab_run_stop.emit()
+
     # Use QueuedConnection for ALL signals — they're emitted from the pipeline
     # thread but the slots manipulate Qt widgets which must run on the main thread.
     pet_controller.state_changed.connect(_on_state_changed, Qt.QueuedConnection)
     # BlockingQueuedConnection: pipeline thread blocks until main thread shows the bubble,
     # guaranteeing the bubble is visible BEFORE audio playback starts.
+    pet_controller.heard_text.connect(_on_heard_text, Qt.QueuedConnection)
     pet_controller.speech_text.connect(_on_speech_text, Qt.BlockingQueuedConnection)
     pet_controller.conversation_started.connect(_on_conversation_started, Qt.QueuedConnection)
     pet_controller.conversation_ended.connect(_on_conversation_ended, Qt.QueuedConnection)
@@ -424,6 +478,12 @@ def main() -> None:
     pet_controller.trick_requested.connect(pet_window.do_trick, Qt.QueuedConnection)
     pet_controller.timed_override.connect(_on_timed_override, Qt.QueuedConnection)
     pet_controller.move_to.connect(_on_move_to, Qt.QueuedConnection)
+    pet_controller.grab_run_start.connect(pet_window.start_grab_run, Qt.QueuedConnection)
+    pet_controller.grab_run_stop.connect(pet_window.stop_grab_run, Qt.QueuedConnection)
+
+    # Wire cursor grab callback to agent loop (defined after both exist)
+    if agent_loop:
+        agent_loop._on_grab_cursor = _on_grab_cursor
 
     # ── Double-click activation ──────────────────────────────────────────────
 

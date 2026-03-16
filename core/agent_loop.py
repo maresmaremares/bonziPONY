@@ -136,7 +136,7 @@ class Directive:
     urgency: int                       # 1–10
     created_at: float                  # time.monotonic()
     last_action_at: float              # last time agent spoke/acted for this
-    escalation_count: int = 0
+    next_nag_at: float = 0.0           # monotonic time of next nag (LLM-driven)
     source: str = "user"               # "user" or "self"
     trigger_time: Optional[str] = None # wall-clock trigger time e.g. "21:00"
     triggered: bool = False            # has the timer fired?
@@ -169,7 +169,8 @@ class AgentDecision:
     create_directive: Optional[Dict[str, Any]] = None
     complete_directive: Optional[int] = None
     adjust_urgency: Optional[Dict[str, Any]] = None
-    next_check_seconds: float = 120.0
+    next_check_seconds: float = 120.0      # legacy fallback for idle checks
+    directive_timings: Dict[str, Dict] = field(default_factory=dict)  # per-directive timing from LLM
 
 
 class AgentLoop:
@@ -191,6 +192,7 @@ class AgentLoop:
         tts_config=None,
         moondream=None,
         vision_config=None,
+        on_grab_cursor=None,
     ) -> None:
         self._config = config
         self._monitor = screen_monitor
@@ -206,13 +208,12 @@ class AgentLoop:
         self._moondream = moondream    # optional, cheap local vision model
         self._transcriber = transcriber  # for enforcement mic listening
         self._vision_config = vision_config  # for screen_vision setting
+        self._on_grab_cursor = on_grab_cursor  # callback for cursor grab (main thread)
 
         self.directives: List[Directive] = []
         self._action_log: List[str] = []         # recent actions, capped at 15
-        self._next_check_at: float = time.monotonic() + 10.0  # first check after 10s
+        self._next_idle_check_at: float = time.monotonic() + 10.0  # for self-initiation/spontaneous
         self._last_self_check: float = 0.0
-        self._last_escalation: float = 0.0
-        self._next_escalation_interval: float = random.uniform(90.0, 180.0)  # 1.5-3 min
         self._next_spontaneous: float = time.monotonic() + random.uniform(
             self._config.spontaneous_speech_min_s, self._config.spontaneous_speech_max_s,
         )
@@ -239,12 +240,15 @@ class AgentLoop:
             now = time.monotonic()
 
             for dd in data.get("directives", []):
+                # Restore next_nag_at from offset (monotonic doesn't persist)
+                offset = dd.get("next_nag_offset_s", 0)
+                nag_at = now + max(0, offset)
                 d = Directive(
                     goal=dd["goal"],
                     urgency=dd.get("urgency", 5),
                     created_at=now,   # monotonic doesn't persist; reset to now
                     last_action_at=now,
-                    escalation_count=dd.get("escalation_count", 0),
+                    next_nag_at=nag_at,
                     source=dd.get("source", "user"),
                     trigger_time=dd.get("trigger_time"),
                     triggered=dd.get("triggered", False),
@@ -288,11 +292,12 @@ class AgentLoop:
         """Save directives and enforcement state to disk."""
         try:
             dirs = []
+            now = time.monotonic()
             for d in self.directives:
                 dirs.append({
                     "goal": d.goal,
                     "urgency": d.urgency,
-                    "escalation_count": d.escalation_count,
+                    "next_nag_offset_s": max(0, d.next_nag_at - now),
                     "source": d.source,
                     "trigger_time": d.trigger_time,
                     "triggered": d.triggered,
@@ -334,6 +339,18 @@ class AgentLoop:
         goal = _re.sub(r'^(?:remind|tell|get|make|have|nag)\s+(?:them|him|her)\s+(?:to\s+)?', '', goal, flags=_re.IGNORECASE)
         return goal.strip()
 
+    @staticmethod
+    def _initial_nag_delay(urgency: int) -> float:
+        """Get initial delay in seconds before first nag, based on urgency."""
+        if urgency >= 9:
+            return random.uniform(15.0, 30.0)
+        elif urgency >= 7:
+            return random.uniform(60.0, 120.0)
+        elif urgency >= 4:
+            return random.uniform(180.0, 480.0)
+        else:
+            return random.uniform(600.0, 900.0)
+
     def add_directive(self, goal: str, urgency: int, source: str = "user") -> None:
         """Add a new directive (max ``max_directives``)."""
         if len(self.directives) >= self._config.max_directives:
@@ -342,11 +359,13 @@ class AgentLoop:
         goal = self._clean_goal(goal)
         urgency = max(1, min(10, urgency))
         now = time.monotonic()
-        d = Directive(goal=goal, urgency=urgency, created_at=now, last_action_at=now, source=source)
+        nag_at = now + self._initial_nag_delay(urgency)
+        d = Directive(goal=goal, urgency=urgency, created_at=now, last_action_at=now,
+                      next_nag_at=nag_at, source=source)
         self.directives.append(d)
-        self._next_check_at = now + 5.0  # check soon after new directive
         self.save_directives()
-        logger.info("Directive added [%s]: %r (urgency %d)", source, goal, urgency)
+        logger.info("Directive added [%s]: %r (urgency %d, first nag in %.0fs)",
+                     source, goal, urgency, nag_at - now)
 
     def add_timer(self, time_str: str, action: str) -> None:
         """Add a time-triggered directive (fires at a specific wall-clock time)."""
@@ -478,8 +497,8 @@ class AgentLoop:
         """Pause/resume autonomous behavior during conversations."""
         self._conversation_active = active
         if not active:
-            # After conversation ends, wait a bit before next check
-            self._next_check_at = time.monotonic() + 30.0
+            # After conversation ends, wait a bit before next idle check
+            self._next_idle_check_at = time.monotonic() + 30.0
 
     @property
     def has_directives(self) -> bool:
@@ -747,7 +766,12 @@ class AgentLoop:
         """Called every ~1s from the pipeline thread. Decides if anything needs doing."""
         # Always track idle/wake state — needed for sleep detection even during conversation
         idle_ms = _get_idle_ms()
+        away_dur = self.routine_manager.away_duration_s  # grab BEFORE update clears it
         self._last_wake_event = self.routine_manager.update_activity(idle_ms)
+
+        # Welcome-back greeting when user returns from AFK
+        if self._last_wake_event == "wake" and not self._conversation_active:
+            self._welcome_back(away_dur)
 
         # Enforcement runs even during conversation for idle TRACKING, but
         # don't poll/react during active conversation (user IS at keyboard talking to Dash)
@@ -767,27 +791,23 @@ class AgentLoop:
         # Check recurring routines (wake/sleep detection + scheduled)
         self._check_routines()
 
-        # Auto-escalate directives over time (randomized interval)
-        if self.directives and (now - self._last_escalation) > self._next_escalation_interval:
-            self._auto_escalate()
-            self._last_escalation = now
-            self._next_escalation_interval = random.uniform(90.0, 180.0)  # 1.5-3 min
-
-        # Check if it's time for an LLM call
-        if now < self._next_check_at:
-            return
-
         # Don't do anything proactive while user is asleep/away
         if self.routine_manager.is_user_away:
-            self._next_check_at = now + 60.0  # check back in a minute
             return
 
-        # Only tick for actionable directives (exclude unfired timers)
+        # Per-directive timing: check if ANY directive is due for a nag
         actionable = [d for d in self.directives
                       if not (d.trigger_time and not d.triggered)]
-        if actionable:
+        due = [d for d in actionable if d.next_nag_at <= now]
+        if due:
             self._execute_tick()
-        else:
+            return
+
+        # No directives due — handle idle behavior (self-initiation, spontaneous speech)
+        if now < self._next_idle_check_at:
+            return
+
+        if not actionable:
             # No active directives — check self-initiation and spontaneous speech
             if self._config.self_initiate:
                 if (now - self._last_self_check) >= self._config.self_initiate_interval_s:
@@ -805,7 +825,7 @@ class AgentLoop:
                 self._spontaneous_speech()
                 self._next_spontaneous = time.monotonic() + next_in
             else:
-                self._next_check_at = now + min(
+                self._next_idle_check_at = now + min(
                     self._config.base_check_interval_s,
                     self._next_spontaneous - now + 1.0,
                 )
@@ -827,16 +847,38 @@ class AgentLoop:
             decision = self._parse_decision(raw)
             self._execute_decision(decision, state)
 
-            # Schedule next check
-            next_s = max(self._config.min_check_interval_s,
-                         min(300.0, decision.next_check_seconds))
-            self._next_check_at = time.monotonic() + next_s
-            print(f"[Agent] Decision: speak={bool(decision.speak)}, actions={len(decision.actions)}, next check in {next_s:.0f}s", flush=True)
+            # Apply per-directive timings from LLM
+            now_m = time.monotonic()
+            actionable = [d for d in self.directives
+                          if not (d.trigger_time and not d.triggered)]
+            for i, d in enumerate(actionable):
+                key = str(i)
+                if key in decision.directive_timings:
+                    timing = decision.directive_timings[key]
+                    nag_min = float(timing.get("next_nag_minutes", 10))
+                    d.next_nag_at = now_m + nag_min * 60.0
+                    if "urgency" in timing:
+                        d.urgency = max(1, min(10, int(timing["urgency"])))
+                else:
+                    # LLM didn't mention this directive — default 10 min
+                    if d.next_nag_at <= now_m:
+                        d.next_nag_at = now_m + 600.0
+            self.save_directives()
+
+            timings_str = ", ".join(
+                f"d{k}→{v.get('next_nag_minutes', '?')}min"
+                for k, v in decision.directive_timings.items()
+            )
+            print(f"[Agent] Decision: speak={bool(decision.speak)}, actions={len(decision.actions)}, timings=[{timings_str}]", flush=True)
 
         except Exception as exc:
             print(f"[Agent] Tick failed: {exc}", flush=True)
             logger.warning("Agent tick failed: %s", exc)
-            self._next_check_at = time.monotonic() + 60.0  # back off on error
+            # Back off on error — push all due directives out 60s
+            now_m = time.monotonic()
+            for d in self.directives:
+                if d.next_nag_at <= now_m:
+                    d.next_nag_at = now_m + 60.0
 
     def _build_tick_prompt(self, state: ScreenState) -> str:
         """Build the structured prompt for the agent tick LLM call."""
@@ -878,13 +920,15 @@ class AgentLoop:
         if actionable:
             lines.append("")
             lines.append("ACTIVE DIRECTIVES:")
+            now_t = time.monotonic()
             for i, d in enumerate(actionable):
-                age = self._fmt_duration(time.monotonic() - d.created_at)
+                age = self._fmt_duration(now_t - d.created_at)
+                since_nag = self._fmt_duration(now_t - d.last_action_at)
                 timer_info = f', timer: {d.trigger_time}(FIRED)' if d.trigger_time else ''
                 delay_info = ', ALREADY DELAYED ONCE — NO MORE DELAYS' if d.delayed else ''
                 lines.append(
                     f'{i}. "{d.goal}" [urgency {d.urgency}/10, active {age}, '
-                    f'escalated {d.escalation_count}x, source: {d.source}{timer_info}{delay_info}]'
+                    f'last nag {since_nag} ago, source: {d.source}{timer_info}{delay_info}]'
                 )
 
         # Recent actions
@@ -903,7 +947,7 @@ class AgentLoop:
             "Your thinking is PRIVATE — never spoken aloud. Only the JSON fields are executed.",
             "",
             "After your <think> block, respond with a JSON object:",
-            '{"speak":"text to say or null","actions":[],"desktop_commands":[],"create_directive":null,"complete_directive":null,"adjust_urgency":null,"next_check_seconds":120}',
+            '{"speak":"text or null","actions":[],"desktop_commands":[],"create_directive":null,"complete_directive":null,"directives":{"0":{"next_nag_minutes":15,"urgency":5}}}',
             "",
             "Field guide:",
             '- speak: short sentence to say out loud (TTS), or null to stay quiet',
@@ -913,17 +957,20 @@ class AgentLoop:
             '  - {"command":"MINIMIZE_TITLE","args":["substring"]} — minimize by title (only works on maximized/large windows)',
             '  - {"command":"SHAKE_TITLE","args":["substring"]} — SHAKE/VIBRATE a window violently (only targets maximized/large windows)',
             '  - {"command":"SHAKE_ALL","args":[]} — shake all MAXIMIZED windows (earthquake mode, high urgency only)',
-            '  - {"command":"MESS_MOUSE","args":[]} — jitter the mouse chaotically (high urgency only)',
+            '  - {"command":"MESS_MOUSE","args":[]} — grab the cursor and run around with it (high urgency only)',
             '  - {"command":"PAUSE_MEDIA","args":[]} — press play/pause key (use for YouTube, Spotify, media apps instead of minimizing)',
             '  - {"command":"GOOGLE_IMAGES","args":["search term"]} — open Google Images for the thing they should be doing (e.g. "gym motivation", "healthy food", "sleeping peacefully")',
-            '  - {"command":"ALT_TAB","args":[]} — simulate Alt+Tab to yank user out of fullscreen apps/games',
+            '  - {"command":"ALT_TAB","args":[]} — Win+D: MINIMIZE ALL WINDOWS and show desktop (nuclear option)',
             '  - {"command":"OPEN","args":["app_name"]}',
             '  - {"command":"BROWSE","args":["url"]}',
             '  - {"command":"WRITE_NOTEPAD","args":["content with \\n for newlines"]} — open Notepad and write content (lists, routines, plans, notes)',
             '- create_directive: {"goal":"...","urgency":1-10} or null — goal must be a DIRECT ACTION like "eat food", "go to sleep", "do homework". NEVER write "remind user to" or "get user to" — just the action itself.',
             '- complete_directive: index of directive to mark done, or null',
-            '- adjust_urgency: {"index":0,"urgency":8} or null',
-            '- next_check_seconds: 60-300, when to look again',
+            '- directives: for EACH active directive by index, decide timing and urgency:',
+            '  {"0": {"next_nag_minutes": 15, "urgency": 5}, "1": {"next_nag_minutes": 45, "urgency": 3}}',
+            '  Think about: What\'s the task? How urgent? How long since last nag? Is the user busy?',
+            '  Would nagging NOW be effective? Low urgency = space it out (30-60 min). High urgency = nag often (1-5 min).',
+            '  You can raise or lower urgency based on context. This replaces adjust_urgency.',
             "",
             "Rules:",
             "- If you have a directive, STAY FOCUSED on it. Escalate if user ignores you.",
@@ -932,11 +979,11 @@ class AgentLoop:
             f"  CHAOS ROLL this tick: {random.randint(1, 100)}",
             "  Urgency 1-3: speak and nag only.",
             "  Urgency 4-5: nag harder. If chaos roll > 60, SHAKE a window (skip if fullscreen).",
-            "  Urgency 6: GOOGLE_IMAGES the directive goal. SHAKE or ALT_TAB if fullscreen.",
-            "  Urgency 7: GOOGLE_IMAGES + ALT_TAB + PAUSE_MEDIA. If chaos roll > 40, MESS_MOUSE.",
+            "  Urgency 6: GOOGLE_IMAGES the directive goal. SHAKE or ALT_TAB (minimizes ALL windows) if fullscreen.",
+            "  Urgency 7: GOOGLE_IMAGES + ALT_TAB + PAUSE_MEDIA. If chaos roll > 40, MESS_MOUSE (grabs their cursor!).",
             "  Urgency 8: ALT_TAB + MESS_MOUSE. If chaos roll > 30, close/minimize windows.",
-            "  Urgency 9-10: FULL NUCLEAR. ALT_TAB, MESS_MOUSE, close everything. Go wild.",
-            "- IMPORTANT: SHAKE does NOT work on fullscreen apps/games. Use ALT_TAB instead.",
+            "  Urgency 9-10: FULL NUCLEAR. ALT_TAB (minimize everything), MESS_MOUSE (grab cursor), close windows. Go wild.",
+            "- IMPORTANT: SHAKE does NOT work on fullscreen apps/games. Use ALT_TAB (Win+D, minimizes ALL windows) instead.",
             "- The chaos roll adds unpredictability — sometimes you're chill, sometimes you snap early. Embrace it.",
             "- Be creative and in-character. You're a prankster with a mission.",
             "- CRITICAL: When speaking, talk DIRECTLY TO the user in second person. NEVER say 'remind the user' or 'get user to' — you ARE talking to them. Say 'go do it' not 'remind user to do it'.",
@@ -971,6 +1018,19 @@ class AgentLoop:
                 logger.warning("JSON parse failed: %s — raw: %s", exc, json_str[:200])
                 return AgentDecision(next_check_seconds=60.0)
 
+        # Parse per-directive timings (new system)
+        dir_timings = data.get("directives") or {}
+        if not isinstance(dir_timings, dict):
+            dir_timings = {}
+
+        # Legacy: if LLM returned adjust_urgency, fold it into directive_timings
+        adj = data.get("adjust_urgency")
+        if adj and isinstance(adj, dict):
+            idx = str(adj.get("index", 0))
+            if idx not in dir_timings:
+                dir_timings[idx] = {}
+            dir_timings[idx]["urgency"] = adj.get("urgency", 5)
+
         return AgentDecision(
             speak=data.get("speak"),
             actions=data.get("actions") or [],
@@ -978,7 +1038,8 @@ class AgentLoop:
             create_directive=data.get("create_directive"),
             complete_directive=data.get("complete_directive"),
             adjust_urgency=data.get("adjust_urgency"),
-            next_check_seconds=float(data.get("next_check_seconds", 60)),
+            next_check_seconds=float(data.get("next_check_seconds", 120)),
+            directive_timings=dir_timings,
         )
 
     def _fallback_decision(self) -> AgentDecision:
@@ -1076,17 +1137,21 @@ class AgentLoop:
                         self._desktop.shake_all_windows()
                         self._log_action("Shook ALL windows (earthquake mode)")
                     elif command == "MESS_MOUSE":
-                        # Duration grows: 5s, 8s, 11s, 14s, ... up to 30s
-                        duration = min(5.0 + self._mess_mouse_count * 3.0, 30.0)
+                        # Duration grows: 15s, 22s, 29s, 36s, 43s, ... up to 60s
+                        duration = min(15.0 + self._mess_mouse_count * 7.0, 60.0)
                         self._mess_mouse_count += 1
-                        self._desktop.mess_with_mouse(duration=duration)
-                        self._log_action(f"Messed with mouse ({duration:.0f}s)")
+                        if self._on_grab_cursor:
+                            self._on_grab_cursor(duration)
+                            self._log_action(f"Grabbed cursor and ran with it ({duration:.0f}s)")
+                        elif self._desktop:
+                            self._desktop.mess_with_mouse(duration=duration)
+                            self._log_action(f"Messed with mouse ({duration:.0f}s)")
                     elif command == "PAUSE_MEDIA":
                         self._desktop.pause_media()
                         self._log_action("Paused media playback")
                     elif command == "ALT_TAB":
                         self._desktop.alt_tab()
-                        self._log_action("Alt+Tab (yank out of fullscreen)")
+                        self._log_action("Win+D (minimized all windows)")
                     elif command == "GOOGLE_IMAGES":
                         if args:
                             import urllib.parse
@@ -1113,15 +1178,6 @@ class AgentLoop:
                 logger.info("Directive completed: %r", removed.goal)
                 if not self.directives:
                     self._mess_mouse_count = 0
-                self.save_directives()
-
-        if decision.adjust_urgency is not None:
-            idx = decision.adjust_urgency.get("index", -1)
-            new_urg = decision.adjust_urgency.get("urgency", 5)
-            if 0 <= idx < len(self.directives):
-                old_urg = self.directives[idx].urgency
-                self.directives[idx].urgency = max(1, min(10, new_urg))
-                logger.info("Directive %d urgency: %d → %d", idx, old_urg, new_urg)
                 self.save_directives()
 
         if decision.create_directive is not None:
@@ -1246,14 +1302,14 @@ class AgentLoop:
         """Check if screen state warrants starting a directive on our own."""
         state = self._monitor.get_state()
         if not state.foreground:
-            self._next_check_at = time.monotonic() + self._config.self_initiate_interval_s
+            self._next_idle_check_at = time.monotonic() + self._config.self_initiate_interval_s
             return
 
         # Dynamic distraction detection
         is_distraction = self._is_likely_distraction(state)
 
         if not is_distraction or state.foreground_duration_s < self._config.sustained_focus_threshold_s:
-            self._next_check_at = time.monotonic() + self._config.self_initiate_interval_s
+            self._next_idle_check_at = time.monotonic() + self._config.self_initiate_interval_s
             return
 
         # Distraction detected for a while — ask LLM if she should intervene
@@ -1288,11 +1344,46 @@ class AgentLoop:
                 self._log_action(f"Self-initiated: \"{decision.speak[:80]}\"")
 
             next_s = max(self._config.min_check_interval_s, decision.next_check_seconds)
-            self._next_check_at = time.monotonic() + next_s
+            self._next_idle_check_at = time.monotonic() + next_s
 
         except Exception as exc:
             logger.warning("Self-initiation check failed: %s", exc)
-            self._next_check_at = time.monotonic() + self._config.self_initiate_interval_s
+            self._next_idle_check_at = time.monotonic() + self._config.self_initiate_interval_s
+
+    # ── Welcome-back greeting ────────────────────────────────────────────
+
+    def _welcome_back(self, away_seconds: Optional[float]) -> None:
+        """Greet the user when they return from AFK."""
+        try:
+            if away_seconds and away_seconds > 0:
+                if away_seconds < 300:
+                    dur = f"{away_seconds / 60:.0f} minutes"
+                elif away_seconds < 7200:
+                    dur = f"{away_seconds / 3600:.1f} hours"
+                else:
+                    dur = f"{away_seconds / 3600:.0f} hours"
+            else:
+                dur = "a while"
+            name = get_character_name()
+            prompt = (
+                f"(The user just came back after being away for {dur}. "
+                f"Welcome them back in ONE short sentence as {name}. "
+                f"Be casual — maybe comment on how long they were gone, "
+                f"ask what they were up to, or just say hi. Keep it brief.)"
+            )
+            raw = self._llm.generate_once(prompt)
+            if raw:
+                from llm.response_parser import parse_response
+                parsed = parse_response(raw)
+                text = parsed.text or raw
+                self._speak(text)
+                self._llm.inject_history(
+                    f"(User returned after being away for {dur}.)",
+                    text,
+                )
+                self._log_action(f"Welcome back after {dur}")
+        except Exception as exc:
+            logger.warning("Welcome-back greeting failed: %s", exc)
 
     # ── Spontaneous speech (fallback when idle) ────────────────────────────
 
@@ -1350,7 +1441,7 @@ class AgentLoop:
             print(f"[Agent] Spontaneous speech failed: {exc}", flush=True)
             logger.warning("Spontaneous speech failed: %s", exc)
         finally:
-            self._next_check_at = time.monotonic() + self._config.base_check_interval_s
+            self._next_idle_check_at = time.monotonic() + self._config.base_check_interval_s
 
     def _listen_for_reply(self) -> None:
         """After spontaneous speech, open the mic briefly for a user response.
@@ -1593,39 +1684,6 @@ class AgentLoop:
             logger.info("Routine fired [%s]: %r", schedule_desc, r.goal)
 
     # ── Helpers ─────────────────────────────────────────────────────────────
-
-    def _auto_escalate(self) -> None:
-        """Bump urgency on directives that have been active a while."""
-        now = time.monotonic()
-        for d in self.directives:
-            # Don't escalate unfired timers — they wait for wall-clock match
-            if d.trigger_time and not d.triggered:
-                continue
-            # Escalate every 5 minutes of being active
-            age_min = (now - d.created_at) / 60.0
-            expected_escalations = int(age_min / 5)
-            if expected_escalations > d.escalation_count and d.urgency < 10:
-                d.escalation_count = expected_escalations
-                old = d.urgency
-                d.urgency = min(10, d.urgency + 1)
-                logger.info(
-                    "Auto-escalated directive %r: urgency %d → %d (active %.0f min)",
-                    d.goal[:40], old, d.urgency, age_min,
-                )
-        self.save_directives()
-
-    def _get_check_interval(self) -> float:
-        """Return check interval based on max directive urgency."""
-        # Only consider actionable directives (not unfired timers)
-        actionable = [d for d in self.directives
-                      if not (d.trigger_time and not d.triggered)]
-        if not actionable:
-            return self._config.base_check_interval_s
-        max_urg = max(d.urgency for d in actionable)
-        # Linear interpolation: urgency 1 → base_interval, urgency 10 → min_interval
-        t = (max_urg - 1) / 9.0
-        interval = self._config.base_check_interval_s * (1 - t) + self._config.min_check_interval_s * t
-        return interval
 
     def _log_action(self, description: str) -> None:
         """Record an action for context in future ticks."""

@@ -99,6 +99,7 @@ class Pipeline:
         # Optional GUI callbacks
         self._on_state_change = None
         self._on_speech_text = None
+        self._on_heard_text = None
         self._on_conversation_start = None
         self._on_conversation_end = None
 
@@ -106,12 +107,14 @@ class Pipeline:
         self,
         on_state_change=None,
         on_speech_text=None,
+        on_heard_text=None,
         on_conversation_start=None,
         on_conversation_end=None,
     ) -> None:
         """Set optional callbacks for GUI integration."""
         self._on_state_change = on_state_change
         self._on_speech_text = on_speech_text
+        self._on_heard_text = on_heard_text
         self._on_conversation_start = on_conversation_start
         self._on_conversation_end = on_conversation_end
 
@@ -329,6 +332,11 @@ class Pipeline:
                     return False
 
             logger.info("User said: %r", user_text)
+            if self._on_heard_text:
+                try:
+                    self._on_heard_text(user_text)
+                except Exception:
+                    pass
             original_user_text = user_text  # save before injections for heuristic check
             self._remember_topic(user_text)
 
@@ -403,7 +411,14 @@ class Pipeline:
                     if hist is not None and len(hist) >= 2:
                         hist.pop()  # broken assistant response
                         hist.pop()  # our user message (chat() will re-add it)
-                    raw_response = self.llm.chat(user_text)
+                    # Prepend a strong reminder to stay in character
+                    name = get_character_name()
+                    retry_text = (
+                        f"[System: STAY IN CHARACTER. You are {name}. Do NOT analyze, "
+                        f"explain, or output code/markdown. Just respond naturally as {name} "
+                        f"in spoken words.]\n\n{user_text}"
+                    )
+                    raw_response = self.llm.chat(retry_text)
                     logger.info("LLM retry response: %r", raw_response)
                     if self._is_character_break(raw_response):
                         logger.warning("Character break on retry — using fallback.")
@@ -576,14 +591,16 @@ class Pipeline:
     # Phrases that indicate the model broke character and is meta-analyzing
     _CHARACTER_BREAK_PHRASES = (
         "system prompt", "character configuration", "character card",
+        "character prompt", "desktop companion",
         "claude on claude", "i'm claude", "i am claude", "as claude",
         "i'm an ai", "i am an ai", "as an ai", "language model",
         "i'm chatgpt", "i am chatgpt", "as chatgpt",
-        "desktop companion prompt", "bonzipony conversation",
+        "desktop companion prompt", "bonzipony conversation", "bonzipony",
         "sharing this with me", "sharing your prompt",
         "looking at this document", "analyze this prompt",
         "let me understand what's happening",
-        "roleplay", "role-play", "stay in character",
+        "let me break down", "let me analyze", "let me examine",
+        "roleplay", "role-play", "stay in character", "in-character",
         "the user is asking me to", "the user is asking",
         "i'm an assistant", "i am an assistant",
         "how can i help you today",
@@ -594,15 +611,52 @@ class Pipeline:
         "voice rules",            # quoting our own system prompt
         "would respond",          # "here's how X would respond"
         "the user wants",
+        "here's a",               # "here's a simple/basic/quick..."
+        "here is a",
+        "i'll create", "i will create",  # "I'll create a..."
+        "let me create",
+        "i'll build", "i will build",
+        "i'll make", "i will make",
+        "i'll write",             # "I'll write some code..." (not WRITE_NOTEPAD)
+        "well-crafted", "well crafted",  # meta-praise of the prompt
+        "key components", "action system", "accountability system",
+        "prompt for", "prompt design",
+        "tts rules", "anti-slop", "conversation flow",
+        "directive system", "enforcement", "action tags",
     )
     # Strong signals — a single hit is enough
     _CHARACTER_BREAK_STRONG = (
         "system prompt", "character card", "character configuration",
+        "character prompt",
         "i'm claude", "i am claude", "i'm chatgpt", "i am chatgpt",
         "as an ai assistant",
         "based on this document", "based on this prompt",
         "based on the document", "based on the prompt",
         "here's how", "here is how",
+        "let me break down",      # meta-analysis opener
+        "well-crafted",           # praising the prompt
+        "desktop companion application",
+        "## ",                    # markdown header in speech = instant break
+    )
+
+    # Regex patterns that detect code/structured output (never valid in spoken responses)
+    _CODE_OUTPUT_PATTERNS = (
+        re.compile(r"```"),                          # code fences
+        re.compile(r"^#{1,6}\s+\w", re.MULTILINE),  # markdown headers
+        re.compile(r"^\*\*[^*]+\*\*\s*[-—:]", re.MULTILINE),  # **Bold** - description (markdown analysis)
+        re.compile(r"^import \w+", re.MULTILINE),    # Python imports
+        re.compile(r"^from \w+ import", re.MULTILINE),
+        re.compile(r"^def \w+\(", re.MULTILINE),     # Python function defs
+        re.compile(r"^class \w+[\(:]", re.MULTILINE), # Python class defs
+        re.compile(r"<(?:div|span|html|body|head|script|style|form|input|button|p|h[1-6]|ul|ol|li|table|tr|td|a\s|img\s)[^>]*>", re.IGNORECASE),  # HTML tags
+        re.compile(r"^\s*(?:const|let|var|function)\s+\w+", re.MULTILINE),  # JS declarations
+        re.compile(r"document\.(?:getElementById|querySelector|createElement)", re.IGNORECASE),  # DOM manipulation
+        re.compile(r"\.(?:addEventListener|innerHTML|textContent|appendChild)\b"),  # DOM methods
+        re.compile(r"^\s*<\?php", re.MULTILINE),     # PHP
+        re.compile(r"(?:console|window)\.(?:log|alert|confirm)\("),  # JS console/window
+        re.compile(r"\{\s*\n\s*(?:return|if|for|while)\b", re.MULTILINE),  # code blocks with control flow
+        re.compile(r"^\s*[-*]\s+`[^`]+`\s*[-—:]", re.MULTILINE),  # - `tag` — description (docs)
+        re.compile(r"^\d+\.\s+\*\*", re.MULTILINE),  # 1. **Bold** (numbered markdown list)
     )
 
     # Regex to strip meta-analysis preamble before in-character content
@@ -613,15 +667,23 @@ class Pipeline:
 
     @staticmethod
     def _is_character_break(response: str) -> bool:
-        """Detect when the model broke character and is meta-analyzing the prompt."""
+        """Detect when the model broke character and is meta-analyzing the prompt,
+        OR when it outputs code/structured content instead of spoken dialogue."""
         if not response or len(response) < 30:
             return False
         lower = response.lower()
         # Single strong signal is enough
         if any(phrase in lower for phrase in Pipeline._CHARACTER_BREAK_STRONG):
             return True
+        # Code output detection — if 2+ code patterns match, it's definitely not speech
+        code_hits = sum(1 for pat in Pipeline._CODE_OUTPUT_PATTERNS if pat.search(response))
+        if code_hits >= 2:
+            return True
         # Two weak signals
         hits = sum(1 for phrase in Pipeline._CHARACTER_BREAK_PHRASES if phrase in lower)
+        # A single code pattern + a single phrase = break
+        if code_hits >= 1 and hits >= 1:
+            return True
         return hits >= 2
 
     @staticmethod
