@@ -101,7 +101,9 @@ class Transcriber:
             self._recognizer.non_speaking_duration = 0.5
             # Let the library auto-adjust energy threshold based on ambient noise
             self._recognizer.dynamic_energy_threshold = True
-            self._recognizer.energy_threshold = 200
+            self._recognizer.energy_threshold = 100
+            self._recognizer.dynamic_energy_adjustment_damping = 0.08
+            self._recognizer.dynamic_energy_ratio = 1.3
             logger.info(
                 "Recognizer initialized (pause_threshold=%.1fs)",
                 self._recognizer.pause_threshold,

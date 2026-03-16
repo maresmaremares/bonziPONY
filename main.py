@@ -269,12 +269,13 @@ def main() -> None:
             on_grab_cursor=None,  # wired after _on_grab_cursor is defined
         )
 
-    # Prune stale user profile events on startup
+    # Compact user profile and prune stale events on startup
     try:
-        from core.user_profile import prune_events
+        from core.user_profile import prune_events, compact_profile
+        compact_profile(llm_provider)
         prune_events(llm_provider)
     except Exception as exc:
-        logger.debug("Event pruning skipped: %s", exc)
+        logger.debug("Profile maintenance skipped: %s", exc)
 
     # Build pipeline with PetController as the robot
     pipeline = Pipeline(

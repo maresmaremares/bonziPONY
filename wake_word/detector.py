@@ -208,8 +208,11 @@ class WakeWordDetector:
         # Short pause threshold — wake phrases are brief
         recognizer.pause_threshold = 0.8
         recognizer.non_speaking_duration = 0.3
+        # Very sensitive — false triggers don't matter (Whisper filters them)
         recognizer.dynamic_energy_threshold = True
-        recognizer.energy_threshold = 100  # Very low — catch even quiet speech
+        recognizer.energy_threshold = 50
+        recognizer.dynamic_energy_adjustment_damping = 0.05
+        recognizer.dynamic_energy_ratio = 1.2
 
         mic_kwargs: dict = {"sample_rate": SAMPLE_RATE}
         if self._input_device_index >= 0:
@@ -224,7 +227,7 @@ class WakeWordDetector:
             try:
                 from stt.mic_lock import safe_microphone
                 with safe_microphone(**mic_kwargs) as source:
-                    recognizer.adjust_for_ambient_noise(source, duration=0.3)
+                    recognizer.adjust_for_ambient_noise(source, duration=0.15)
 
                     # Inner loop: listen while not paused/stopped
                     while not self._stop.is_set() and not self._paused.is_set():
@@ -252,7 +255,7 @@ class WakeWordDetector:
                                 audio_f32,
                                 language=self._language,
                                 fp16=False,
-                                no_speech_threshold=0.2,
+                                no_speech_threshold=0.3,
                             )
                             text = result.get("text", "").strip()
                         except Exception as exc:

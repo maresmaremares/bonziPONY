@@ -67,6 +67,29 @@ Conversation:
 Now extract. Be concise. Only genuinely interesting or useful facts — skip \
 trivial filler. Output the two sections and nothing else."""
 
+_COMPACT_PROMPT = """\
+Below is a user profile that has accumulated over many sessions. It may have \
+duplicates, contradictions, outdated info, or trivial filler.
+
+Rewrite it into a clean, compact profile. Rules:
+- Keep ONLY important, useful facts (name, age, location, job/school, key \
+interests, personality, living situation, health, relationships, preferences)
+- Remove duplicates — if the same fact appears multiple times, keep it once
+- If two facts contradict, keep the more recent/specific one
+- Remove trivial filler ("user said hi", "user was tired today", etc.)
+- Keep it as SHORT as possible while retaining all genuinely useful information
+- One fact per line, short and direct, no bullets or prefixes
+- If the profile is already clean, return it unchanged
+
+Today's date: {today}
+
+Current profile:
+---
+{profile}
+---
+
+Return ONLY the cleaned profile text, nothing else."""
+
 _PRUNE_PROMPT = """\
 Below is a list of time-sensitive events and follow-ups for a user. \
 Today's date is {today}.
@@ -201,6 +224,35 @@ def prune_events(llm_provider) -> None:
             logger.info("Events list pruned.")
     except Exception as exc:
         logger.warning("Event pruning failed: %s", exc)
+
+
+def compact_profile(llm_provider) -> None:
+    """
+    Summarize and deduplicate the user profile.  Call on startup each session
+    so the profile stays tight and doesn't grow unbounded.
+    """
+    profile = get_profile()
+    if not profile:
+        return
+
+    # Only compact if the profile is getting long (>15 lines)
+    line_count = len([l for l in profile.splitlines() if l.strip()])
+    if line_count < 15:
+        logger.debug("Profile is short (%d lines) — skipping compaction.", line_count)
+        return
+
+    today = datetime.now().strftime("%B %d, %Y")
+    prompt = _COMPACT_PROMPT.format(today=today, profile=profile)
+
+    try:
+        raw = llm_provider.generate_once(prompt)
+        if raw and raw.strip():
+            compacted = raw.strip()
+            new_count = len([l for l in compacted.splitlines() if l.strip()])
+            _write_file(_PROFILE_FILE, compacted)
+            logger.info("Profile compacted: %d lines → %d lines.", line_count, new_count)
+    except Exception as exc:
+        logger.warning("Profile compaction failed: %s", exc)
 
 
 def _parse_and_save(raw: str) -> None:
