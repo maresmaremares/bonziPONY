@@ -165,7 +165,10 @@ class Pipeline:
             return
 
         cfg = self.config.conversation
-        deadline = time.monotonic() + cfg.timeout_s
+        # Minimum 15s conversation window — lower values make multi-turn
+        # conversations nearly impossible (user can't respond in time)
+        convo_timeout = max(cfg.timeout_s, 15.0)
+        deadline = time.monotonic() + convo_timeout
         just_spoke = True  # TTS just played; first follow-up listen needs echo drain
 
         print("\n[Conversation mode — just keep talking, no wake word needed]")
@@ -199,7 +202,7 @@ class Pipeline:
                 print("[Conversation ended naturally]")
                 break
             if spoke:
-                deadline = time.monotonic() + cfg.timeout_s
+                deadline = time.monotonic() + convo_timeout
                 just_spoke = True
 
         print("[Conversation ended — say the wake word to start again]")
@@ -296,12 +299,32 @@ class Pipeline:
             return
 
         try:
+            # Build conversation transcript from history so the LLM can see
+            # what was actually said (generate_once only sends system prompt)
+            history = list(getattr(self.llm, "_history", []))
+            if len(history) < 2:
+                return
+
+            transcript_lines = []
+            for msg in history:
+                role = msg.get("role", "?")
+                content = msg.get("content", "")
+                if role == "system":
+                    continue
+                speaker = "User" if role == "user" else "Pony"
+                transcript_lines.append(f"{speaker}: {content}")
+
+            if not transcript_lines:
+                return
+
+            transcript = "\n".join(transcript_lines[-30:])
             prompt = (
-                "(System: Summarize this conversation in 3-5 bullet points. "
+                "Summarize this conversation in 3-5 bullet points. "
                 "Be as brief as possible — key topics, anything important said, "
-                "notable moments. Plain text, no formatting.)"
+                "notable moments. Plain text, no formatting.\n\n"
+                f"Conversation:\n{transcript}"
             )
-            summary = self.llm.generate_once(prompt)
+            summary = self.llm.generate_once(prompt, max_tokens=512)
             if summary and summary.strip():
                 from core.memory import save_summary
                 save_summary(summary)
@@ -389,13 +412,18 @@ class Pipeline:
                     " once, REFUSE. Say 'no, you already got your extension. go do it NOW.' Do NOT give a"
                     " second delay under any circumstances — the user had their chance."
                 )
-                hint += (
-                    " IMPORTANT: Include [CONVO:CONTINUE] if you expect a reply (asked a question, "
-                    "mid-conversation) or [CONVO:END] if the conversation is naturally over (goodbye, "
-                    "going AFK, user leaving to do something, short acknowledgment with nothing to follow up on)."
-                )
                 hint += "]"
                 user_text += hint
+
+            # ALWAYS inject conversation flow hint (even without agent loop)
+            # so the LLM outputs [CONVO:CONTINUE/END] tags reliably
+            user_text += (
+                "\n\n[IMPORTANT: End your reply with [CONVO:CONTINUE] or [CONVO:END]. "
+                "Default to [CONVO:CONTINUE] — conversations should keep going unless the user "
+                "is explicitly saying goodbye, leaving, or going AFK. A short reply like "
+                "'ok cool' or 'thanks' from the user is NOT a reason to end — they might "
+                "have more to say. Only use [CONVO:END] for clear goodbyes and sign-offs.]"
+            )
 
             self._transition(PipelineState.THINK)
             raw_response = self.llm.chat(user_text)
@@ -704,33 +732,45 @@ class Pipeline:
         return response
 
     # Phrases that signal the user is leaving or ending the conversation
+    # Only match clear, unambiguous goodbye phrases — not casual acknowledgments
     _USER_END_PHRASES = (
         "goodnight", "good night", "night night", "nighty night",
-        "gotta go", "gonna go", "im going to go", "i'm going to go",
         "going to sleep", "gonna sleep", "heading to bed", "going to bed",
-        "brb", "be right back", "be back", "talk later", "talk to you later",
-        "bye", "goodbye", "see ya", "see you", "later", "peace", "im out",
-        "i'm out", "gotta run", "gotta bounce", "heading out",
-        "ok thanks", "ok cool", "alright thanks", "alright cool",
-        "ok bye", "alright bye",
+        "talk to you later", "talk later",
+        "goodbye", "ok bye", "alright bye",
+        "gotta go", "gonna go", "heading out", "gotta run", "gotta bounce",
+        "im out", "i'm out",
     )
     # Phrases in Dash's response that signal she's done talking
     _RESPONSE_END_PHRASES = (
         "goodnight", "good night", "night night", "sleep well", "sleep tight",
-        "sweet dreams", "see ya", "see you", "later", "bye", "peace",
-        "take care", "be safe", "go go go",
+        "sweet dreams",
     )
 
     def _heuristic_convo_end(self, user_text: str, response_text: str) -> bool:
-        """Fallback: detect obvious conversation enders when LLM forgets the tag."""
-        u = user_text.lower()
+        """Fallback: detect obvious conversation enders when LLM forgets the tag.
+
+        This should be CONSERVATIVE — false negatives (missing an ending) just
+        mean the conversation listens for one more round, which is fine.  False
+        positives (ending too early) are much worse because the user has to
+        re-trigger the wake word.
+        """
+        u = user_text.lower().strip()
+        # Only match if the ENTIRE user message is a goodbye phrase (or very close)
+        # Don't substring-match — "I'll do it later" should NOT end the conversation
+        u_words = u.split()
+        if len(u_words) <= 4:
+            if any(u == phrase or u.rstrip("!.") == phrase for phrase in self._USER_END_PHRASES):
+                return True
+        # For longer messages, only match if they START with a goodbye
+        if len(u_words) <= 6:
+            if any(u.startswith(phrase) for phrase in ("gotta go", "gonna go", "heading out",
+                                                        "going to sleep", "heading to bed")):
+                return True
+        # Dash's response sounds like a sign-off AND is very short (not a question)
         r = response_text.lower()
-        # User said something that sounds like leaving
-        if any(phrase in u for phrase in self._USER_END_PHRASES):
-            return True
-        # Dash's response sounds like a sign-off AND is short (not a question)
         if any(phrase in r for phrase in self._RESPONSE_END_PHRASES):
-            if "?" not in response_text and len(response_text.split()) < 20:
+            if "?" not in response_text and len(response_text.split()) < 12:
                 return True
         return False
 
@@ -943,9 +983,11 @@ class Pipeline:
             self._recent_topics.pop(0)
 
     def _extract_user_profile(self, force: bool = False) -> None:
-        """Run background extraction of user profile facts from conversation.
+        """Extract user profile facts from conversation.
 
         Rate-limited to once per 4 hours unless force=True (shutdown).
+        When force=True (shutdown), runs synchronously so the process doesn't
+        exit before extraction completes.  Otherwise runs in a background thread.
         """
         if not self.llm.has_history():
             return
@@ -962,15 +1004,20 @@ class Pipeline:
                 return
             self._last_profile_extraction = now
             print("[Profile] Extracting user profile from conversation...", flush=True)
-            # Run in background thread so it doesn't block the next wake word
-            t = threading.Thread(
-                target=update_from_conversation,
-                args=(self.llm, history),
-                daemon=True,
-            )
-            t.start()
+            if force:
+                # Shutdown path — run synchronously so the process doesn't
+                # exit before the LLM call finishes
+                update_from_conversation(self.llm, history)
+            else:
+                # Normal path — background thread so it doesn't block wake word
+                t = threading.Thread(
+                    target=update_from_conversation,
+                    args=(self.llm, history),
+                    daemon=True,
+                )
+                t.start()
         except Exception as exc:
-            logger.warning("Profile extraction launch failed: %s", exc)
+            logger.warning("Profile extraction failed: %s", exc)
 
     @staticmethod
     def _parse_time_estimate(text: str) -> Optional[int]:
