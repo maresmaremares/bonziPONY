@@ -216,6 +216,91 @@ class Pipeline:
                 pass
         self._transition(PipelineState.IDLE)
 
+    def run_conversation_with_text(self, text: str) -> None:
+        """Like run_conversation but with pre-supplied text for the first turn.
+
+        Used by push-to-talk: the audio is already transcribed, so we skip
+        the first listen but still enter the follow-up conversation loop.
+        """
+        if self._on_conversation_start:
+            try:
+                self._on_conversation_start()
+            except Exception:
+                pass
+
+        if self.agent_loop:
+            self.agent_loop.set_conversation_active(True)
+
+        self._last_end_conversation = False
+        if self._on_heard_text:
+            try:
+                self._on_heard_text(text)
+            except Exception:
+                pass
+        spoke = self._run_turn(play_ack=False, user_text=text)
+        if not spoke and not self._last_end_conversation:
+            if self.agent_loop:
+                self.agent_loop.set_conversation_active(False)
+            if self._on_conversation_end:
+                try:
+                    self._on_conversation_end()
+                except Exception:
+                    pass
+            self._transition(PipelineState.IDLE)
+            return
+
+        if self._last_end_conversation:
+            if self.agent_loop:
+                self.agent_loop.set_conversation_active(False)
+            if self._on_conversation_end:
+                try:
+                    self._on_conversation_end()
+                except Exception:
+                    pass
+            self._transition(PipelineState.IDLE)
+            return
+
+        # Enter follow-up conversation loop (same as run_conversation)
+        cfg = self.config.conversation
+        convo_timeout = max(cfg.timeout_s, 15.0)
+        deadline = time.monotonic() + convo_timeout
+        just_spoke = True
+
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            wait = min(cfg.listen_timeout_s, remaining)
+            if wait <= 0:
+                break
+
+            self._transition(PipelineState.LISTEN)
+            discard_ms = 600 if just_spoke else 0
+            user_text = self.transcriber.listen(speech_start_timeout_s=wait, initial_discard_ms=discard_ms)
+            just_spoke = False
+
+            if not user_text or not user_text.strip():
+                break
+
+            from stt.transcriber import _is_whisper_hallucination
+            if _is_whisper_hallucination(user_text):
+                continue
+
+            spoke = self._run_turn(play_ack=False, user_text=user_text)
+            if self._last_end_conversation:
+                break
+            if spoke:
+                deadline = time.monotonic() + convo_timeout
+                just_spoke = True
+
+        self._extract_user_profile()
+        if self.agent_loop:
+            self.agent_loop.set_conversation_active(False)
+        if self._on_conversation_end:
+            try:
+                self._on_conversation_end()
+            except Exception:
+                pass
+        self._transition(PipelineState.IDLE)
+
     def run_text_conversation(self, text: str) -> None:
         """Handle a typed message — skips STT, goes straight to LLM."""
         if self._on_conversation_start:

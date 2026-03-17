@@ -26,6 +26,7 @@ class AudioConfig:
     output_device_index: int = -1
     vad_aggressiveness: int = 2
     silence_duration_ms: int = 800
+    ptt_key: str = "f6"  # push-to-talk key (hold to record, release to send)
 
 
 @dataclass
@@ -251,6 +252,7 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
             output_device_index=audio_raw.get("output_device_index", -1),
             vad_aggressiveness=audio_raw.get("vad_aggressiveness", 2),
             silence_duration_ms=audio_raw.get("silence_duration_ms", 800),
+            ptt_key=audio_raw.get("ptt_key", "f6"),
         ),
         whisper=WhisperConfig(
             model=whisper_raw.get("model", "base"),

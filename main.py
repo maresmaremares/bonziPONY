@@ -564,6 +564,42 @@ def main() -> None:
     pet_window.text_message.connect(_on_text_message)
     pet_window.listen_interrupted.connect(transcriber.interrupt_listening)
 
+    # ── Push-to-talk (PTT) ───────────────────────────────────────────────────
+
+    _ptt_active = threading.Event()      # set while key is held
+    _ptt_stop = threading.Event()        # set on key release to stop recording
+    _ptt_pending = threading.Event()     # signals pipeline loop that PTT audio is ready
+
+    ptt_key = config.audio.ptt_key or "f6"
+    _ptt_available = False
+    try:
+        import keyboard as _kb
+
+        def _ptt_on_press(event):
+            if _ptt_active.is_set():
+                return  # already recording (key repeat)
+            _ptt_active.set()
+            _ptt_stop.clear()
+            activation_event.set()
+            _ptt_pending.set()
+            logger.debug("PTT key pressed — recording started.")
+
+        def _ptt_on_release(event):
+            if not _ptt_active.is_set():
+                return
+            _ptt_active.clear()
+            _ptt_stop.set()
+            logger.debug("PTT key released — recording stopped.")
+
+        _kb.on_press_key(ptt_key, _ptt_on_press, suppress=False)
+        _kb.on_release_key(ptt_key, _ptt_on_release, suppress=False)
+        _ptt_available = True
+        logger.info("Push-to-talk enabled: hold '%s' to talk.", ptt_key)
+    except ImportError:
+        logger.info("Push-to-talk disabled — install 'keyboard' package to enable (pip install keyboard).")
+    except Exception as exc:
+        logger.warning("Push-to-talk setup failed: %s", exc)
+
     # ── Pipeline thread ──────────────────────────────────────────────────────
 
     _shutdown_requested = threading.Event()
@@ -586,7 +622,7 @@ def main() -> None:
                 if _shutdown_requested.is_set():
                     break
 
-                # Check for double-click activation or typed message
+                # Check for double-click activation, typed message, or PTT
                 if keyword_index is None and activation_event.is_set():
                     activation_event.clear()
                     # Check if there's a typed message waiting
@@ -596,6 +632,24 @@ def main() -> None:
                         try:
                             pipeline.run_text_conversation(typed)
                         finally:
+                            if not _shutdown_requested.is_set():
+                                detector.resume()
+                        continue
+                    # Push-to-talk: record while key is held, then run turn
+                    if _ptt_pending.is_set():
+                        _ptt_pending.clear()
+                        detector.pause()
+                        try:
+                            pet_controller.on_state_change("LISTEN")
+                            ptt_text = transcriber.listen_ptt(_ptt_stop)
+                            if ptt_text and ptt_text.strip():
+                                logger.info("PTT heard: %r", ptt_text)
+                                pipeline.run_conversation_with_text(ptt_text)
+                            else:
+                                pet_controller.on_state_change("IDLE")
+                        finally:
+                            _ptt_active.clear()
+                            _ptt_stop.clear()
                             if not _shutdown_requested.is_set():
                                 detector.resume()
                         continue

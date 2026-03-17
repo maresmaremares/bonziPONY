@@ -273,3 +273,83 @@ class Transcriber:
         except Exception as exc:
             logger.error("Listening failed: %s", exc)
             return None
+
+    def listen_ptt(self, stop_event: threading.Event) -> Optional[str]:
+        """Push-to-talk: record while stop_event is NOT set, transcribe on release.
+
+        Unlike listen(), this doesn't use silence detection — it records
+        continuously until the PTT key is released (stop_event is set).
+        """
+        import struct
+        try:
+            import pyaudio
+        except ImportError:
+            logger.error("pyaudio not available for PTT")
+            return None
+
+        frames: list[bytes] = []
+        frame_size = int(SAMPLE_RATE * 30 / 1000)  # 30ms frames
+
+        try:
+            from stt.mic_lock import _mic_lock
+            with _mic_lock:
+                pa = pyaudio.PyAudio()
+                stream_kwargs = dict(
+                    format=pyaudio.paInt16, channels=CHANNELS, rate=SAMPLE_RATE,
+                    input=True, frames_per_buffer=frame_size,
+                )
+                if self.input_device_index is not None:
+                    stream_kwargs["input_device_index"] = self.input_device_index
+                stream = pa.open(**stream_kwargs)
+
+            try:
+                while not stop_event.is_set():
+                    try:
+                        data = stream.read(frame_size, exception_on_overflow=False)
+                        frames.append(data)
+                    except Exception:
+                        break
+            finally:
+                with _mic_lock:
+                    stream.stop_stream()
+                    stream.close()
+                    pa.terminate()
+
+            if not frames:
+                return None
+
+            # Notify GUI that recording is done
+            if self.on_recording_done:
+                try:
+                    self.on_recording_done()
+                except Exception:
+                    pass
+
+            audio_bytes = b"".join(frames)
+            # Need at least ~0.3s of audio
+            if len(audio_bytes) < SAMPLE_RATE * 2 * 0.3:
+                logger.debug("PTT audio too short (%d bytes) — skipping.", len(audio_bytes))
+                return None
+
+            audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+            audio_f32 = audio_int16.astype(np.float32) / 32768.0
+
+            # Voice filter check
+            vf = self._get_voice_filter()
+            if vf and vf.enrolled and not vf.is_user(audio_f32):
+                logger.info("PTT voice filter: rejected (not enrolled user).")
+                return None
+
+            # Transcribe with Whisper
+            logger.debug("PTT: transcribing %d samples via Whisper...", len(audio_f32))
+            model = self._get_whisper_model()
+            result = model.transcribe(audio_f32, language=self.language, fp16=False)
+            text = result.get("text", "").strip()
+            if text and not _is_whisper_hallucination(text):
+                logger.debug("PTT transcription: %r", text)
+                return text
+            return None
+
+        except Exception as exc:
+            logger.error("PTT listen failed: %s", exc)
+            return None
