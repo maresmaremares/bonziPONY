@@ -135,14 +135,17 @@ class OpenAIProvider(LLMProvider):
             text = text[:idx]
         return text.strip()
 
-    def generate_once(self, prompt: str, max_tokens: int | None = None) -> str:
+    def generate_once(self, prompt: str, max_tokens: int | None = None,
+                      system_prompt: str | None = None) -> str:
         """One-shot call — does not touch self._history."""
-        from llm.prompt import get_system_prompt
+        if system_prompt is None:
+            from llm.prompt import get_system_prompt
+            system_prompt = get_system_prompt()
         t0 = time.time()
         response = self._call_with_retry(
             model=self.model,
             messages=[
-                {"role": "system", "content": get_system_prompt()},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             temperature=self.temperature,

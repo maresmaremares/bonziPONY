@@ -18,8 +18,14 @@ class LLMProvider(ABC):
         """Clear conversation history."""
 
     @abstractmethod
-    def generate_once(self, prompt: str, max_tokens: int | None = None) -> str:
-        """One-shot generation that does NOT affect conversation history."""
+    def generate_once(self, prompt: str, max_tokens: int | None = None,
+                      system_prompt: str | None = None) -> str:
+        """One-shot generation that does NOT affect conversation history.
+
+        If system_prompt is provided, it overrides the default character
+        system prompt.  Use this for utility tasks (summarization, profile
+        extraction) that should NOT be in-character.
+        """
 
     def has_history(self) -> bool:
         """Return True if there is any conversation history to summarize."""

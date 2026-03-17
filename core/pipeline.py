@@ -324,7 +324,10 @@ class Pipeline:
                 "notable moments. Plain text, no formatting.\n\n"
                 f"Conversation:\n{transcript}"
             )
-            summary = self.llm.generate_once(prompt, max_tokens=512)
+            summary = self.llm.generate_once(
+                prompt, max_tokens=512,
+                system_prompt="You are a helpful assistant that summarizes conversations. Be concise and factual. Do NOT role-play or respond in character.",
+            )
             if summary and summary.strip():
                 from core.memory import save_summary
                 save_summary(summary)

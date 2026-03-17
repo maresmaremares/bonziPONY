@@ -197,7 +197,10 @@ def update_from_conversation(llm_provider, conversation_history: list[dict]) -> 
     )
 
     try:
-        raw = llm_provider.generate_once(prompt)
+        raw = llm_provider.generate_once(
+            prompt, max_tokens=1024,
+            system_prompt="You are a helpful assistant that extracts structured information from conversations. Follow the instructions exactly. Do NOT role-play or respond in character.",
+        )
         if not raw:
             return
         _parse_and_save(raw)
@@ -217,8 +220,9 @@ def prune_events(llm_provider) -> None:
     today = datetime.now().strftime("%B %d, %Y")
     prompt = _PRUNE_PROMPT.format(today=today, events=events)
 
+    _UTIL_SYSTEM = "You are a helpful assistant. Follow the instructions exactly. Do NOT role-play or respond in character."
     try:
-        raw = llm_provider.generate_once(prompt)
+        raw = llm_provider.generate_once(prompt, system_prompt=_UTIL_SYSTEM)
         if raw and raw.strip():
             _write_file(_EVENTS_FILE, raw.strip())
             logger.info("Events list pruned.")
@@ -244,8 +248,9 @@ def compact_profile(llm_provider) -> None:
     today = datetime.now().strftime("%B %d, %Y")
     prompt = _COMPACT_PROMPT.format(today=today, profile=profile)
 
+    _UTIL_SYSTEM = "You are a helpful assistant. Follow the instructions exactly. Do NOT role-play or respond in character."
     try:
-        raw = llm_provider.generate_once(prompt)
+        raw = llm_provider.generate_once(prompt, system_prompt=_UTIL_SYSTEM)
         if raw and raw.strip():
             compacted = raw.strip()
             new_count = len([l for l in compacted.splitlines() if l.strip()])

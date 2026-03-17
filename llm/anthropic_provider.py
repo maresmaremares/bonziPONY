@@ -115,12 +115,15 @@ class AnthropicProvider(LLMProvider):
             text = text[:idx]
         return text.strip()
 
-    def generate_once(self, prompt: str, max_tokens: int | None = None) -> str:
+    def generate_once(self, prompt: str, max_tokens: int | None = None,
+                      system_prompt: str | None = None) -> str:
         """One-shot call — does not touch self._history."""
-        from llm.prompt import get_system_prompt
+        if system_prompt is None:
+            from llm.prompt import get_system_prompt
+            system_prompt = get_system_prompt()
         response = self._call_with_retry(
             model=self.model,
-            system=get_system_prompt(),
+            system=system_prompt,
             messages=[{"role": "user", "content": prompt}],
             temperature=self.temperature,
             max_tokens=max_tokens or self.max_tokens,
