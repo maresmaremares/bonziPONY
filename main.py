@@ -476,6 +476,9 @@ def main() -> None:
         if state_name == "THINK" and config.desktop_pet.speech_bubble:
             ax, ay, ah = pet_window.get_anchor_point()
             speech_bubble.show_thinking(ax, ay)
+        elif state_name == "IDLE" and config.desktop_pet.speech_bubble:
+            # Clear thinking bubble if LLM decided not to speak
+            speech_bubble.hide_bubble()
 
     def _on_heard_text(text: str) -> None:
         """Show what the STT heard below the pony."""
@@ -700,6 +703,7 @@ def main() -> None:
                     if _ptt_result_ready.is_set():
                         _ptt_result_ready.clear()
                         ptt_text = _ptt_result_text
+                        _ptt_result_text = None  # consume — prevent stale replays
                         if ptt_text and ptt_text.strip():
                             print(f"[PTT] Heard: \"{ptt_text}\"", flush=True)
                             logger.info("PTT heard: %r", ptt_text)
@@ -713,6 +717,10 @@ def main() -> None:
                             if not _shutdown_requested.is_set():
                                 detector.resume()
                         continue
+                    # No PTT and no text message — this was a double-click or
+                    # other activation. Only open mic if PTT isn't mid-recording.
+                    if _ptt_recording:
+                        continue  # PTT in progress, don't open a second mic
                     keyword_index = 0  # Treat as voice conversation trigger
 
                 if keyword_index is None:

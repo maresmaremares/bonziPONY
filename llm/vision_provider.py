@@ -99,8 +99,8 @@ class VisionProvider:
                     {
                         "role": "system",
                         "content": (
-                            "You are a screen reader providing detailed descriptions of a computer screen "
-                            "for someone who cannot see it. Your output is consumed by another AI, not a human."
+                            "You are a concise screen reader. Output is consumed by another AI. "
+                            "Be brief — only include what's relevant. No filler."
                         ),
                     },
                     {
@@ -113,20 +113,18 @@ class VisionProvider:
                             {
                                 "type": "text",
                                 "text": (
-                                    "Describe this screenshot in detail. Include:\n"
-                                    "1. APPLICATIONS: Which programs/windows are open, which is focused\n"
-                                    "2. TEXT/OCR: Read and transcribe any visible text — titles, tabs, chat messages, "
-                                    "code, articles, captions, notifications, URLs. Quote key text verbatim.\n"
-                                    "3. MEDIA: If a video/stream/game is playing, describe what's happening in it\n"
-                                    "4. ACTIVITY: What the user appears to be doing (browsing, coding, chatting, gaming, etc.)\n"
-                                    "Ignore the small animated pony sprite — that's a desktop pet overlay, not relevant.\n"
-                                    "Be thorough. The more detail you provide, the better."
+                                    "What's on this screen? Be concise. Include:\n"
+                                    "- Focused app and what's in it (title, key visible text)\n"
+                                    "- What the user is doing (browsing, coding, gaming, watching, chatting)\n"
+                                    "- Any notable content (video title, article headline, chat topic)\n"
+                                    "Skip decorative UI elements, taskbar, desktop icons. "
+                                    "Ignore the small animated pony sprite overlay."
                                 ),
                             },
                         ],
                     },
                 ],
-                max_tokens=1024,
+                max_tokens=300,
                 temperature=self._temperature,
             )
             elapsed = time.time() - t0

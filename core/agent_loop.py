@@ -1774,6 +1774,7 @@ class AgentLoop:
                 self._detector.pause()
             if self._on_state_change:
                 self._on_state_change("LISTEN")
+            print("[Agent] Listening for reply...", flush=True)
 
             # Listen with a short timeout — don't wait too long for a reply
             user_text = self._transcriber.listen(
@@ -1782,7 +1783,7 @@ class AgentLoop:
             )
 
             if not user_text or not user_text.strip():
-                logger.debug("No reply to spontaneous speech — moving on.")
+                print("[Agent] No reply — moving on.", flush=True)
                 return
 
             # Filter Whisper hallucinations
