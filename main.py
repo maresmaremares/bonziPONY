@@ -701,6 +701,7 @@ def main() -> None:
                     # Push-to-talk: recording already happened on its own thread
                     # (detector was paused by the recording thread)
                     if _ptt_result_ready.is_set():
+                        nonlocal _ptt_result_text
                         _ptt_result_ready.clear()
                         ptt_text = _ptt_result_text
                         _ptt_result_text = None  # consume — prevent stale replays
