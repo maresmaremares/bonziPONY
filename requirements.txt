@@ -44,7 +44,7 @@ pygetwindow>=0.0.9
 pywin32>=306                    # win32gui, win32con, etc.
 
 # ── Input / hotkeys ──────────────────────────────────────────
-keyboard>=0.13.5               # global hotkey detection (push-to-talk)
+pynput>=1.7.0                  # global hotkey detection (push-to-talk, no admin needed)
 
 # ── Config / utilities ────────────────────────────────────────
 PyYAML>=6.0.1
