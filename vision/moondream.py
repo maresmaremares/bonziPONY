@@ -10,9 +10,12 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _PROMPT = (
-    "Describe what's on this computer screen concisely in 2-3 sentences. "
-    "Focus on which applications or windows are open, what content is displayed, "
-    "and any notable text or activity. Ignore any small animated sprite overlay."
+    "Describe this computer screenshot in detail. "
+    "Which applications/windows are open and which is focused? "
+    "Read and transcribe any visible text: window titles, tab names, chat messages, "
+    "code, articles, notifications, URLs. Quote key text verbatim. "
+    "If video/stream/game is playing, describe what's happening. "
+    "What is the user doing? Ignore any small animated sprite overlay."
 )
 
 
@@ -40,6 +43,7 @@ class MoondreamDescriber:
             if self._model is not None or self._loading or not self._available:
                 return
             self._loading = True
+        print("[Moondream] Loading vision model in background...", flush=True)
         t = threading.Thread(target=self._load, daemon=True, name="moondream-loader")
         t.start()
 
@@ -50,9 +54,9 @@ class MoondreamDescriber:
             mem = psutil.virtual_memory()
             free_gb = mem.available / (1024 ** 3)
             if free_gb < 2.0:
-                logger.warning(
-                    "Moondream skipped — only %.1f GB RAM free (need ≥2 GB).", free_gb
-                )
+                msg = f"Moondream skipped — only {free_gb:.1f} GB RAM free (need ≥2 GB)."
+                logger.warning(msg)
+                print(f"[Moondream] SKIPPED: {msg}", flush=True)
                 self._available = False
                 self._loading = False
                 return False
@@ -63,6 +67,7 @@ class MoondreamDescriber:
             from transformers import AutoModelForCausalLM, AutoTokenizer
 
             model_id = "vikhyatk/moondream2"
+            print(f"[Moondream] Downloading/loading model '{model_id}' on {self._device}...", flush=True)
             logger.info("Loading Moondream2 (%s)...", self._device)
             tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
             model = AutoModelForCausalLM.from_pretrained(
@@ -72,10 +77,12 @@ class MoondreamDescriber:
                 self._tokenizer = tokenizer
                 self._model = model
                 self._loading = False
+            print("[Moondream] Ready!", flush=True)
             logger.info("Moondream2 ready on %s.", self._device)
             return True
         except Exception as exc:
-            logger.warning("Moondream2 failed to load: %s", exc)
+            print(f"[Moondream] FAILED to load: {type(exc).__name__}: {exc}", flush=True)
+            logger.warning("Moondream2 failed to load: %s: %s", type(exc).__name__, exc)
             with self._lock:
                 self._available = False
                 self._loading = False
@@ -105,5 +112,6 @@ class MoondreamDescriber:
             result = self._model.answer_question(enc_image, _PROMPT, self._tokenizer)
             return result.strip() if result else None
         except Exception as exc:
-            logger.warning("Moondream describe failed: %s", exc)
+            print(f"[Moondream] describe() failed: {type(exc).__name__}: {exc}", flush=True)
+            logger.warning("Moondream describe failed: %s: %s", type(exc).__name__, exc)
             return None

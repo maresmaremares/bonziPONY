@@ -29,6 +29,32 @@ class ScreenState:
     open_windows: List[WindowInfo]
     recent_changes: List[str]
     timestamp: float
+    is_media_fullscreen: bool = False  # user is watching video/media in fullscreen
+
+
+# ── Media app detection ──────────────────────────────────────────────────
+
+_MEDIA_EXES = {
+    "vlc.exe", "mpv.exe", "mpc-hc64.exe", "mpc-hc.exe", "mpc-be64.exe",
+    "potplayer.exe", "potplayer64.exe", "potplayermini64.exe",
+    "wmplayer.exe", "smplayer.exe", "plex.exe", "plexmediaplayer.exe",
+    "kodi.exe", "stremio.exe", "jellyfinmediaplayer.exe",
+}
+
+_MEDIA_TITLE_KEYWORDS = [
+    "youtube", "netflix", "hulu", "disney+", "disneyplus", "crunchyroll",
+    "prime video", "primevideo", "hbo max", "peacock", "paramount+",
+    "plex", "jellyfin", "twitch", "funimation", "stremio",
+    "vlc media player", "mpv",
+]
+
+
+def _is_media_app(exe_name: Optional[str], title: str) -> bool:
+    """Check if a window is a media/video application."""
+    if exe_name and exe_name.lower() in _MEDIA_EXES:
+        return True
+    title_lower = title.lower()
+    return any(kw in title_lower for kw in _MEDIA_TITLE_KEYWORDS)
 
 
 # ── Win32 helpers for getting process exe name ────────────────────────────
@@ -246,12 +272,18 @@ class ScreenMonitor:
 
             # Update state
             fg_dur = (now - self._fg_since) if self._fg_hwnd else 0.0
+            media_fs = (
+                fg_info is not None
+                and fg_info.is_fullscreen
+                and _is_media_app(fg_info.exe_name, fg_info.title)
+            )
             self._state = ScreenState(
                 foreground=fg_info,
                 foreground_duration_s=fg_dur,
                 open_windows=list(current_windows.values()),
                 recent_changes=list(self._changes[-20:]),
                 timestamp=now,
+                is_media_fullscreen=media_fs,
             )
 
     def _add_change(self, description: str) -> None:

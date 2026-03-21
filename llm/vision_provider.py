@@ -99,9 +99,8 @@ class VisionProvider:
                     {
                         "role": "system",
                         "content": (
-                            "You are observing a computer screen. Describe what you see concisely in 2-3 sentences. "
-                            "Focus on: which applications/windows are open, what content is displayed, any notable "
-                            "text or activity. Ignore the small animated pony sprite — that's you."
+                            "You are a screen reader providing detailed descriptions of a computer screen "
+                            "for someone who cannot see it. Your output is consumed by another AI, not a human."
                         ),
                     },
                     {
@@ -111,11 +110,23 @@ class VisionProvider:
                                 "type": "image_url",
                                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
                             },
-                            {"type": "text", "text": "What's on the screen?"},
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Describe this screenshot in detail. Include:\n"
+                                    "1. APPLICATIONS: Which programs/windows are open, which is focused\n"
+                                    "2. TEXT/OCR: Read and transcribe any visible text — titles, tabs, chat messages, "
+                                    "code, articles, captions, notifications, URLs. Quote key text verbatim.\n"
+                                    "3. MEDIA: If a video/stream/game is playing, describe what's happening in it\n"
+                                    "4. ACTIVITY: What the user appears to be doing (browsing, coding, chatting, gaming, etc.)\n"
+                                    "Ignore the small animated pony sprite — that's a desktop pet overlay, not relevant.\n"
+                                    "Be thorough. The more detail you provide, the better."
+                                ),
+                            },
                         ],
                     },
                 ],
-                max_tokens=200,
+                max_tokens=1024,
                 temperature=self._temperature,
             )
             elapsed = time.time() - t0
@@ -160,4 +171,94 @@ class VisionProvider:
             return response.choices[0].message.content or None
         except Exception as exc:
             logger.warning("VisionProvider describe_image failed: %s", exc)
+            return None
+
+    def locate_on_screen(
+        self,
+        description: str,
+        jpeg_bytes: bytes,
+        original_size: tuple[int, int],
+    ) -> Optional[tuple[int, int]]:
+        """Find something on screen and return its real pixel coordinates.
+
+        Args:
+            description: What to look for (e.g. "the blue button", "the blueberry image")
+            jpeg_bytes: Screenshot JPEG (may be scaled down to max_width)
+            original_size: (width, height) of the original unscaled screenshot
+
+        Returns:
+            (x, y) in real screen coordinates, or None if not found.
+        """
+        client = self._next_client()
+        if client is None:
+            return None
+
+        b64 = base64.standard_b64encode(jpeg_bytes).decode("utf-8")
+        try:
+            # Determine the scaled image dimensions for coordinate mapping
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(jpeg_bytes))
+            img_w, img_h = img.size
+
+            t0 = time.time()
+            response = client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a precise visual locator. Given a screenshot and a description, "
+                            "return the approximate CENTER pixel coordinates of the described element "
+                            f"within this {img_w}x{img_h} image. "
+                            "Return ONLY a JSON object, nothing else."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                            },
+                            {
+                                "type": "text",
+                                "text": (
+                                    f'Find: "{description}"\n'
+                                    f'Return JSON: {{"x": <pixel_x>, "y": <pixel_y>}}\n'
+                                    f'If not found, return: {{"x": null, "y": null}}'
+                                ),
+                            },
+                        ],
+                    },
+                ],
+                max_tokens=50,
+                temperature=0.1,
+            )
+            elapsed = time.time() - t0
+            logger.info("[TIMING] vision locate_on_screen() took %.2fs", elapsed)
+
+            raw = response.choices[0].message.content or ""
+            # Extract JSON from response
+            import json, re
+            json_match = re.search(r'\{[^}]+\}', raw)
+            if not json_match:
+                return None
+            data = json.loads(json_match.group())
+            x = data.get("x")
+            y = data.get("y")
+            if x is None or y is None:
+                return None
+
+            # Scale from image coordinates to real screen coordinates
+            orig_w, orig_h = original_size
+            scale_x = orig_w / img_w
+            scale_y = orig_h / img_h
+            real_x = int(x * scale_x)
+            real_y = int(y * scale_y)
+            logger.info("locate_on_screen(%r): image(%d,%d) -> real(%d,%d)", description, x, y, real_x, real_y)
+            return (real_x, real_y)
+
+        except Exception as exc:
+            logger.warning("VisionProvider locate_on_screen failed: %s", exc)
             return None

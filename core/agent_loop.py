@@ -141,6 +141,8 @@ class Directive:
     trigger_time: Optional[str] = None # wall-clock trigger time e.g. "21:00"
     triggered: bool = False            # has the timer fired?
     delayed: bool = False              # user already negotiated a delay once
+    nag_count: int = 0                 # how many times agent has nagged about this
+    last_nag_style: str = ""           # one-word label of last nag approach (avoid repeating)
 
 
 @dataclass
@@ -171,6 +173,7 @@ class AgentDecision:
     adjust_urgency: Optional[Dict[str, Any]] = None
     next_check_seconds: float = 120.0      # legacy fallback for idle checks
     directive_timings: Dict[str, Dict] = field(default_factory=dict)  # per-directive timing from LLM
+    nag_style: str = ""  # one-word label for nag approach this tick
 
 
 class AgentLoop:
@@ -221,6 +224,7 @@ class AgentLoop:
         )
         self._conversation_active = False
         self._enforcement = EnforcementMode()
+        self._enforcement_just_completed = False  # suppress welcome-back after enforcement
         self._mess_mouse_count: int = 0  # grows duration each trigger
         self._last_wake_event: Optional[str] = None  # set by tick(), consumed by _check_routines()
 
@@ -255,6 +259,8 @@ class AgentLoop:
                     trigger_time=dd.get("trigger_time"),
                     triggered=dd.get("triggered", False),
                     delayed=dd.get("delayed", False),
+                    nag_count=dd.get("nag_count", 0),
+                    last_nag_style=dd.get("last_nag_style", ""),
                 )
                 self.directives.append(d)
 
@@ -304,6 +310,8 @@ class AgentLoop:
                     "trigger_time": d.trigger_time,
                     "triggered": d.triggered,
                     "delayed": d.delayed,
+                    "nag_count": d.nag_count,
+                    "last_nag_style": d.last_nag_style,
                 })
 
             enf_data = None
@@ -441,7 +449,7 @@ class AgentLoop:
         was_enforcing = self._enforcement.active
         if was_enforcing:
             self._enforcement = EnforcementMode()
-            self._hide_countdown()
+        self._hide_countdown()  # always hide — timer may linger even without enforcement
         if count or was_enforcing:
             logger.info("Cleared %d directive(s)%s.", count, " + enforcement" if was_enforcing else "")
             print(f"[Agent] Cleared {count} directive(s){' + enforcement' if was_enforcing else ''}.", flush=True)
@@ -566,19 +574,13 @@ class AgentLoop:
             # Don't interrupt — they're away (idle). Just note it.
             logger.info("Enforcement timer expired for %r — user still away.", self._enforcement.directive_goal)
 
-    # ── Enforcement response keywords ────────────────────────────────────
-
-    _YES_KEYWORDS = ("yes", "yeah", "yep", "yup", "done", "did it", "finished",
-                     "completed", "i did", "already did", "took care of it",
-                     "all done", "i'm done", "it's done", "of course")
-    _NO_KEYWORDS = ("no", "not yet", "nope", "haven't", "didn't", "not done",
-                    "not really", "hold on", "give me a", "in a minute",
-                    "in a sec", "almost", "working on it", "soon")
+    # ── Enforcement interaction (LLM-driven) ────────────────────────────
 
     def _enforcement_ask_if_done(self) -> None:
         """User touched mouse/keyboard during enforcement — ask if they completed the task.
-        If yes → done. If no → LOCKDOWN."""
+        If yes → done. If no → LOCKDOWN. All speech is LLM-generated."""
         goal = self._enforcement.directive_goal
+        caught_count = self._enforcement.caught_count
 
         # Pause wake word detector for the entire enforcement interaction
         if self._detector:
@@ -588,30 +590,58 @@ class AgentLoop:
                 pass
 
         try:
-            # Ask if they did it
-            self._speak(f"Hey, did you finish {goal}?")
+            # LLM generates the question (in character)
+            name = get_character_name()
+            ask_prompt = (
+                f"You are {name}. The user was supposed to go {goal}. "
+                f"You sent them away, but they just touched the mouse/keyboard again. "
+                f"This is catch #{caught_count}. "
+                f"Ask them if they actually did it. ONE sentence, in character. "
+                f"{'Be suspicious — they keep coming back too fast.' if caught_count > 1 else 'Be direct.'}"
+            )
+            ask_text = self._llm.generate_once(ask_prompt, max_tokens=100)
+            ask_text = self._strip_think(ask_text).strip().strip('"')
+            if not ask_text:
+                ask_text = f"did you {goal}?"
+            self._speak(ask_text)
 
             # Open mic and listen for response
             response = self._enforcement_listen()
             if response is None:
-                # No response — ask again later
-                logger.info("Enforcement: no response to 'did you finish it?'")
+                logger.info("Enforcement: no response to ask-if-done")
                 return
 
-            response_lower = response.lower()
             logger.info("Enforcement response: %r", response)
 
-            # Check for affirmative
-            if any(kw in response_lower for kw in self._YES_KEYWORDS):
-                self._speak("nice, good job.")
-                self._enforcement_complete()
+            # LLM classifies intent instead of keyword matching
+            classify_prompt = (
+                f"The user was asked if they finished '{goal}'. "
+                f"They responded: \"{response}\"\n"
+                f"Did they confirm they completed the task? "
+                f"Reply with exactly YES or NO."
+            )
+            verdict = self._llm.generate_once(
+                classify_prompt, max_tokens=10,
+                system_prompt="You are a classification assistant. Reply YES or NO only."
+            )
+            verdict = self._strip_think(verdict).strip().upper()
+            logger.info("Enforcement verdict: %r (from response: %r)", verdict, response)
+
+            if "YES" in verdict:
+                # LLM generates completion response
+                complete_prompt = (
+                    f"You are {name}. The user just confirmed they completed '{goal}'. "
+                    f"React in ONE sentence. Be genuinely pleased, in character."
+                )
+                complete_text = self._llm.generate_once(complete_prompt, max_tokens=100)
+                complete_text = self._strip_think(complete_text).strip().strip('"')
+                if complete_text:
+                    self._speak(complete_text)
+                self._enforcement_complete(complete_text or "okay, nice.")
                 return
 
-            # Check for negative or anything that's not clearly "yes"
-            # If they said ANYTHING that isn't affirmative, it's lockdown time
-            is_negative = any(kw in response_lower for kw in self._NO_KEYWORDS)
-            if is_negative or not any(kw in response_lower for kw in self._YES_KEYWORDS):
-                self._enforcement_lockdown()
+            # Not confirmed → lockdown
+            self._enforcement_lockdown()
         finally:
             # Always resume wake word detector
             if self._detector:
@@ -645,7 +675,7 @@ class AgentLoop:
             if self._on_state_change:
                 self._on_state_change("IDLE")
 
-    def _enforcement_complete(self) -> None:
+    def _enforcement_complete(self, response_text: str = "okay, nice.") -> None:
         """User confirmed they did the task — remove directive and end enforcement."""
         goal = self._enforcement.directive_goal
         # Remove the matching directive
@@ -655,19 +685,22 @@ class AgentLoop:
                 logger.info("Enforcement completed: %r", goal)
                 break
         self._enforcement = EnforcementMode()
+        self._enforcement_just_completed = True  # suppress welcome-back
         self._hide_countdown()
         self.save_directives()
         self._llm.inject_history(
             f"(User confirmed they completed \"{goal}\" during enforcement.)",
-            "nice, good job.",
+            response_text,
         )
         self._log_action(f"Enforcement completed: \"{goal[:40]}\"")
         if not self.directives:
             self._mess_mouse_count = 0
 
     def _enforcement_lockdown(self) -> None:
-        """User said they HAVEN'T done it — full lockdown until they go do it."""
+        """User said they HAVEN'T done it — full lockdown until they go do it.
+        All speech is LLM-generated; mechanical actions (minimize, cursor lock) stay code-driven."""
         goal = self._enforcement.directive_goal
+        name = get_character_name()
 
         # Nuke urgency to 10
         for d in self.directives:
@@ -676,15 +709,20 @@ class AgentLoop:
                 break
         self.save_directives()
 
-        # Announce lockdown
-        self._speak(
-            f"not yet? well, I'm gonna lock your computer until you do. "
-            f"if you want it back, you gotta go {goal}."
+        # LLM generates lockdown announcement
+        lockdown_prompt = (
+            f"You are {name}. The user said they HAVEN'T done '{goal}' yet. "
+            f"You're about to lock their computer until they go do it. "
+            f"Tell them what's happening. Be firm but in-character. TWO sentences max."
         )
+        lockdown_text = self._llm.generate_once(lockdown_prompt, max_tokens=150)
+        lockdown_text = self._strip_think(lockdown_text).strip().strip('"')
+        if not lockdown_text:
+            lockdown_text = f"nope. go {goal}. I'm locking your computer."
+        self._speak(lockdown_text)
         self._llm.inject_history(
             f"(User said they haven't done \"{goal}\" — entering lockdown mode.)",
-            f"not yet? well, I'm gonna lock your computer until you do. "
-            f"if you want it back, you gotta go {goal}.",
+            lockdown_text,
         )
 
         # LOCKDOWN LOOP — minimize everything, mess with mouse, keep asking
@@ -724,27 +762,58 @@ class AgentLoop:
                 elif cursor_locked:
                     time.sleep(10.0)  # mouse is locked, just wait
 
-                # Brief pause, then ask again
+                # Brief pause, then LLM-generated taunt
                 time.sleep(1.0)
 
-                if lockdown_round % 2 == 0:
-                    self._speak(f"have you done it yet? go {goal}!")
-                else:
-                    if cursor_locked:
-                        self._speak(f"if you want control back, you gotta go {goal}!")
-                    else:
-                        self._speak("I'm not giving your computer back until you do it.")
+                taunt_prompt = (
+                    f"You are {name}. Lockdown round {lockdown_round}. "
+                    f"The user STILL hasn't gone to {goal}. You have their computer locked. "
+                    f"Say ONE sentence — be increasingly dramatic/annoyed. In character."
+                )
+                taunt_text = self._llm.generate_once(taunt_prompt, max_tokens=100)
+                taunt_text = self._strip_think(taunt_text).strip().strip('"')
+                if taunt_text:
+                    self._speak(taunt_text)
 
                 response = self._enforcement_listen(timeout=6.0)
                 if response:
-                    response_lower = response.lower()
-                    if any(kw in response_lower for kw in self._YES_KEYWORDS):
-                        self._speak("finally. okay, you're free.")
-                        self._enforcement_complete()
+                    logger.info("Lockdown response: %r", response)
+                    # LLM classifies: (A) completed, (B) stop/give up, (C) neither
+                    classify_prompt = (
+                        f"User response during lockdown for '{goal}': \"{response}\"\n"
+                        f"Did they: (A) confirm they completed the task, "
+                        f"(B) ask to stop/give up/quit, or (C) neither?\n"
+                        f"Reply A, B, or C only."
+                    )
+                    verdict = self._llm.generate_once(
+                        classify_prompt, max_tokens=10,
+                        system_prompt="You are a classification assistant. Reply A, B, or C only."
+                    )
+                    verdict = self._strip_think(verdict).strip().upper()
+                    logger.info("Lockdown verdict: %r", verdict)
+
+                    if "A" in verdict:
+                        # LLM generates release text
+                        release_prompt = (
+                            f"You are {name}. The user FINALLY completed '{goal}' during lockdown "
+                            f"after {lockdown_round} rounds. React in ONE sentence. In character."
+                        )
+                        release_text = self._llm.generate_once(release_prompt, max_tokens=100)
+                        release_text = self._strip_think(release_text).strip().strip('"')
+                        if release_text:
+                            self._speak(release_text)
+                        self._enforcement_complete(release_text or "finally.")
                         return
-                    _STOP = ("stop", "quit", "enough", "shut up", "knock it off", "cut it out")
-                    if any(kw in response_lower for kw in _STOP):
-                        self._speak("ugh, fine. but you still need to do it.")
+                    elif "B" in verdict:
+                        # LLM generates grudging release
+                        stop_prompt = (
+                            f"You are {name}. The user asked you to stop the lockdown for '{goal}'. "
+                            f"You're giving in, but you're NOT happy about it. ONE sentence, in character."
+                        )
+                        stop_text = self._llm.generate_once(stop_prompt, max_tokens=100)
+                        stop_text = self._strip_think(stop_text).strip().strip('"')
+                        if stop_text:
+                            self._speak(stop_text)
                         self._enforcement = EnforcementMode()
                         self._hide_countdown()
                         self.save_directives()
@@ -782,11 +851,21 @@ class AgentLoop:
         # Always track idle/wake state — needed for sleep detection even during conversation
         idle_ms = _get_idle_ms()
         away_dur = self.routine_manager.away_duration_s  # grab BEFORE update clears it
-        self._last_wake_event = self.routine_manager.update_activity(idle_ms)
+
+        # Media-aware AFK: watching fullscreen video ≠ away
+        state = self._monitor.get_state()
+        media_active = state.is_media_fullscreen if state else False
+        self._last_wake_event = self.routine_manager.update_activity(idle_ms, media_active=media_active)
 
         # Welcome-back greeting when user returns from AFK
         if self._last_wake_event == "wake" and not self._conversation_active:
-            self._welcome_back(away_dur)
+            # Skip if enforcement just finished (already greeted) or very short absence
+            if self._enforcement_just_completed:
+                self._enforcement_just_completed = False
+            elif away_dur and away_dur < 300:
+                pass  # too short to greet
+            else:
+                self._welcome_back(away_dur)
 
         # Enforcement runs even during conversation for idle TRACKING, but
         # don't poll/react during active conversation (user IS at keyboard talking to Dash)
@@ -830,14 +909,19 @@ class AgentLoop:
                     self._maybe_self_initiate()
                     return
 
-            # Spontaneous speech on its own dedicated timer (every 3-8 min)
+            # Observation tick OR spontaneous speech (every 3-8 min)
             if now >= self._next_spontaneous:
                 next_in = random.uniform(
                     self._config.spontaneous_speech_min_s,
                     self._config.spontaneous_speech_max_s,
                 )
-                print(f"\n[Agent] Spontaneous speech triggered (next in {next_in:.0f}s)", flush=True)
-                self._spontaneous_speech()
+                # 60% observation tick (screen-aware), 40% classic spontaneous speech
+                if random.random() < 0.6:
+                    print(f"\n[Agent] Observation tick (next in {next_in:.0f}s)", flush=True)
+                    self._observation_tick()
+                else:
+                    print(f"\n[Agent] Spontaneous speech triggered (next in {next_in:.0f}s)", flush=True)
+                    self._spontaneous_speech()
                 self._next_spontaneous = time.monotonic() + next_in
             else:
                 self._next_idle_check_at = now + min(
@@ -868,6 +952,7 @@ class AgentLoop:
                           if not (d.trigger_time and not d.triggered)]
             for i, d in enumerate(actionable):
                 key = str(i)
+                d.nag_count += 1
                 if key in decision.directive_timings:
                     timing = decision.directive_timings[key]
                     nag_min = float(timing.get("next_nag_minutes", 10))
@@ -929,6 +1014,12 @@ class AgentLoop:
             if screen_desc:
                 lines.append(f"SCREENSHOT (what you can actually see): {screen_desc}")
 
+        # Installed apps (if scanned)
+        if self._desktop and hasattr(self._desktop, 'get_installed_app_names'):
+            app_names = self._desktop.get_installed_app_names()
+            if app_names:
+                lines.append(f"INSTALLED APPS: {app_names[:30]}")
+
         # Directives (exclude unfired timers — they're handled by _check_timers)
         actionable = [d for d in self.directives
                       if not (d.trigger_time and not d.triggered)]
@@ -941,9 +1032,11 @@ class AgentLoop:
                 since_nag = self._fmt_duration(now_t - d.last_action_at)
                 timer_info = f', timer: {d.trigger_time}(FIRED)' if d.trigger_time else ''
                 delay_info = ', ALREADY DELAYED ONCE — NO MORE DELAYS' if d.delayed else ''
+                style_info = f', last approach: "{d.last_nag_style}"' if d.last_nag_style else ''
                 lines.append(
                     f'{i}. "{d.goal}" [urgency {d.urgency}/10, active {age}, '
-                    f'last nag {since_nag} ago, source: {d.source}{timer_info}{delay_info}]'
+                    f'nagged {d.nag_count} times, last nag {since_nag} ago, '
+                    f'source: {d.source}{timer_info}{delay_info}{style_info}]'
                 )
 
         # Recent actions
@@ -954,54 +1047,107 @@ class AgentLoop:
                 lines.append(f"- {entry}")
 
         # Instructions
+        chaos_roll = random.randint(1, 100)
         lines.extend([
             "",
-            "THINK FIRST: Before your JSON response, reason through your decision in <think>...</think> tags.",
-            "In your thinking, consider: What is the user doing? How long? Should I intervene or wait?",
-            "What's the right tone? What actions make sense at this urgency level? Is this actually a distraction?",
+            "THINK FIRST: Before your JSON response, reason in <think>...</think> tags.",
+            "Structure your thinking:",
+            "1. OBSERVE: What is the user doing RIGHT NOW? What app, what content, what context clues?",
+            "2. ASSESS: Are they procrastinating? Working? Relaxing? How long have they ignored this?",
+            "3. HISTORY: How many times have I nagged? What approach did I use last? Did it work?",
+            "4. PLAN: What should I do — speak, act, both, or stay quiet? What urgency makes sense?",
+            "5. TONE: What emotional approach fits? Guilt? Humor? Sympathy? Sarcasm? Tough love?",
             "Your thinking is PRIVATE — never spoken aloud. Only the JSON fields are executed.",
             "",
             "After your <think> block, respond with a JSON object:",
-            '{"speak":"text or null","actions":[],"desktop_commands":[],"create_directive":null,"complete_directive":null,"directives":{"0":{"next_nag_minutes":15,"urgency":5}}}',
+            '{"speak":"text or null","nag_style":"one-word label","actions":[],"desktop_commands":[],"create_directive":null,"complete_directive":null,"directives":{"0":{"next_nag_minutes":5,"urgency":7}}}',
             "",
             "Field guide:",
             '- speak: short sentence to say out loud (TTS), or null to stay quiet',
+            '- nag_style: one-word label for your approach (e.g. "sarcastic", "guilt", "threat", "reverse-psychology")',
             '- actions: list of action names like "CLOSE_WINDOW", "MINIMIZE_WINDOW"',
             '- desktop_commands: list of objects with "command" and "args" fields:',
             '  - {"command":"CLOSE_TITLE","args":["substring"]} — close window by title',
-            '  - {"command":"MINIMIZE_TITLE","args":["substring"]} — minimize by title (only works on maximized/large windows)',
-            '  - {"command":"SHAKE_TITLE","args":["substring"]} — SHAKE/VIBRATE a window violently (only targets maximized/large windows)',
-            '  - {"command":"SHAKE_ALL","args":[]} — shake all MAXIMIZED windows (earthquake mode, high urgency only)',
-            '  - {"command":"MESS_MOUSE","args":[]} — grab the cursor and run around with it (high urgency only)',
+            '  - {"command":"MINIMIZE_TITLE","args":["substring"]} — minimize by title',
+            '  - {"command":"SHAKE_TITLE","args":["substring"]} — SHAKE/VIBRATE a window violently',
+            '  - {"command":"SHAKE_ALL","args":[]} — shake all visible windows (earthquake mode)',
+            '  - {"command":"MESS_MOUSE","args":[]} — grab the cursor IN YOUR MOUTH and gallop across the screen with it! Very dramatic, very funny. Use at urgency 6+.',
+            '  - {"command":"LOCK_MOUSE","args":[seconds]} — lock cursor to center of screen for N seconds (max 30s, urgency 8+ only)',
             '  - {"command":"PAUSE_MEDIA","args":[]} — press play/pause key (use for YouTube, Spotify, media apps instead of minimizing)',
             '  - {"command":"GOOGLE_IMAGES","args":["search term"]} — open Google Images for the thing they should be doing (e.g. "gym motivation", "healthy food", "sleeping peacefully")',
             '  - {"command":"ALT_TAB","args":[]} — Win+D: MINIMIZE ALL WINDOWS and show desktop (nuclear option)',
+            '  - {"command":"LOOK_AND_CLICK","args":["description of what to click"]} — use vision to find something on screen and click it',
             '  - {"command":"OPEN","args":["app_name"]}',
             '  - {"command":"BROWSE","args":["url"]}',
             '  - {"command":"WRITE_NOTEPAD","args":["content with \\n for newlines"]} — open Notepad and write content (lists, routines, plans, notes)',
+            '  - {"command":"LAUNCH_APP","args":["app name"]} — launch an installed app or game by name (fuzzy match)',
             '- create_directive: {"goal":"...","urgency":1-10} or null — goal must be a DIRECT ACTION like "eat food", "go to sleep", "do homework". NEVER write "remind user to" or "get user to" — just the action itself.',
             '- complete_directive: index of directive to mark done, or null',
-            '- directives: for EACH active directive by index, decide timing and urgency:',
-            '  {"0": {"next_nag_minutes": 15, "urgency": 5}, "1": {"next_nag_minutes": 45, "urgency": 3}}',
-            '  Think about: What\'s the task? How urgent? How long since last nag? Is the user busy?',
-            '  Would nagging NOW be effective? Low urgency = space it out (30-60 min). High urgency = nag often (1-5 min).',
-            '  You can raise or lower urgency based on context. This replaces adjust_urgency.',
+            '- directives: for EACH active directive by index, set timing AND urgency:',
+            '  {"0": {"next_nag_minutes": 5, "urgency": 7}}',
             "",
-            "Rules:",
-            "- If you have a directive, STAY FOCUSED on it. Escalate if user ignores you.",
-            "- You can speak AND do actions in the same tick.",
-            "- Escalation is GRADUATED. Follow this chaos roll system:",
-            f"  CHAOS ROLL this tick: {random.randint(1, 100)}",
-            "  Urgency 1-3: speak and nag only.",
-            "  Urgency 4-5: nag harder. If chaos roll > 60, SHAKE a window (skip if fullscreen).",
-            "  Urgency 6: GOOGLE_IMAGES the directive goal. SHAKE or ALT_TAB (minimizes ALL windows) if fullscreen.",
-            "  Urgency 7: GOOGLE_IMAGES + ALT_TAB + PAUSE_MEDIA. If chaos roll > 40, MESS_MOUSE (grabs their cursor!).",
-            "  Urgency 8: ALT_TAB + MESS_MOUSE. If chaos roll > 30, close/minimize windows.",
-            "  Urgency 9-10: FULL NUCLEAR. ALT_TAB (minimize everything), MESS_MOUSE (grab cursor), close windows. Go wild.",
-            "- IMPORTANT: SHAKE does NOT work on fullscreen apps/games. Use ALT_TAB (Win+D, minimizes ALL windows) instead.",
-            "- The chaos roll adds unpredictability — sometimes you're chill, sometimes you snap early. Embrace it.",
-            "- Be creative and in-character. You're a prankster with a mission.",
-            "- CRITICAL: When speaking, talk DIRECTLY TO the user in second person. NEVER say 'remind the user' or 'get user to' — you ARE talking to them. Say 'go do it' not 'remind user to do it'.",
+            "═══════════════════════════════════════════════════════",
+            "URGENCY & TIMING GUIDELINES:",
+            "═══════════════════════════════════════════════════════",
+            "You have full context about the user's situation. Use your JUDGMENT — these are guidelines, not hard rules.",
+            "",
+            "CONTEXT:",
+            f"  Time: {datetime.now().strftime('%I:%M %p, %A')}",
+            f"  Chaos roll: {chaos_roll} (random 1-100, adds unpredictability)",
+            "",
+            "GENERAL PRINCIPLES:",
+            "- Urgency should TEND to increase over time when the user ignores a directive.",
+            "- But context matters: if they seem stressed, tired, or having a bad day, ease up.",
+            "- If they're actively working on something productive, be patient even with pending tasks.",
+            "- If they're clearly procrastinating (endless scrolling, social media while tasks pile up), push harder.",
+            "- The chaos roll adds randomness — sometimes you snap early, sometimes you let it slide.",
+            "- Vary your nag timing. Don't be predictable. 2-15 minutes between nags is the range.",
+            "- Some days are rest days. Not every directive needs urgency 10.",
+            "",
+            "ACTION PALETTE (at your discretion based on urgency):",
+            f"  CHAOS ROLL: {chaos_roll}",
+            "  Low urgency (1-3): speak only. Be conversational.",
+            "  Medium urgency (4-6): speak + consider shaking a window, pausing media. Use chaos roll for variety.",
+            "  High urgency (7-8): speak + ALT_TAB, MESS_MOUSE, LOCK_MOUSE. Stack actions when warranted.",
+            "  Extreme urgency (9-10): go nuclear IF the situation truly warrants it. Stack everything.",
+            "  SHAKE does NOT work on fullscreen apps — use ALT_TAB (Win+D) instead.",
+            "",
+            "WHAT NOT TO DO:",
+            "- Don't mechanically escalate urgency every single tick. Sometimes holding steady is right.",
+            "- Don't nag more often than every 2 minutes unless urgency is 8+.",
+            "- Don't let a directive go silent for more than 15 minutes between nags.",
+            "- Don't use the exact same approach twice in a row (check last_nag_style).",
+            "",
+            "═════════════════════════════════════════════════════",
+            "NAG VARIETY — THIS IS CRITICAL, DO NOT SKIP:",
+            "═════════════════════════════════════════════════════",
+            "BANNED PATTERNS (never use these):",
+            '- "hey! reminder to [task]"',
+            '- "don\'t forget to [task]"',
+            '- "just a reminder that [task]"',
+            '- "hey! [task name]!"',
+            '- Starting with "hey!" followed by the task. This is the #1 most overused pattern.',
+            "",
+            "Instead, pick a DIFFERENT approach each time based on your nag count:",
+            "  Nag 1-2: Casual, work it into natural conversation. Maybe comment on what they're doing first.",
+            "  Nag 3-4: Getting annoyed. React to what they're DOING instead of the task.",
+            '    e.g. "you\'re STILL on youtube? seriously?"',
+            "  Nag 5-6: In-character mockery. Mock their willpower. Question their life choices.",
+            "  Nag 7-8: Guilt trips. Reference how many times and how long you've been asking.",
+            '    e.g. "I have asked you NINE times. NINE. in the last hour."',
+            "  Nag 9+: Unhinged. Dramatic speeches, threats, existential commentary.",
+            "",
+            "STYLE EXAMPLES (rotate, never repeat the same style twice in a row):",
+            '  - Sarcastic countdown: "oh cool, minute 47 of not doing it. new record."',
+            '  - Reverse psychology: "you know what, don\'t do it. see what happens. I dare you."',
+            '  - Screen commentary: "wow that reddit post is SO important, way more important than [task]"',
+            '  - Competitive: "bet you can\'t even start in the next 30 seconds. prove me wrong."',
+            '  - Disappointed: "I\'m not mad, I\'m just... no wait, I\'m definitely mad."',
+            '  - Dramatic monologue: "I\'ve watched you scroll past 300 posts instead of doing ONE thing..."',
+            "",
+            "OTHER RULES:",
+            "- You can speak AND do actions in the same tick. At high urgency you SHOULD do both.",
+            "- CRITICAL: Talk DIRECTLY TO the user. Say 'go do it' not 'remind user to do it'.",
             "- Complete a directive when the goal is achieved or clearly impossible.",
         ])
 
@@ -1055,6 +1201,7 @@ class AgentLoop:
             adjust_urgency=data.get("adjust_urgency"),
             next_check_seconds=float(data.get("next_check_seconds", 120)),
             directive_timings=dir_timings,
+            nag_style=str(data.get("nag_style", "")),
         )
 
     def _fallback_decision(self) -> AgentDecision:
@@ -1175,6 +1322,52 @@ class AgentLoop:
                             url = f"https://www.google.com/search?tbm=isch&q={query}"
                             webbrowser.open(url)
                             self._log_action(f"Opened Google Images: {args[0]}")
+                    elif command == "LOCK_MOUSE":
+                        # Lock cursor to center of screen for N seconds
+                        max_urg = max((d.urgency for d in self.directives), default=0)
+                        if max_urg >= 8:
+                            seconds = min(int(args[0]) if args else 10, 30)
+                            try:
+                                import ctypes
+                                import ctypes.wintypes
+                                mon = self._desktop._get_monitor_rect()
+                                cx = mon.left + mon.width // 2
+                                cy = mon.top + mon.height // 2
+                                rect = ctypes.wintypes.RECT(cx, cy, cx + 1, cy + 1)
+                                ctypes.windll.user32.ClipCursor(ctypes.byref(rect))
+                                self._log_action(f"Locked mouse for {seconds}s")
+                                time.sleep(seconds)
+                            finally:
+                                try:
+                                    ctypes.windll.user32.ClipCursor(None)
+                                except Exception:
+                                    pass
+                        else:
+                            self._log_action("LOCK_MOUSE skipped — urgency too low")
+                    elif command == "LOOK_AND_CLICK":
+                        if args and self._screen:
+                            description = args[0]
+                            jpeg = self._screen.grab(quality=85)
+                            if jpeg:
+                                coords = None
+                                if self._vision_llm and hasattr(self._vision_llm, 'locate_on_screen'):
+                                    coords = self._vision_llm.locate_on_screen(
+                                        description, jpeg,
+                                        self._screen.last_original_size,
+                                    )
+                                if coords:
+                                    rx, ry = coords
+                                    self._desktop._cmd_click([str(rx), str(ry)])
+                                    self._log_action(f"LOOK_AND_CLICK '{description}' at ({rx},{ry})")
+                                else:
+                                    self._log_action(f"LOOK_AND_CLICK '{description}' — not found")
+                    elif command == "LAUNCH_APP":
+                        if args and self._desktop and hasattr(self._desktop, 'launch_app'):
+                            ok, matched = self._desktop.launch_app(args[0])
+                            self._log_action(
+                                f"Launched '{matched}'" if ok
+                                else f"LAUNCH_APP '{args[0]}' — not found"
+                            )
                     else:
                         # Fall through to standard DesktopCommand handling
                         from llm.response_parser import DesktopCommand
@@ -1191,8 +1384,13 @@ class AgentLoop:
                 removed = self.directives.pop(idx)
                 self._log_action(f"Completed directive: \"{removed.goal}\"")
                 logger.info("Directive completed: %r", removed.goal)
+                # End enforcement if it was for this directive
+                if self._enforcement.active and self._enforcement.directive_goal == removed.goal:
+                    self._enforcement = EnforcementMode()
+                    self._hide_countdown()
                 if not self.directives:
                     self._mess_mouse_count = 0
+                    self._hide_countdown()
                 self.save_directives()
 
         if decision.create_directive is not None:
@@ -1201,10 +1399,12 @@ class AgentLoop:
             if goal:
                 self.add_directive(goal, urgency, source="self")
 
-        # Update last_action_at on active directives if we did something
+        # Update last_action_at and nag_style on active directives if we did something
         if decision.speak or decision.actions or decision.desktop_commands:
             for d in self.directives:
                 d.last_action_at = now
+                if decision.nag_style:
+                    d.last_nag_style = decision.nag_style
 
     # ── Self-initiation ────────────────────────────────────────────────────
 
@@ -1380,11 +1580,18 @@ class AgentLoop:
             else:
                 dur = "a while"
             name = get_character_name()
+
+            # Gather context for a natural greeting
+            state = self._monitor.get_state()
+            current_app = ""
+            if state and state.foreground:
+                current_app = f" They're now looking at: \"{state.foreground.title}\"."
+
             prompt = (
-                f"(The user just came back after being away for {dur}. "
+                f"(The user just came back after being away for {dur}.{current_app} "
                 f"Welcome them back in ONE short sentence as {name}. "
-                f"Be casual — maybe comment on how long they were gone, "
-                f"ask what they were up to, or just say hi. Keep it brief.)"
+                f"Be natural and casual — don't robotically state the exact duration like "
+                f"'wow, X minutes.' Just be a friend who noticed they're back. Keep it brief.)"
             )
             raw = self._llm.generate_once(prompt)
             if raw:
@@ -1417,13 +1624,13 @@ class AgentLoop:
             else:
                 prompt_choice = random.choice(_IDLE_PROMPTS)
 
-            # 30% chance: comment on what's on screen, 70%: use an idle prompt
-            if state.foreground and random.random() < 0.3:
+            # 50% chance: comment on what's on screen, 50%: use an idle prompt
+            if state.foreground and random.random() < 0.5:
                 fg = state.foreground.title
                 exe = state.foreground.exe_name or "unknown app"
                 fullscreen = " (FULLSCREEN)" if state.foreground.is_fullscreen else ""
                 screen_extra = ""
-                if random.random() < 0.3:
+                if random.random() < 0.5:
                     desc = self._maybe_grab_screenshot()
                     if desc:
                         screen_extra = f" You can see on screen: {desc}."
@@ -1455,6 +1662,101 @@ class AgentLoop:
         except Exception as exc:
             print(f"[Agent] Spontaneous speech failed: {exc}", flush=True)
             logger.warning("Spontaneous speech failed: %s", exc)
+        finally:
+            self._next_idle_check_at = time.monotonic() + self._config.base_check_interval_s
+
+    def _observation_tick(self) -> None:
+        """Screen-aware observation — judge what the user is doing and optionally comment.
+
+        Unlike spontaneous speech, this always uses screen context (window titles + optional screenshot)
+        and asks the LLM to reason about whether the user is being productive, distracted, etc.
+        """
+        try:
+            state = self._monitor.get_state()
+            if not state.foreground:
+                return
+
+            fg = state.foreground.title
+            exe = state.foreground.exe_name or "unknown app"
+            dur = self._fmt_duration(state.foreground_duration_s)
+            fullscreen = " (FULLSCREEN)" if state.foreground.is_fullscreen else ""
+
+            # Build window list
+            windows = [w.title for w in state.open_windows[:15] if w.title.strip()]
+
+            # Screenshot ~20% of the time (cheap enough, but not every tick)
+            screen_context = ""
+            if random.random() < 0.2:
+                desc = self._maybe_grab_screenshot()
+                if desc:
+                    screen_context = f"\nSCREENSHOT: {desc}"
+
+            # Installed apps context
+            apps_context = ""
+            if self._desktop and hasattr(self._desktop, 'get_installed_app_names'):
+                app_names = self._desktop.get_installed_app_names()
+                if app_names:
+                    apps_context = f"\nINSTALLED APPS: {app_names[:40]}"
+
+            name = get_character_name()
+            prompt = (
+                f"You are {name}, observing your user's desktop. Stay in character.\n"
+                f"\n"
+                f"SCREEN STATE:\n"
+                f"Foreground: \"{fg}\" ({exe}, open for {dur}{fullscreen})\n"
+                f"Open windows: {windows}"
+                f"{screen_context}"
+                f"{apps_context}\n"
+                f"\n"
+                f"OBSERVATION RULES:\n"
+                f"Think about WHAT they're doing, not just what app is open.\n"
+                f"- YouTube art tutorial, coding tutorial, educational video = PRODUCTIVE. Stay quiet or encourage.\n"
+                f"- YouTube meme compilations, reddit scrolling for 30+ min = maybe gently comment.\n"
+                f"- Working in an IDE, writing a document, drawing = PRODUCTIVE. Compliment or stay quiet.\n"
+                f"- Gaming is fine for recreation. Don't nag about games unless they have a pending task.\n"
+                f"- Some days are rest days. If the user told you they're resting, back off completely.\n"
+                f"\n"
+                f"You can:\n"
+                f"- Say something short and natural (comment on what they're doing, ask a question)\n"
+                f"- Stay quiet (return null) — this is PERFECTLY FINE and often the right choice\n"
+                f"- Suggest an activity if they seem bored/unfocused\n"
+                f"\n"
+                f"DO NOT auto-create directives. DO NOT nag without a directive. Be a companion, not a virus.\n"
+                f"If you speak, keep it to ONE short sentence. Be natural, not robotic.\n"
+                f"\n"
+                f"Respond with ONLY: {{\"speak\": \"your sentence\" or null}}"
+            )
+
+            raw = self._llm.generate_once(prompt, max_tokens=512)
+            if not raw:
+                return
+
+            # Parse response
+            cleaned = self._strip_think(raw)
+            try:
+                import json as _json
+                json_match = re.search(r'\{[^}]*\}', cleaned)
+                if json_match:
+                    data = _json.loads(json_match.group())
+                    text = data.get("speak")
+                else:
+                    text = None
+            except Exception:
+                text = None
+
+            if text and text.strip() and text.lower() != "null":
+                print(f"[Agent] Observation: \"{text[:80]}\"", flush=True)
+                self._speak(text)
+                fg_title = state.foreground.title if state.foreground else "the screen"
+                ctx = f"(You noticed {fg_title} and commented.)"
+                self._llm.inject_history(ctx, text)
+                self._log_action(f"Observation: \"{text[:60]}\"")
+                self._listen_for_reply()
+            else:
+                logger.debug("Observation tick — staying quiet.")
+
+        except Exception as exc:
+            logger.warning("Observation tick failed: %s", exc)
         finally:
             self._next_idle_check_at = time.monotonic() + self._config.base_check_interval_s
 
@@ -1608,14 +1910,16 @@ class AgentLoop:
         if not getattr(self._screen, "available", False):
             return None
         try:
-            jpeg = self._screen.grab()
-            if jpeg is None:
-                return None
-
             use_moondream = (
                 self._vision_config
                 and getattr(self._vision_config, "screen_vision", "api") == "moondream"
             )
+            # Use higher JPEG quality for local moondream (needs readable text)
+            quality = 85 if use_moondream else 60
+            jpeg = self._screen.grab(quality=quality)
+            if jpeg is None:
+                return None
+
             description = None
             if use_moondream and self._moondream and self._moondream.loaded:
                 description = self._moondream.describe(jpeg)

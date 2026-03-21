@@ -259,6 +259,13 @@ def main() -> None:
             logger.warning("Desktop control disabled: %s", exc)
             desktop_controller = None
 
+    # Scan installed apps/games in background
+    if desktop_controller:
+        threading.Thread(
+            target=desktop_controller.scan_installed_apps,
+            daemon=True, name="app-scanner",
+        ).start()
+
     # Screen monitor (free local window tracking)
     screen_monitor = None
     if config.agent.enabled:
@@ -487,7 +494,10 @@ def main() -> None:
         pet_window.set_listening(False)  # Safety net — always clear mic indicator
         pet_window.clear_override()
         pet_window.resume_roaming()
-        speech_bubble.hide_bubble()
+        # Don't hide the speech bubble here — let SpeechBubble's own auto-hide
+        # timer handle it naturally (same as directive bubbles). Hiding it here
+        # causes the bubble to vanish before the user can read it, especially
+        # when TTS is disabled/fails or for typed conversations with no follow-up loop.
         heard_text.hide_heard()
 
     def _on_action_triggered(action_name: str) -> None:
@@ -565,39 +575,89 @@ def main() -> None:
     pet_window.listen_interrupted.connect(transcriber.interrupt_listening)
 
     # ── Push-to-talk (PTT) ───────────────────────────────────────────────────
+    # Uses pynput (no admin needed) to listen for key press/release.
+    # Records immediately on key press (own thread) so no speech is lost.
 
-    _ptt_active = threading.Event()      # set while key is held
     _ptt_stop = threading.Event()        # set on key release to stop recording
-    _ptt_pending = threading.Event()     # signals pipeline loop that PTT audio is ready
+    _ptt_recording = False               # guard against key-repeat
+    _ptt_result_text = None  # completed transcription (str or None)
+    _ptt_result_ready = threading.Event()   # signals pipeline that text is ready
 
     ptt_key = config.audio.ptt_key or "f6"
     _ptt_available = False
     try:
-        import keyboard as _kb
+        from pynput import keyboard as _pynput_kb
 
-        def _ptt_on_press(event):
-            if _ptt_active.is_set():
-                return  # already recording (key repeat)
-            _ptt_active.set()
-            _ptt_stop.clear()
-            activation_event.set()
-            _ptt_pending.set()
-            logger.debug("PTT key pressed — recording started.")
+        # Map config key name to pynput Key enum
+        _ptt_key_obj = None
+        try:
+            # Try function keys first (f1-f12)
+            _ptt_key_obj = getattr(_pynput_kb.Key, ptt_key.lower(), None)
+        except Exception:
+            pass
+        if _ptt_key_obj is None:
+            # Try as a character key
+            try:
+                _ptt_key_obj = _pynput_kb.KeyCode.from_char(ptt_key.lower())
+            except Exception:
+                _ptt_key_obj = _pynput_kb.Key.f6  # fallback
 
-        def _ptt_on_release(event):
-            if not _ptt_active.is_set():
+        def _ptt_record_thread():
+            """Record in background, transcribe when done."""
+            nonlocal _ptt_result_text
+            try:
+                # Pause wake word detector so we can use the mic
+                detector.pause()
+                text = transcriber.listen_ptt(_ptt_stop)
+                _ptt_result_text = text if text and text.strip() else None
+            except Exception as exc:
+                logger.error("PTT recording failed: %s", exc)
+                print(f"[PTT] Recording error: {exc}", flush=True)
+                _ptt_result_text = None
+            finally:
+                _ptt_result_ready.set()
+                activation_event.set()  # wake the pipeline loop
+
+        def _ptt_on_press(key):
+            nonlocal _ptt_recording
+            try:
+                if key != _ptt_key_obj:
+                    return
+            except Exception:
                 return
-            _ptt_active.clear()
-            _ptt_stop.set()
-            logger.debug("PTT key released — recording stopped.")
+            if _ptt_recording:
+                return  # already recording (key repeat)
+            _ptt_recording = True
+            _ptt_stop.clear()
+            _ptt_result_ready.clear()
+            print(f"[PTT] Recording... (release {ptt_key} to send)", flush=True)
+            t = threading.Thread(target=_ptt_record_thread, daemon=True, name="ptt-recorder")
+            t.start()
 
-        _kb.on_press_key(ptt_key, _ptt_on_press, suppress=False)
-        _kb.on_release_key(ptt_key, _ptt_on_release, suppress=False)
+        def _ptt_on_release(key):
+            nonlocal _ptt_recording
+            try:
+                if key != _ptt_key_obj:
+                    return
+            except Exception:
+                return
+            if not _ptt_recording:
+                return
+            _ptt_recording = False
+            _ptt_stop.set()
+            print("[PTT] Key released — transcribing...", flush=True)
+
+        _ptt_listener = _pynput_kb.Listener(on_press=_ptt_on_press, on_release=_ptt_on_release)
+        _ptt_listener.daemon = True
+        _ptt_listener.start()
         _ptt_available = True
-        logger.info("Push-to-talk enabled: hold '%s' to talk.", ptt_key)
+        print(f"[PTT] Push-to-talk enabled: hold '{ptt_key}' to talk.", flush=True)
+        logger.info("Push-to-talk enabled (pynput): hold '%s' to talk.", ptt_key)
     except ImportError:
-        logger.info("Push-to-talk disabled — install 'keyboard' package to enable (pip install keyboard).")
+        print("[PTT] Disabled — install 'pynput' package (pip install pynput).", flush=True)
+        logger.info("Push-to-talk disabled — install 'pynput' package to enable.")
     except Exception as exc:
+        print(f"[PTT] FAILED to set up: {exc}", flush=True)
         logger.warning("Push-to-talk setup failed: %s", exc)
 
     # ── Pipeline thread ──────────────────────────────────────────────────────
@@ -635,21 +695,21 @@ def main() -> None:
                             if not _shutdown_requested.is_set():
                                 detector.resume()
                         continue
-                    # Push-to-talk: record while key is held, then run turn
-                    if _ptt_pending.is_set():
-                        _ptt_pending.clear()
-                        detector.pause()
-                        try:
-                            pet_controller.on_state_change("LISTEN")
-                            ptt_text = transcriber.listen_ptt(_ptt_stop)
-                            if ptt_text and ptt_text.strip():
-                                logger.info("PTT heard: %r", ptt_text)
+                    # Push-to-talk: recording already happened on its own thread
+                    # (detector was paused by the recording thread)
+                    if _ptt_result_ready.is_set():
+                        _ptt_result_ready.clear()
+                        ptt_text = _ptt_result_text
+                        if ptt_text and ptt_text.strip():
+                            print(f"[PTT] Heard: \"{ptt_text}\"", flush=True)
+                            logger.info("PTT heard: %r", ptt_text)
+                            try:
                                 pipeline.run_conversation_with_text(ptt_text)
-                            else:
-                                pet_controller.on_state_change("IDLE")
-                        finally:
-                            _ptt_active.clear()
-                            _ptt_stop.clear()
+                            finally:
+                                if not _shutdown_requested.is_set():
+                                    detector.resume()
+                        else:
+                            print("[PTT] No speech detected.", flush=True)
                             if not _shutdown_requested.is_set():
                                 detector.resume()
                         continue

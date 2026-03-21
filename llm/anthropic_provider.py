@@ -162,9 +162,8 @@ class AnthropicProvider(LLMProvider):
         response = self._call_with_retry(
             model=self.model,
             system=(
-                "You are observing a computer screen. Describe what you see concisely in 2-3 sentences. "
-                "Focus on: which applications/windows are open, what content is displayed, any notable "
-                "text or activity. Ignore the small animated pony sprite — that's you."
+                "You are a screen reader providing detailed descriptions of a computer screen "
+                "for someone who cannot see it. Your output is consumed by another AI, not a human."
             ),
             messages=[
                 {
@@ -178,11 +177,23 @@ class AnthropicProvider(LLMProvider):
                                 "data": b64,
                             },
                         },
-                        {"type": "text", "text": "What's on the screen?"},
+                        {
+                            "type": "text",
+                            "text": (
+                                "Describe this screenshot in detail. Include:\n"
+                                "1. APPLICATIONS: Which programs/windows are open, which is focused\n"
+                                "2. TEXT/OCR: Read and transcribe any visible text — titles, tabs, chat messages, "
+                                "code, articles, captions, notifications, URLs. Quote key text verbatim.\n"
+                                "3. MEDIA: If a video/stream/game is playing, describe what's happening in it\n"
+                                "4. ACTIVITY: What the user appears to be doing (browsing, coding, chatting, gaming, etc.)\n"
+                                "Ignore the small animated pony sprite — that's a desktop pet overlay, not relevant.\n"
+                                "Be thorough. The more detail you provide, the better."
+                            ),
+                        },
                     ],
                 }
             ],
-            max_tokens=200,
+            max_tokens=600,
         )
         return response.content[0].text.strip() if response.content else None
 

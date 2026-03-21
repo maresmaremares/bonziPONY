@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,7 @@ class ScreenCapture:
         self._max_width = max_width
         self._available = True
         self._get_pony_xy = None
+        self._last_original_size: Tuple[int, int] = (1920, 1080)  # fallback
         logger.info("ScreenCapture ready (max_width=%d).", max_width)
 
     def set_pony_locator(self, fn) -> None:
@@ -31,6 +32,11 @@ class ScreenCapture:
     @property
     def available(self) -> bool:
         return self._available
+
+    @property
+    def last_original_size(self) -> Tuple[int, int]:
+        """(width, height) of the most recent capture BEFORE resizing."""
+        return self._last_original_size
 
     def grab_pil(self):
         """Capture the primary monitor and return a PIL Image, or None on failure."""
@@ -55,6 +61,7 @@ class ScreenCapture:
                 raw = sct.grab(monitor)
 
             img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+            self._last_original_size = (img.width, img.height)
 
             if img.width > self._max_width:
                 ratio = self._max_width / img.width
@@ -67,14 +74,14 @@ class ScreenCapture:
             logger.warning("Screen capture failed: %s", exc)
             return None
 
-    def grab(self) -> Optional[bytes]:
+    def grab(self, quality: int = 60) -> Optional[bytes]:
         """Capture the primary monitor and return JPEG bytes, or None on failure."""
         img = self.grab_pil()
         if img is None:
             return None
         try:
             buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=60)
+            img.save(buf, format="JPEG", quality=quality)
             return buf.getvalue()
         except Exception as exc:
             logger.warning("JPEG encode failed: %s", exc)

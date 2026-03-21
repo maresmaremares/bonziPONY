@@ -646,9 +646,6 @@ class DesktopController:
         if self._is_fullscreen_window(hwnd):
             logger.info("Skipping shake — window HWND=%d is fullscreen.", hwnd)
             return
-        if not self._is_prominent(hwnd):
-            logger.info("Skipping shake — window HWND=%d is not maximized/prominent.", hwnd)
-            return
 
         try:
             import win32gui
@@ -672,13 +669,14 @@ class DesktopController:
             logger.warning("shake_window failed: %s", exc)
 
     def shake_all_windows(self, duration: float = 8.0, intensity: int = 12) -> None:
-        """Shake maximized / prominent windows — earthquake mode for high urgency."""
+        """Shake visible windows — earthquake mode for high urgency."""
         try:
             import win32gui
         except ImportError:
             return
 
         hwnds_and_rects = []
+        fg_hwnd = self._get_foreground_hwnd()
 
         def _callback(hwnd, _extra):
             if not win32gui.IsWindowVisible(hwnd):
@@ -694,14 +692,16 @@ class DesktopController:
                 if self._is_fullscreen_window(hwnd):
                     return True  # skip fullscreen windows
                 rect = win32gui.GetWindowRect(hwnd)
-                # Only shake maximized or large windows (>40% of their monitor)
-                if win32gui.IsZoomed(hwnd):
+                # Always include the foreground window
+                if hwnd == fg_hwnd:
+                    hwnds_and_rects.append((hwnd, rect))
+                elif win32gui.IsZoomed(hwnd):
                     hwnds_and_rects.append((hwnd, rect))
                 else:
                     w = rect[2] - rect[0]
                     h = rect[3] - rect[1]
                     mon = self._get_monitor_rect(hwnd)
-                    if w > 0 and h > 0 and (w * h) >= (mon.width * mon.height) * 0.4:
+                    if w > 0 and h > 0 and (w * h) >= (mon.width * mon.height) * 0.15:
                         hwnds_and_rects.append((hwnd, rect))
             except Exception:
                 pass
@@ -774,8 +774,176 @@ class DesktopController:
             return False
         if self._is_own_console(hwnd):
             return False
-        if not self._is_prominent(hwnd):
-            logger.info("Skipping shake — window %r is not maximized/prominent.", title_substring)
-            return False
         self.shake_window(hwnd=hwnd, duration=duration, intensity=intensity)
         return True
+
+    # ── App/game library ─────────────────────────────────────────────────
+
+    _installed_apps: list = []  # cached list of (name, launch_path, source, app_id)
+
+    def scan_installed_apps(self) -> list:
+        """Scan Steam library, Desktop, and Start Menu for installed apps.
+        Returns list of (name, launch_path, source, app_id) tuples.
+        Thread-safe — stores result in _installed_apps."""
+        apps = []
+
+        # ── Steam games ──────────────────────────────────────────────
+        try:
+            apps.extend(self._scan_steam())
+        except Exception as exc:
+            logger.debug("Steam scan failed: %s", exc)
+
+        # ── Desktop shortcuts ────────────────────────────────────────
+        try:
+            desktop = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+            apps.extend(self._scan_shortcuts(desktop, "desktop"))
+        except Exception as exc:
+            logger.debug("Desktop shortcut scan failed: %s", exc)
+
+        # ── Start Menu shortcuts ─────────────────────────────────────
+        try:
+            # User start menu
+            user_start = os.path.join(
+                os.environ.get("APPDATA", ""),
+                "Microsoft", "Windows", "Start Menu", "Programs",
+            )
+            apps.extend(self._scan_shortcuts(user_start, "start_menu"))
+            # All-users start menu
+            all_start = os.path.join(
+                os.environ.get("PROGRAMDATA", r"C:\ProgramData"),
+                "Microsoft", "Windows", "Start Menu", "Programs",
+            )
+            apps.extend(self._scan_shortcuts(all_start, "start_menu"))
+        except Exception as exc:
+            logger.debug("Start Menu scan failed: %s", exc)
+
+        # Deduplicate by name (case-insensitive)
+        seen = set()
+        unique = []
+        for name, path, source, app_id in apps:
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                unique.append((name, path, source, app_id))
+
+        DesktopController._installed_apps = unique
+        logger.info("Scanned %d installed apps/games.", len(unique))
+        print(f"[Apps] Found {len(unique)} installed apps/games.", flush=True)
+        return unique
+
+    @staticmethod
+    def _scan_steam() -> list:
+        """Parse Steam library for installed games."""
+        import re as _re
+        results = []
+        steam_path = r"C:\Program Files (x86)\Steam"
+        vdf_path = os.path.join(steam_path, "steamapps", "libraryfolders.vdf")
+        if not os.path.exists(vdf_path):
+            return results
+
+        # Parse library folders from VDF
+        lib_paths = [os.path.join(steam_path, "steamapps")]
+        try:
+            with open(vdf_path, encoding="utf-8") as f:
+                content = f.read()
+            for match in _re.finditer(r'"path"\s+"([^"]+)"', content):
+                p = os.path.join(match.group(1), "steamapps")
+                if os.path.isdir(p) and p not in lib_paths:
+                    lib_paths.append(p)
+        except Exception:
+            pass
+
+        # Parse ACF manifest files for installed games
+        for lib in lib_paths:
+            try:
+                for fname in os.listdir(lib):
+                    if not fname.startswith("appmanifest_") or not fname.endswith(".acf"):
+                        continue
+                    try:
+                        with open(os.path.join(lib, fname), encoding="utf-8") as f:
+                            acf = f.read()
+                        name_m = _re.search(r'"name"\s+"([^"]+)"', acf)
+                        appid_m = _re.search(r'"appid"\s+"(\d+)"', acf)
+                        if name_m and appid_m:
+                            name = name_m.group(1)
+                            appid = appid_m.group(1)
+                            # Skip Steamworks tools / redistributables
+                            if any(kw in name.lower() for kw in (
+                                "redistribut", "directx", "vcredist", "proton",
+                                "steamworks", "steam linux", "compatibility",
+                            )):
+                                continue
+                            results.append((name, f"steam://rungameid/{appid}", "steam", appid))
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return results
+
+    @staticmethod
+    def _scan_shortcuts(directory: str, source: str) -> list:
+        """Scan a directory for .lnk shortcuts and resolve their targets."""
+        results = []
+        if not os.path.isdir(directory):
+            return results
+
+        try:
+            import win32com.client
+            shell = win32com.client.Dispatch("WScript.Shell")
+        except ImportError:
+            # Fallback: just list the shortcut names without resolving
+            for root, _dirs, files in os.walk(directory):
+                for fname in files:
+                    if fname.lower().endswith(".lnk"):
+                        name = fname[:-4]  # strip .lnk
+                        if name.lower() not in ("uninstall", "readme", "help", "website"):
+                            full = os.path.join(root, fname)
+                            results.append((name, full, source, ""))
+            return results
+
+        for root, _dirs, files in os.walk(directory):
+            for fname in files:
+                if not fname.lower().endswith(".lnk"):
+                    continue
+                name = fname[:-4]
+                if name.lower() in ("uninstall", "readme", "help", "website"):
+                    continue
+                try:
+                    full = os.path.join(root, fname)
+                    shortcut = shell.CreateShortCut(full)
+                    target = shortcut.TargetPath
+                    if target:
+                        results.append((name, target, source, ""))
+                    else:
+                        results.append((name, full, source, ""))
+                except Exception:
+                    results.append((name, os.path.join(root, fname), source, ""))
+        return results
+
+    def launch_app(self, name: str) -> tuple:
+        """Launch an app by fuzzy name match. Returns (success, matched_name)."""
+        if not DesktopController._installed_apps:
+            return (False, name)
+
+        name_lower = name.lower()
+
+        # Try exact substring match first
+        for app_name, path, source, app_id in DesktopController._installed_apps:
+            if name_lower in app_name.lower() or app_name.lower() in name_lower:
+                try:
+                    if path.startswith("steam://"):
+                        webbrowser.open(path)
+                    else:
+                        os.startfile(path)
+                    logger.info("Launched app: %s (%s)", app_name, source)
+                    return (True, app_name)
+                except Exception as exc:
+                    logger.warning("Failed to launch %s: %s", app_name, exc)
+                    return (False, app_name)
+
+        return (False, name)
+
+    @staticmethod
+    def get_installed_app_names() -> list:
+        """Return list of installed app names (for injection into LLM prompts)."""
+        return [name for name, _, _, _ in DesktopController._installed_apps]
