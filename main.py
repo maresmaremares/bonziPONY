@@ -483,8 +483,9 @@ def main() -> None:
             ax, ay, ah = pet_window.get_anchor_point()
             speech_bubble.show_thinking(ax, ay)
         elif state_name == "IDLE" and config.desktop_pet.speech_bubble:
-            # Clear thinking bubble if LLM decided not to speak
-            speech_bubble.hide_bubble()
+            # Only clear thinking bubble — speech bubbles have their own auto-hide timer
+            if speech_bubble._thinking:
+                speech_bubble.hide_bubble()
 
     def _on_heard_text(text: str) -> None:
         """Show what the STT heard below the pony."""
