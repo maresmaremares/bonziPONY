@@ -35,10 +35,60 @@ def _git(*args: str, cwd: Optional[str] = None) -> Tuple[int, str]:
         return -1, str(e)
 
 
+def _is_git_repo() -> bool:
+    """Check if the project directory is a git repo."""
+    rc, _ = _git("rev-parse", "--git-dir")
+    return rc == 0
+
+
+def _bootstrap_git_repo() -> Tuple[bool, str]:
+    """Initialize a git repo for ZIP-downloaded installs so the updater works.
+
+    Steps: git init → add remote → fetch → reset to origin/master (keeps local files).
+    """
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    logger.info("Bootstrapping git repo for updater...")
+
+    rc, out = _git("init")
+    if rc != 0:
+        return False, f"git init failed: {out}"
+
+    rc, out = _git("remote", "add", "origin", REPO_URL)
+    if rc != 0:
+        # Remote might already exist from a partial bootstrap
+        if "already exists" not in out:
+            return False, f"git remote add failed: {out}"
+
+    rc, out = _git("fetch", "origin", "master")
+    if rc != 0:
+        return False, f"git fetch failed: {out}"
+
+    # Reset index to match remote WITHOUT touching working files (--mixed).
+    # This means local config changes, presets, etc. are preserved.
+    rc, out = _git("reset", "--mixed", "origin/master")
+    if rc != 0:
+        return False, f"git reset failed: {out}"
+
+    logger.info("Git repo bootstrapped successfully.")
+    return True, "ok"
+
+
 def get_local_head() -> Optional[str]:
-    """Get the local HEAD commit hash."""
+    """Get the local HEAD commit hash. Auto-bootstraps git if needed."""
     rc, out = _git("rev-parse", "HEAD")
-    return out if rc == 0 else None
+    if rc == 0:
+        return out
+
+    # Not a git repo — try to bootstrap (ZIP download users)
+    if not _is_git_repo():
+        ok, msg = _bootstrap_git_repo()
+        if ok:
+            rc, out = _git("rev-parse", "HEAD")
+            return out if rc == 0 else None
+        else:
+            logger.warning("Git bootstrap failed: %s", msg)
+
+    return None
 
 
 def get_remote_head() -> Optional[str]:
@@ -58,7 +108,11 @@ def check_for_updates() -> Tuple[bool, str, List[str]]:
     """
     local = get_local_head()
     if not local:
-        return False, "Could not determine local version (not a git repo?).", []
+        # Check if git is even installed
+        rc, _ = _git("--version")
+        if rc != 0:
+            return False, "Git is not installed. Install git from https://git-scm.com to enable updates.", []
+        return False, "Could not determine local version. Try again — if this persists, re-download from GitHub.", []
 
     remote = get_remote_head()
     if not remote:

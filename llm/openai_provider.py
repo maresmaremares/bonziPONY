@@ -91,15 +91,15 @@ class OpenAIProvider(LLMProvider):
         print(f"[LLM] chat() took {elapsed:.2f}s", flush=True)
 
         # If the response was truncated (hit token limit), retry with a higher limit.
-        # WRITE_NOTEPAD gets unlimited (16k) so she can write as much as she wants.
+        # Cap at 8192 — DeepSeek and many providers reject higher values.
         finish = getattr(response.choices[0], "finish_reason", None) if response.choices else None
         if finish == "length":
             partial = response.choices[0].message.content or ""
             if "WRITE_NOTEPAD" in partial:
-                retry_tokens = 16384
+                retry_tokens = 8192
                 logger.info("WRITE_NOTEPAD truncated — retrying with %d tokens.", retry_tokens)
             else:
-                retry_tokens = max(self.max_tokens * 4, 4096)
+                retry_tokens = min(max(self.max_tokens * 4, 4096), 8192)
                 logger.info("Response truncated — retrying with %d tokens.", retry_tokens)
             t0 = time.time()
             response = self._call_with_retry(

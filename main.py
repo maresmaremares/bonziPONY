@@ -143,6 +143,10 @@ def main() -> None:
             from llm.vision_provider import VisionProvider
             from llm.factory import _KNOWN_BASE_URLS
             base_url = vlm_cfg.base_url or _KNOWN_BASE_URLS.get(vlm_cfg.provider.lower())
+            # Gemini requires the /openai suffix for OpenAI-compatible API
+            if base_url and "generativelanguage.googleapis.com" in base_url and not base_url.rstrip("/").endswith("/openai"):
+                base_url = base_url.rstrip("/") + "/openai"
+                logger.info("Auto-corrected Gemini base_url to include /openai suffix")
             vision_llm = VisionProvider(
                 api_keys=vlm_cfg.api_keys,
                 model=vlm_cfg.model,
@@ -404,6 +408,8 @@ def main() -> None:
                 from llm.vision_provider import VisionProvider
                 from llm.factory import _KNOWN_BASE_URLS
                 base_url = vlm_cfg.base_url or _KNOWN_BASE_URLS.get(vlm_cfg.provider.lower())
+                if base_url and "generativelanguage.googleapis.com" in base_url and not base_url.rstrip("/").endswith("/openai"):
+                    base_url = base_url.rstrip("/") + "/openai"
                 vision_llm = VisionProvider(
                     api_keys=vlm_cfg.api_keys,
                     model=vlm_cfg.model,
@@ -609,8 +615,7 @@ def main() -> None:
             """Record in background, transcribe when done."""
             nonlocal _ptt_result_text
             try:
-                # Pause wake word detector so we can use the mic
-                detector.pause()
+                # detector already paused by _ptt_on_press (immediate, before thread spawn)
                 text = transcriber.listen_ptt(_ptt_stop)
                 _ptt_result_text = text if text and text.strip() else None
             except Exception as exc:
@@ -633,6 +638,10 @@ def main() -> None:
             _ptt_recording = True
             _ptt_stop.clear()
             _ptt_result_ready.clear()
+            # Pause wake word detector IMMEDIATELY so it doesn't also fire on
+            # "hey dash" spoken while PTT is held (race condition: wake word
+            # would detect before the recording thread could pause it)
+            detector.pause()
             print(f"[PTT] Recording... (release {ptt_key} to send)", flush=True)
             t = threading.Thread(target=_ptt_record_thread, daemon=True, name="ptt-recorder")
             t.start()

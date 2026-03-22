@@ -124,7 +124,7 @@ class VisionProvider:
                         ],
                     },
                 ],
-                max_tokens=300,
+                max_tokens=500,
                 temperature=self._temperature,
             )
             elapsed = time.time() - t0

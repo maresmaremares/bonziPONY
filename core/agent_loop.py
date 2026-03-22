@@ -225,6 +225,7 @@ class AgentLoop:
         self._conversation_active = False
         self._enforcement = EnforcementMode()
         self._enforcement_just_completed = False  # suppress welcome-back after enforcement
+        self._directives_cleared_at: float = 0.0  # suppress re-creation after clear
         self._mess_mouse_count: int = 0  # grows duration each trigger
         self._last_wake_event: Optional[str] = None  # set by tick(), consumed by _check_routines()
 
@@ -362,12 +363,24 @@ class AgentLoop:
             return random.uniform(600.0, 900.0)
 
     def add_directive(self, goal: str, urgency: int, source: str = "user") -> None:
-        """Add a new directive (max ``max_directives``)."""
+        """Add a new directive (max ``max_directives``). Deduplicates by goal."""
         if len(self.directives) >= self._config.max_directives:
             logger.warning("Max directives reached (%d) — ignoring new directive.", self._config.max_directives)
             return
         goal = self._clean_goal(goal)
         urgency = max(1, min(10, urgency))
+        # Deduplicate: skip if a directive with the same goal (case-insensitive) exists
+        goal_lower = goal.lower().strip()
+        for existing in self.directives:
+            if existing.goal.lower().strip() == goal_lower:
+                # Update urgency if the new one is higher
+                if urgency > existing.urgency:
+                    existing.urgency = urgency
+                    self.save_directives()
+                    logger.info("Duplicate directive %r — bumped urgency to %d", goal, urgency)
+                else:
+                    logger.info("Duplicate directive %r — skipping (existing urgency %d)", goal, existing.urgency)
+                return
         now = time.monotonic()
         nag_at = now + self._initial_nag_delay(urgency)
         d = Directive(goal=goal, urgency=urgency, created_at=now, last_action_at=now,
@@ -450,6 +463,7 @@ class AgentLoop:
         if was_enforcing:
             self._enforcement = EnforcementMode()
         self._hide_countdown()  # always hide — timer may linger even without enforcement
+        self._directives_cleared_at = time.monotonic()  # suppress re-creation for a bit
         if count or was_enforcing:
             logger.info("Cleared %d directive(s)%s.", count, " + enforcement" if was_enforcing else "")
             print(f"[Agent] Cleared {count} directive(s){' + enforcement' if was_enforcing else ''}.", flush=True)
@@ -862,8 +876,8 @@ class AgentLoop:
             # Skip if enforcement just finished (already greeted) or very short absence
             if self._enforcement_just_completed:
                 self._enforcement_just_completed = False
-            elif away_dur and away_dur < 300:
-                pass  # too short to greet
+            elif away_dur is None or away_dur < 300:
+                pass  # unknown duration (app just started) or too short to greet
             else:
                 self._welcome_back(away_dur)
 
@@ -1127,6 +1141,8 @@ class AgentLoop:
             '- "just a reminder that [task]"',
             '- "hey! [task name]!"',
             '- Starting with "hey!" followed by the task. This is the #1 most overused pattern.',
+            '- "that\'s... actually kinda [cool/based/neat/etc]" — this phrase is BANNED in all forms.',
+            '- Any variation of "that\'s actually pretty [adjective]" — find a different way to express it.',
             "",
             "Instead, pick a DIFFERENT approach each time based on your nag count:",
             "  Nag 1-2: Casual, work it into natural conversation. Maybe comment on what they're doing first.",
@@ -1396,7 +1412,9 @@ class AgentLoop:
         if decision.create_directive is not None:
             goal = decision.create_directive.get("goal", "")
             urgency = decision.create_directive.get("urgency", 5)
-            if goal:
+            # Don't re-create directives right after user cleared them (60s cooldown)
+            recently_cleared = (now - self._directives_cleared_at) < 60.0
+            if goal and not recently_cleared:
                 self.add_directive(goal, urgency, source="self")
 
         # Update last_action_at and nag_style on active directives if we did something
@@ -1545,7 +1563,8 @@ class AgentLoop:
         try:
             raw = self._llm.generate_once(prompt, max_tokens=1024)
             decision = self._parse_decision(raw)
-            if decision.create_directive:
+            recently_cleared = (time.monotonic() - self._directives_cleared_at) < 60.0
+            if decision.create_directive and not recently_cleared:
                 goal = decision.create_directive.get("goal", "")
                 urgency = decision.create_directive.get("urgency", 5)
                 if goal:
@@ -1637,7 +1656,8 @@ class AgentLoop:
                 trigger = (
                     f"(You glanced at the user's screen. They have \"{fg}\" ({exe}{fullscreen}) open.{screen_extra} "
                     f"React in ONE short sentence as {get_character_name()}. Be natural — sometimes "
-                    "comment on it, sometimes ignore it and say something random.)"
+                    "comment on it, sometimes ignore it and say something random. "
+                    "NEVER say 'that's actually kinda cool/based/neat' — use different words.)"
                 )
             else:
                 trigger = f"(Spontaneous thought — {prompt_choice})"
@@ -1723,6 +1743,7 @@ class AgentLoop:
                 f"\n"
                 f"DO NOT auto-create directives. DO NOT nag without a directive. Be a companion, not a virus.\n"
                 f"If you speak, keep it to ONE short sentence. Be natural, not robotic.\n"
+                f"NEVER say \"that's actually kinda [cool/based/neat]\" or any variation. Find different words.\n"
                 f"\n"
                 f"Respond with ONLY: {{\"speak\": \"your sentence\" or null}}"
             )
@@ -2003,16 +2024,43 @@ class AgentLoop:
         due = self.routine_manager.get_due_routines(wake_event=wake)
         if wake:
             self._last_wake_event = None  # consume the event
+        if not due:
+            return
+        # Batch all due routines into one LLM call for natural announcement
+        name = get_character_name()
+        goals = [r.goal for r in due]
         for r in due:
             schedule_desc = self.routine_manager.describe_routine(r)
             self.add_directive(r.goal, r.urgency, source=f"routine:{r.schedule}")
-            self._speak(f"Hey! Routine reminder: {r.goal}")
-            self._llm.inject_history(
-                f"(Recurring routine fired [{schedule_desc}]: {r.goal})",
-                f"Hey! Routine reminder — {r.goal}!",
-            )
             self._log_action(f"Routine fired [{schedule_desc}]: {r.goal}")
             logger.info("Routine fired [%s]: %r", schedule_desc, r.goal)
+        # LLM-generated announcement — varied and in-character
+        try:
+            if len(goals) == 1:
+                prompt = (
+                    f"You are {name}. It's time for the user's routine: \"{goals[0]}\". "
+                    f"Tell them in ONE sentence, in character. Be natural and varied — "
+                    f"don't just say 'time to do X'. Be creative, caring, or playful."
+                )
+            else:
+                goals_str = ", ".join(f'"{g}"' for g in goals)
+                prompt = (
+                    f"You are {name}. Multiple routines just fired: {goals_str}. "
+                    f"Announce them naturally in 1-2 sentences. Don't just list them — "
+                    f"be in-character, creative. Maybe prioritize, maybe be playful about it."
+                )
+            text = self._llm.generate_once(prompt, max_tokens=100)
+            if text:
+                text = self._strip_think(text).strip().strip('"')
+            if not text:
+                text = f"hey — {', '.join(goals)}. let's go."
+        except Exception:
+            text = f"hey — {', '.join(goals)}. let's go."
+        self._speak(text)
+        self._llm.inject_history(
+            f"(Recurring routines fired: {', '.join(goals)})",
+            text,
+        )
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
