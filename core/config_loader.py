@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class WakeWordConfig:
+    enabled: bool = True               # set False for PTT-only mode (no wake words)
     phrases: Dict[str, List[str]] = field(default_factory=dict)  # preset_slug -> wake phrases
     language: str = "en"
     model: str = "base"  # Whisper model for wake word detection
@@ -45,6 +46,9 @@ class LLMConfig:
     max_history_turns: int = 10
     base_url: Optional[str] = None
     preset: str = "rainbow_dash"
+    prefill: str = ""                    # custom assistant prefill (empty = default)
+    relationship: str = "lover"          # lover | best_friend | roommate | caretaker | custom
+    relationship_custom: str = ""        # free-text (only when relationship="custom")
 
 
 @dataclass
@@ -92,6 +96,8 @@ class VisionLLMConfig:
     base_url: Optional[str] = None
     max_requests_per_key_per_day: int = 100
     temperature: float = 0.3
+    max_tokens: int = 2048              # max tokens for describe_screen (high for Gemini thinking overhead)
+    locate_max_tokens: int = 200        # max tokens for locate_on_screen output
 
 
 @dataclass
@@ -203,6 +209,8 @@ def _parse_vision_llm(raw: dict | None) -> VisionLLMConfig | None:
         base_url=raw.get("base_url"),
         max_requests_per_key_per_day=raw.get("max_requests_per_key_per_day", 100),
         temperature=raw.get("temperature", 0.3),
+        max_tokens=raw.get("max_tokens", 2048),
+        locate_max_tokens=raw.get("locate_max_tokens", 200),
     )
 
 
@@ -243,6 +251,7 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
 
     return AppConfig(
         wake_word=WakeWordConfig(
+            enabled=ww_raw.get("enabled", True),
             phrases=ww_raw.get("phrases", {}),
             language=ww_raw.get("language", "en"),
             model=ww_raw.get("model", "base"),
@@ -267,6 +276,9 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
             max_history_turns=llm_raw.get("max_history_turns", 10),
             base_url=llm_base_url,
             preset=llm_raw.get("preset", "rainbow_dash"),
+            prefill=llm_raw.get("prefill", ""),
+            relationship=llm_raw.get("relationship", "lover"),
+            relationship_custom=llm_raw.get("relationship_custom", ""),
         ),
         elevenlabs=ElevenLabsConfig(
             api_key=el_api_key,

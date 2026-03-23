@@ -90,6 +90,7 @@ class DesktopCommand:
 class DirectiveTag:
     goal: str
     urgency: int
+    delay_minutes: Optional[int] = None  # deferred directive — wait N min before first nag
 
 
 @dataclass
@@ -168,18 +169,35 @@ def parse_response(raw: str) -> ParsedResponse:
                 ))
 
     # Parse first DIRECTIVE tag (only one allowed per response)
+    # Supports: [DIRECTIVE:goal:urgency] and [DIRECTIVE:goal:urgency:delay_minutes]
     dir_match = _DIRECTIVE_PATTERN.search(raw)
     if dir_match:
-        parts = dir_match.group(1).rsplit(":", 1)  # split from right — last segment is urgency
-        if len(parts) == 2:
+        content = dir_match.group(1)
+        # Try goal:urgency:delay format first (rsplit from right, max 2 splits)
+        parts3 = content.rsplit(":", 2)
+        parsed_dir = False
+        if len(parts3) == 3:
             try:
-                urgency = int(parts[1].strip())
-                directive = DirectiveTag(goal=parts[0].strip(), urgency=max(1, min(10, urgency)))
+                urg = int(parts3[1].strip())
+                delay = int(parts3[2].strip())
+                directive = DirectiveTag(
+                    goal=parts3[0].strip(),
+                    urgency=max(1, min(10, urg)),
+                    delay_minutes=delay if delay > 0 else None,
+                )
+                parsed_dir = True
             except ValueError:
-                # No valid urgency — treat entire string as goal with default urgency
-                directive = DirectiveTag(goal=dir_match.group(1).strip(), urgency=5)
-        else:
-            directive = DirectiveTag(goal=parts[0].strip(), urgency=5)
+                pass  # fall through to goal:urgency
+        if not parsed_dir:
+            parts2 = content.rsplit(":", 1)
+            if len(parts2) == 2:
+                try:
+                    urg = int(parts2[1].strip())
+                    directive = DirectiveTag(goal=parts2[0].strip(), urgency=max(1, min(10, urg)))
+                except ValueError:
+                    directive = DirectiveTag(goal=content.strip(), urgency=5)
+            else:
+                directive = DirectiveTag(goal=content.strip(), urgency=5)
 
     # Parse first TIMER tag
     timer_match = _TIMER_PATTERN.search(raw)

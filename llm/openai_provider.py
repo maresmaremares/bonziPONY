@@ -30,6 +30,7 @@ class OpenAIProvider(LLMProvider):
         max_tokens: int = 600,
         max_history_turns: int = 10,
         base_url: Optional[str] = None,
+        prefill: str = "",
     ) -> None:
         from openai import OpenAI
 
@@ -37,6 +38,7 @@ class OpenAIProvider(LLMProvider):
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.max_history_turns = max_history_turns
+        self._prefill = prefill
 
         client_kwargs = {"api_key": api_key}
         if base_url:
@@ -69,14 +71,18 @@ class OpenAIProvider(LLMProvider):
 
         messages = [{"role": "system", "content": get_system_prompt()}]
         # Character prefill: inject an assistant greeting so the model sees
-        # itself already in-character.  Skip for Claude models (no prefill support).
+        # itself already in-character.  Skip for Claude models (message alternation rules).
         if len(self._history) == 1:
             model_lower = self.model.lower()
             is_claude = any(k in model_lower for k in ("claude", "opus", "sonnet", "haiku"))
             if not is_claude:
                 from llm.prompt import get_character_name
                 name = get_character_name()
-                messages.append({"role": "assistant", "content": f"(I am {name}. I stay in character at all times.)"})
+                if self._prefill:
+                    prefill_text = self._prefill.replace("{name}", name)
+                else:
+                    prefill_text = f"(I am {name}. I stay in character at all times.)"
+                messages.append({"role": "assistant", "content": prefill_text})
         messages.extend(self._history)
 
         t0 = time.time()
@@ -226,7 +232,7 @@ class OpenAIProvider(LLMProvider):
                         ],
                     },
                 ],
-                max_tokens=600,
+                max_tokens=2048,
             )
             elapsed = time.time() - t0
             logger.info("[TIMING] describe_screen() took %.2fs", elapsed)

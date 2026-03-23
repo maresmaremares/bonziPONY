@@ -28,6 +28,9 @@ llm:
   max_history_turns: 10
   base_url: null               # auto-detected for known providers; set for custom endpoints (e.g. "http://localhost:1234/v1")
   preset: "rainbow_dash"       # filename in presets/ folder (no .txt)
+  relationship: "lover"        # lover | best_friend | roommate | caretaker | custom
+  # relationship_custom: ""   # free-text (only used when relationship is "custom")
+  # prefill: ""               # custom first-turn prefill. {name} = character name. blank = default
 
 elevenlabs:
   api_key: "YOUR_ELEVENLABS_KEY"   # or set BONZI_ELEVENLABS_API_KEY env var

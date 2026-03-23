@@ -53,6 +53,7 @@ def get_provider(config) -> LLMProvider:
             max_tokens=cfg.max_tokens,
             max_history_turns=cfg.max_history_turns,
             base_url=cfg.base_url or None,
+            prefill=cfg.prefill,
         )
 
     # Everything else is OpenAI-compatible
@@ -65,4 +66,5 @@ def get_provider(config) -> LLMProvider:
         max_tokens=cfg.max_tokens,
         max_history_turns=cfg.max_history_turns,
         base_url=base_url,
+        prefill=cfg.prefill,
     )

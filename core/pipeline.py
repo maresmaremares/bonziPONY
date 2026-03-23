@@ -75,6 +75,7 @@ class Pipeline:
         screen_monitor: ScreenMonitor | None = None,
         moondream=None,
         vision_llm=None,
+        timeline=None,
     ) -> None:
         self.config = config
         self.detector = detector
@@ -90,6 +91,7 @@ class Pipeline:
         self.screen_monitor = screen_monitor
         self.moondream = moondream
         self.vision_llm = vision_llm  # dedicated vision model (optional)
+        self._timeline = timeline     # shared event timeline
         self.state = PipelineState.IDLE
 
         self._recent_topics: List[str] = []
@@ -133,6 +135,9 @@ class Pipeline:
                 self._on_conversation_start()
             except Exception:
                 pass
+        if self._timeline:
+            from core.event_timeline import EventType
+            self._timeline.append(EventType.CONVERSATION_START, "Conversation started")
 
         if self.agent_loop:
             self.agent_loop.set_conversation_active(True)
@@ -451,6 +456,10 @@ class Pipeline:
                     return False
 
             logger.info("User said: %r", user_text)
+            if self._timeline:
+                from core.event_timeline import EventType
+                self._timeline.append(EventType.USER_SAID,
+                                      f'User said: "{user_text[:150]}"')
             if self._on_heard_text:
                 try:
                     self._on_heard_text(user_text)
@@ -474,11 +483,14 @@ class Pipeline:
             # Nudge LLM to pick up on tasks/needs, compliance, and conversation flow
             if self.agent_loop:
                 hint = (
-                    "\n\n[System hint: If the user mentioned ANYTHING they need to do, should do, "
-                    "or have been neglecting (eating, showering, homework, sleeping, chores, etc.), "
-                    "create a [DIRECTIVE:goal:urgency] for it. The goal must be a DIRECT ACTION "
-                    "like 'eat food', 'go to sleep', 'do homework' — NEVER 'remind user to' or 'get user to'. "
-                    "Be their accountability partner."
+                    "\n\n[System hint: Pick the RIGHT tag for the situation. "
+                    "Something they should do RIGHT NOW (actively neglecting a need) → [DIRECTIVE:goal:urgency]. "
+                    "Something they should do LATER today → [DIRECTIVE:goal:urgency:delay_minutes] (delays first nag). "
+                    "Something at a SPECIFIC TIME → [TIMER:HH:MM:goal]. "
+                    "Something RECURRING → [ROUTINE:...]. "
+                    "Something they're just MENTIONING (plans, stories) → NO TAG, just talk about it. "
+                    "Only create immediate directives for things they're clearly neglecting RIGHT NOW. "
+                    "Goal must be a DIRECT ACTION like 'eat food', 'shower' — NEVER 'remind user to' or 'get user to'."
                 )
                 if self.agent_loop.has_directives:
                     directives_list = "; ".join(
@@ -490,8 +502,8 @@ class Pipeline:
                         " If the user says they COMPLETED a task from this list, use [DONE] or"
                         " [DONE:keyword] to mark it done."
                         " If the user says they're LEAVING to go do a task (away from computer),"
-                        " ASK how long it'll take, then on their answer use [ENFORCE:minutes]."
-                        " Do NOT guess the enforcement time — ask first."
+                        " use [ENFORCE:minutes] with an estimated duration. Do NOT ask how long —"
+                        " just estimate (shower=15, eating=20, gym=60, errands=45, brb=10)."
                     )
                 hint += (
                     " If the user asks you to DELAY a directive (e.g. 'give me an hour', 'I'll do it later'),"
@@ -585,6 +597,7 @@ class Pipeline:
                     goal=parsed.directive.goal,
                     urgency=parsed.directive.urgency,
                     source="user",
+                    delay_minutes=parsed.directive.delay_minutes,
                 )
 
             # Create timer from conversation if LLM used [TIMER:...] tag
@@ -684,6 +697,16 @@ class Pipeline:
                 enforce_s = max(60.0, min(3600.0, parsed.enforce_minutes * 60.0))
                 self.agent_loop.start_enforcement(enforce_s)
                 logger.info("Enforcement started via LLM tag: %d min", parsed.enforce_minutes)
+                if self._timeline:
+                    from core.event_timeline import EventType, UserIntent
+                    import time as _time
+                    goal = self.agent_loop._enforcement.directive_goal
+                    self._timeline.set_user_intent(UserIntent(
+                        action=goal, stated_at=_time.monotonic(),
+                        expected_duration_s=enforce_s))
+                    self._timeline.set_afk_context(f"going to: {goal}")
+                    self._timeline.append(EventType.ENFORCEMENT_START,
+                                          f"Enforcement started: {goal} ({parsed.enforce_minutes}min)")
 
             self._transition(PipelineState.SPEAK)
             if parsed.text:
@@ -702,6 +725,10 @@ class Pipeline:
                     self.tts.speak(parsed.text, on_playback_start=_show_bubble)
                 # Always ensure bubble was shown (fallback if TTS failed/skipped callback)
                 _show_bubble()
+                if self._timeline:
+                    from core.event_timeline import EventType
+                    self._timeline.append(EventType.PONY_SAID,
+                                          f'Pony replied: "{parsed.text[:150]}"')
                 return True
             return False
 

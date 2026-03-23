@@ -29,6 +29,7 @@ class AnthropicProvider(LLMProvider):
         max_tokens: int = 600,
         max_history_turns: int = 10,
         base_url: Optional[str] = None,
+        prefill: str = "",
     ) -> None:
         from anthropic import Anthropic
 
@@ -36,6 +37,7 @@ class AnthropicProvider(LLMProvider):
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.max_history_turns = max_history_turns
+        self._prefill = prefill
 
         client_kwargs = {"api_key": api_key}
         if base_url:
@@ -67,9 +69,17 @@ class AnthropicProvider(LLMProvider):
         self._history.append({"role": "user", "content": user_message})
         self._trim_history()
 
+        system_prompt = get_system_prompt()
+        # Prefill for Claude: append to system prompt on first turn
+        if len(self._history) == 1 and self._prefill:
+            from llm.prompt import get_character_name
+            name = get_character_name()
+            prefill_text = self._prefill.replace("{name}", name)
+            system_prompt += f"\n\nIMPORTANT REMINDER: {prefill_text}"
+
         response = self._call_with_retry(
             model=self.model,
-            system=get_system_prompt(),
+            system=system_prompt,
             messages=self._history,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
@@ -87,7 +97,7 @@ class AnthropicProvider(LLMProvider):
                 logger.info("Response truncated — retrying with %d tokens.", retry_tokens)
             response = self._call_with_retry(
                 model=self.model,
-                system=get_system_prompt(),
+                system=system_prompt,
                 messages=self._history,
                 temperature=self.temperature,
                 max_tokens=retry_tokens,

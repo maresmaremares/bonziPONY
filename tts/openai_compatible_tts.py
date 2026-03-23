@@ -164,12 +164,22 @@ class OpenAICompatibleTTS:
         self._play_pcm(pcm_bytes)
 
     def _play_pcm(self, pcm_bytes: bytes) -> None:
-        """Convert raw 16-bit PCM bytes to float32 and play via sounddevice."""
-        num_samples = len(pcm_bytes) // PCM_SAMPLE_WIDTH
-        samples_int16 = struct.unpack(f"{num_samples}h", pcm_bytes[:num_samples * PCM_SAMPLE_WIDTH])
-        audio_f32 = np.array(samples_int16, dtype=np.float32) / 32768.0
+        """Play audio bytes — auto-detects WAV vs raw PCM."""
+        import io
 
-        play_kwargs: dict = {"samplerate": self._sample_rate}
+        # Detect WAV format (starts with "RIFF" header)
+        if pcm_bytes[:4] == b"RIFF":
+            import soundfile as sf
+            data, sample_rate = sf.read(io.BytesIO(pcm_bytes), dtype="float32")
+            audio_f32 = data
+        else:
+            # Raw 16-bit PCM
+            num_samples = len(pcm_bytes) // PCM_SAMPLE_WIDTH
+            samples_int16 = struct.unpack(f"{num_samples}h", pcm_bytes[:num_samples * PCM_SAMPLE_WIDTH])
+            audio_f32 = np.array(samples_int16, dtype=np.float32) / 32768.0
+            sample_rate = self._sample_rate
+
+        play_kwargs: dict = {"samplerate": sample_rate}
         if self.output_device_index is not None:
             play_kwargs["device"] = self.output_device_index
 

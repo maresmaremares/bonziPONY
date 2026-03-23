@@ -25,6 +25,8 @@ class VisionProvider:
         base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai",
         max_requests_per_key_per_day: int = 100,
         temperature: float = 0.3,
+        max_tokens: int = 500,
+        locate_max_tokens: int = 200,
     ) -> None:
         from openai import OpenAI
 
@@ -36,6 +38,8 @@ class VisionProvider:
         self._base_url = base_url
         self._max_per_key = max_requests_per_key_per_day
         self._temperature = temperature
+        self._max_tokens = max_tokens
+        self._locate_max_tokens = locate_max_tokens
 
         # One client per key
         self._clients: List[OpenAI] = []
@@ -124,7 +128,7 @@ class VisionProvider:
                         ],
                     },
                 ],
-                max_tokens=500,
+                max_tokens=self._max_tokens,
                 temperature=self._temperature,
             )
             elapsed = time.time() - t0
@@ -206,10 +210,20 @@ class VisionProvider:
                     {
                         "role": "system",
                         "content": (
-                            "You are a precise visual locator. Given a screenshot and a description, "
-                            "return the approximate CENTER pixel coordinates of the described element "
-                            f"within this {img_w}x{img_h} image. "
-                            "Return ONLY a JSON object, nothing else."
+                            "You are a pixel-precise UI element locator. You receive a screenshot "
+                            f"that is exactly {img_w}x{img_h} pixels. Your job is to find a "
+                            "described element and return its EXACT center coordinates.\n\n"
+                            "PROCEDURE:\n"
+                            "1. Scan the image systematically — top-left to bottom-right.\n"
+                            "2. Identify ALL instances of the target element.\n"
+                            "3. For the best match, determine its bounding box edges (left, right, top, bottom pixel).\n"
+                            "4. Compute center: x = (left + right) / 2, y = (top + bottom) / 2.\n"
+                            "5. Return the coordinates.\n\n"
+                            "COORDINATE SYSTEM: Origin (0,0) is top-left. X increases rightward. Y increases downward.\n"
+                            "BE PRECISE: A YouTube thumbnail is ~360x200px. A button is ~80x30px. "
+                            "Account for padding, margins, and borders. Target the CENTER of the clickable area, "
+                            "not the text label or icon edge.\n\n"
+                            "OUTPUT: JSON only, no explanation."
                         ),
                     },
                     {
@@ -222,15 +236,17 @@ class VisionProvider:
                             {
                                 "type": "text",
                                 "text": (
-                                    f'Find: "{description}"\n'
-                                    f'Return JSON: {{"x": <pixel_x>, "y": <pixel_y>}}\n'
-                                    f'If not found, return: {{"x": null, "y": null}}'
+                                    f'Target: "{description}"\n'
+                                    f'Image size: {img_w}x{img_h}px\n'
+                                    f'Return: {{"x": <center_x>, "y": <center_y>, "confidence": "high"|"medium"|"low", '
+                                    f'"bbox": {{"left": <l>, "top": <t>, "right": <r>, "bottom": <b>}}}}\n'
+                                    f'Not found: {{"x": null, "y": null, "confidence": "none"}}'
                                 ),
                             },
                         ],
                     },
                 ],
-                max_tokens=50,
+                max_tokens=self._locate_max_tokens,
                 temperature=0.1,
             )
             elapsed = time.time() - t0

@@ -161,6 +161,10 @@ class EnforcementMode:
     expired: bool = False           # has the duration elapsed?
     last_checkin_at: float = 0.0    # when we last asked "are you back?"
     checkin_count: int = 0          # how many check-ins after expiry
+    # Enforcement-specific idle tracking (independent of routine_manager's 3-min threshold)
+    idle_since: float = 0.0         # monotonic time when user went idle during enforcement
+    was_idle: bool = False           # is user currently idle (enforcement-specific)
+    last_away_dur: float = 0.0      # how long user was away on their most recent idle period
 
 
 @dataclass
@@ -197,6 +201,7 @@ class AgentLoop:
         vision_config=None,
         on_grab_cursor=None,
         vision_llm=None,
+        timeline=None,
     ) -> None:
         self._config = config
         self._monitor = screen_monitor
@@ -214,6 +219,7 @@ class AgentLoop:
         self._vision_config = vision_config  # for screen_vision setting
         self._on_grab_cursor = on_grab_cursor  # callback for cursor grab (main thread)
         self._vision_llm = vision_llm  # dedicated vision model (optional)
+        self._timeline = timeline      # shared event timeline
 
         self.directives: List[Directive] = []
         self._action_log: List[str] = []         # recent actions, capped at 15
@@ -235,6 +241,66 @@ class AgentLoop:
 
         # Load persistent state (directives, enforcement, timers)
         self._load_directives()
+
+    # ── Activity classification ─────────────────────────────────────────────
+
+    # Known game window classes (DX/UE/Unity/etc.)
+    _GAME_CLASS_PATTERNS = (
+        "unreal", "unity", "sdl_app", "glfw", "pygame", "godot",
+        "unrealwindow", "launchunreal",
+    )
+
+    _WORK_EXES = frozenset({
+        "code.exe", "devenv.exe", "idea64.exe", "pycharm64.exe",
+        "rider64.exe", "webstorm64.exe", "clion64.exe",
+        "winword.exe", "excel.exe", "powerpnt.exe", "onenote.exe",
+        "notepad++.exe", "sublime_text.exe",
+        "cmd.exe", "powershell.exe", "wt.exe", "windowsterminal.exe",
+        "obs64.exe", "audacity.exe", "blender.exe",
+        "photoshop.exe", "illustrator.exe", "clip_studio_paint.exe",
+        "krita.exe", "gimp-2.10.exe", "sai2.exe", "sai.exe",
+    })
+
+    _CHAT_EXES = frozenset({
+        "discord.exe", "telegram.exe", "slack.exe", "teams.exe",
+        "signal.exe", "element.exe",
+    })
+
+    _BROWSER_EXES = frozenset({
+        "chrome.exe", "firefox.exe", "msedge.exe", "brave.exe",
+        "opera.exe", "vivaldi.exe",
+    })
+
+    def _classify_activity(self, state) -> "ActivityState":
+        """Classify user's current activity from screen state. No LLM call."""
+        from core.event_timeline import ActivityState
+
+        if not state or not state.foreground:
+            return ActivityState.AFK_UNKNOWN
+
+        exe = (state.foreground.exe_name or "").lower()
+        title = state.foreground.title.lower()
+        cls = (state.foreground.class_name or "").lower()
+
+        # Media detection (fullscreen video)
+        if state.is_media_fullscreen:
+            return ActivityState.ACTIVE_MEDIA
+
+        # Gaming detection
+        if any(gc in cls for gc in self._GAME_CLASS_PATTERNS):
+            return ActivityState.ACTIVE_GAMING
+        if state.foreground.is_fullscreen and exe not in self._BROWSER_EXES and exe not in self._WORK_EXES:
+            return ActivityState.ACTIVE_GAMING
+
+        # Chat/social
+        if exe in self._CHAT_EXES:
+            return ActivityState.ACTIVE_CHATTING
+
+        # Productive work
+        if exe in self._WORK_EXES:
+            return ActivityState.ACTIVE_WORKING
+
+        return ActivityState.ACTIVE_BROWSING
 
     # ── Directive persistence ──────────────────────────────────────────────
 
@@ -362,8 +428,14 @@ class AgentLoop:
         else:
             return random.uniform(600.0, 900.0)
 
-    def add_directive(self, goal: str, urgency: int, source: str = "user") -> None:
-        """Add a new directive (max ``max_directives``). Deduplicates by goal."""
+    def add_directive(self, goal: str, urgency: int, source: str = "user",
+                      delay_minutes: int = None) -> None:
+        """Add a new directive (max ``max_directives``). Deduplicates by goal.
+
+        If ``delay_minutes`` is set, the first nag is deferred by that many minutes
+        instead of using the default urgency-based delay. This is for things the user
+        mentioned needing to do LATER, not RIGHT NOW.
+        """
         if len(self.directives) >= self._config.max_directives:
             logger.warning("Max directives reached (%d) — ignoring new directive.", self._config.max_directives)
             return
@@ -382,13 +454,21 @@ class AgentLoop:
                     logger.info("Duplicate directive %r — skipping (existing urgency %d)", goal, existing.urgency)
                 return
         now = time.monotonic()
-        nag_at = now + self._initial_nag_delay(urgency)
+        if delay_minutes and delay_minutes > 0:
+            nag_at = now + delay_minutes * 60
+        else:
+            nag_at = now + self._initial_nag_delay(urgency)
         d = Directive(goal=goal, urgency=urgency, created_at=now, last_action_at=now,
                       next_nag_at=nag_at, source=source)
         self.directives.append(d)
         self.save_directives()
-        logger.info("Directive added [%s]: %r (urgency %d, first nag in %.0fs)",
-                     source, goal, urgency, nag_at - now)
+        delay_str = f", deferred {delay_minutes}min" if delay_minutes else ""
+        logger.info("Directive added [%s]: %r (urgency %d, first nag in %.0fs%s)",
+                     source, goal, urgency, nag_at - now, delay_str)
+        if self._timeline:
+            from core.event_timeline import EventType
+            self._timeline.append(EventType.DIRECTIVE_CREATED,
+                                  f'Directive created: "{goal}" (urgency {urgency}, source: {source}{delay_str})')
 
     def add_timer(self, time_str: str, action: str) -> None:
         """Add a time-triggered directive (fires at a specific wall-clock time)."""
@@ -525,6 +605,9 @@ class AgentLoop:
         if not active:
             # After conversation ends, wait a bit before next idle check
             self._next_idle_check_at = time.monotonic() + 30.0
+            if self._timeline:
+                from core.event_timeline import EventType
+                self._timeline.append(EventType.CONVERSATION_END, "Conversation ended")
 
     @property
     def has_directives(self) -> bool:
@@ -551,12 +634,22 @@ class AgentLoop:
         if self._robot and hasattr(self._robot, 'countdown_start'):
             self._robot.countdown_start.emit(int(duration_s))
 
+    # Idle threshold for enforcement: 15s avoids false positives from mouse jitter,
+    # system notifications, or optical sensor drift.
+    _ENFORCEMENT_IDLE_MS = 15_000
+
     def _check_enforcement(self) -> None:
-        """Enforcement mode — IMMEDIATELY detect any mouse/keyboard input, ask if done."""
+        """Smart enforcement — uses its own idle tracking, not routine_manager.
+
+        Key fix: routine_manager uses a 3-MINUTE threshold for away detection,
+        but enforcement needs a much shorter threshold (15s). Using routine_manager's
+        away_duration_s gave wildly wrong durations (stale from hours-old transitions).
+        """
         now = time.monotonic()
         elapsed = now - self._enforcement.start_time
+        duration = self._enforcement.duration_s
 
-        # Short grace period — user is walking away (10 seconds)
+        # Grace period (10s for user to walk away)
         if elapsed < 10.0:
             return
 
@@ -570,28 +663,280 @@ class AgentLoop:
 
         # Debug output every 30 checks (~30 seconds)
         if self._enforcement.check_count % 30 == 0:
-            print(f"[ENFORCEMENT] {elapsed:.0f}s/{self._enforcement.duration_s:.0f}s | idle={idle_ms}ms")
+            state = "IDLE" if idle_ms >= self._ENFORCEMENT_IDLE_MS else "ACTIVE"
+            print(f"[ENFORCEMENT] {elapsed:.0f}s/{duration:.0f}s | idle={idle_ms}ms ({state})")
 
-        # ANY input detected (idle < 3 seconds) — immediately ask
-        if idle_ms < 3000:
-            # Don't ask again if we asked recently (cooldown 30s)
+        # ── User is idle (away from computer) ──
+        if idle_ms >= self._ENFORCEMENT_IDLE_MS:
+            if not self._enforcement.was_idle:
+                # Just went idle — record when
+                self._enforcement.was_idle = True
+                self._enforcement.idle_since = now
+                logger.info("Enforcement: user went idle (doing task?)")
+
+            # Timer expired while away — note it
+            if elapsed >= duration and not self._enforcement.expired:
+                self._enforcement.expired = True
+                logger.info("Enforcement timer expired for %r — user still away.",
+                            self._enforcement.directive_goal)
+            return
+
+        # ── User is active (touching input) ──
+
+        if self._enforcement.was_idle:
+            # JUST RETURNED from being idle — compute actual away duration
+            away_dur = now - self._enforcement.idle_since
+            self._enforcement.was_idle = False
+            self._enforcement.last_away_dur = away_dur
+
+            # Cooldown: don't ask within 30s of last ask
             if (now - self._enforcement.last_caught_at) < 30.0:
                 return
+
+            self._enforcement.last_caught_at = now
+            self._enforcement.caught_count += 1
+
+            ratio = away_dur / duration if duration > 0 else 0
+            print(f"[ENFORCEMENT] User returned — away {away_dur:.0f}s / "
+                  f"{duration:.0f}s expected (ratio {ratio:.1%})")
+
+            if ratio >= 0.7:
+                self._enforcement_auto_complete(away_dur)
+            elif ratio >= 0.3:
+                self._enforcement_casual_checkin(away_dur)
+            elif ratio >= 0.1:
+                self._enforcement_ask_if_done()
+            else:
+                self._enforcement_ask_if_done_skeptical()
+        else:
+            # User has been continuously active — never left or returned a while ago.
+            # Only nag if they've been sitting here a long time without leaving.
+            if elapsed < 30.0:
+                return  # give them time to wrap up and leave
+            if (now - self._enforcement.last_caught_at) < 60.0:
+                return  # don't nag more than once per minute when they won't leave
             self._enforcement.last_caught_at = now
             self._enforcement.caught_count += 1
             self._enforcement_ask_if_done()
-            return
 
-        # Timer expired and user is still away — periodic check-in
-        if elapsed >= self._enforcement.duration_s and not self._enforcement.expired:
-            self._enforcement.expired = True
-            # Don't interrupt — they're away (idle). Just note it.
-            logger.info("Enforcement timer expired for %r — user still away.", self._enforcement.directive_goal)
+    # ── Enforcement interaction (LLM-driven, temporally-aware) ──────────
 
-    # ── Enforcement interaction (LLM-driven) ────────────────────────────
+    def _enforcement_auto_complete(self, away_seconds: float) -> None:
+        """User was away >= 70% of expected time — assume they did it. Welcome warmly."""
+        goal = self._enforcement.directive_goal
+        name = get_character_name()
+        dur_str = self._fmt_duration(away_seconds)
+
+        context = ""
+        if self._timeline:
+            intent = self._timeline.user_intent
+            if intent:
+                context = f" They said they were going to: {intent.action}."
+
+        prompt = (
+            f"You are {name}. The user was away for {dur_str} doing '{goal}'.{context} "
+            f"They just came back. Welcome them back warmly — you're confident they "
+            f"did it because they were gone long enough. ONE sentence, in character. "
+            f"Be genuinely pleased, not suspicious."
+        )
+        text = self._llm.generate_once(prompt, max_tokens=100)
+        text = self._strip_think(text).strip().strip('"')
+        if not text:
+            text = "welcome back! that was good timing."
+        self._speak(text)
+        self._enforcement_complete(text)
+
+        if self._timeline:
+            from core.event_timeline import EventType
+            self._timeline.append(EventType.ENFORCEMENT_COMPLETE,
+                                  f"Task auto-completed: {goal} (away {dur_str})")
+            self._timeline.set_user_intent(None)
+
+    def _enforcement_casual_checkin(self, away_seconds: float) -> None:
+        """User was away 30-70% of expected time. Ask casually, not suspiciously."""
+        goal = self._enforcement.directive_goal
+        name = get_character_name()
+        dur_str = self._fmt_duration(away_seconds)
+
+        if self._detector:
+            try:
+                self._detector.pause()
+            except Exception:
+                pass
+
+        try:
+            prompt = (
+                f"You are {name}. The user was supposed to {goal}. They left for {dur_str} "
+                f"and just came back. That's a reasonable amount of time — they probably did it. "
+                f"Welcome them back and casually ask how it went. ONE sentence. Be warm, not suspicious."
+            )
+            text = self._llm.generate_once(prompt, max_tokens=100)
+            text = self._strip_think(text).strip().strip('"')
+            if not text:
+                text = "hey, welcome back! how'd it go?"
+            self._speak(text)
+
+            response = self._enforcement_listen()
+            if response is None:
+                # No response — benefit of the doubt, they were gone a reasonable time
+                self._llm.inject_history(
+                    f"(Enforcement for \"{goal}\": you asked how it went, no response.)",
+                    text,
+                )
+                self._enforcement_complete(text)
+                if self._timeline:
+                    from core.event_timeline import EventType
+                    self._timeline.append(EventType.ENFORCEMENT_COMPLETE,
+                                          f"Task completed (no response, reasonable absence): {goal}")
+                    self._timeline.set_user_intent(None)
+                return
+
+            # Classify response — distinguish "did it" from "going to do it"
+            classify_prompt = (
+                f"The user was asked casually how '{goal}' went after being away "
+                f"for {dur_str}. They said: \"{response}\"\n"
+                f"Did they indicate they ALREADY completed it (even partially)? YES or NO.\n"
+                f"Note: 'I'm going to do it' or 'I'll do it now' means NO — they haven't done it yet."
+            )
+            verdict = self._llm.generate_once(
+                classify_prompt, max_tokens=10,
+                system_prompt="Reply YES or NO only."
+            )
+            verdict = self._strip_think(verdict).strip().upper()
+
+            # Inject the whole exchange into history
+            self._llm.inject_history(
+                f"(Enforcement: you asked about \"{goal}\". User said: \"{response}\")",
+                text,
+            )
+
+            if "YES" in verdict:
+                complete_prompt = (
+                    f"You are {name}. The user confirmed they did '{goal}'. "
+                    f"React positively in ONE sentence."
+                )
+                complete_text = self._llm.generate_once(complete_prompt, max_tokens=100)
+                complete_text = self._strip_think(complete_text).strip().strip('"')
+                if complete_text:
+                    self._speak(complete_text)
+                self._enforcement_complete(complete_text or text)
+                if self._timeline:
+                    from core.event_timeline import EventType
+                    self._timeline.append(EventType.ENFORCEMENT_COMPLETE,
+                                          f"Task confirmed complete: {goal}")
+                    self._timeline.set_user_intent(None)
+            else:
+                # Didn't do it despite being away — nag but don't lockdown yet
+                nag_prompt = (
+                    f"You are {name}. The user was away for {dur_str} but didn't "
+                    f"actually do '{goal}'. Be disappointed but not aggressive. ONE sentence."
+                )
+                nag_text = self._llm.generate_once(nag_prompt, max_tokens=100)
+                nag_text = self._strip_think(nag_text).strip().strip('"')
+                if nag_text:
+                    self._speak(nag_text)
+                    self._llm.inject_history(
+                        f"(User didn't do \"{goal}\" despite being away.)",
+                        nag_text,
+                    )
+        finally:
+            if self._detector:
+                try:
+                    self._detector.resume()
+                except Exception:
+                    pass
+
+    def _enforcement_ask_if_done_skeptical(self) -> None:
+        """User barely left their desk. Be skeptical when asking."""
+        goal = self._enforcement.directive_goal
+        name = get_character_name()
+        caught_count = self._enforcement.caught_count
+
+        if self._detector:
+            try:
+                self._detector.pause()
+            except Exception:
+                pass
+
+        try:
+            prompt = (
+                f"You are {name}. The user was supposed to go {goal}, but they "
+                f"barely left their computer. They've only been away for a moment. "
+                f"This is catch #{caught_count}. "
+                f"Call them out — they clearly didn't do it. ONE sentence, in character. "
+                f"Be skeptical and pushy."
+            )
+            ask_text = self._llm.generate_once(prompt, max_tokens=100)
+            ask_text = self._strip_think(ask_text).strip().strip('"')
+            if not ask_text:
+                ask_text = f"uh... that was fast. you definitely didn't {goal}."
+            self._speak(ask_text)
+
+            response = self._enforcement_listen()
+            if response is None:
+                self._llm.inject_history(
+                    f"(Enforcement: you called out user about \"{goal}\", no response.)",
+                    ask_text,
+                )
+                return
+
+            # Inject the exchange so pony remembers
+            self._llm.inject_history(
+                f"(Enforcement: you asked about \"{goal}\". User said: \"{response}\")",
+                ask_text,
+            )
+
+            classify_prompt = (
+                f"The user was asked if they finished '{goal}'. "
+                f"They responded: \"{response}\"\n"
+                f"Classify: (A) they ALREADY completed the task, "
+                f"(B) they're saying they'll GO DO IT now, "
+                f"(C) they did NOT do it and aren't leaving.\n"
+                f"Reply A, B, or C only."
+            )
+            verdict = self._llm.generate_once(
+                classify_prompt, max_tokens=10,
+                system_prompt="Reply A, B, or C only."
+            )
+            verdict = self._strip_think(verdict).strip().upper()
+
+            if "A" in verdict:
+                complete_prompt = (
+                    f"You are {name}. The user claims they did '{goal}' super fast. "
+                    f"Be surprised but accept it. ONE sentence."
+                )
+                complete_text = self._llm.generate_once(complete_prompt, max_tokens=100)
+                complete_text = self._strip_think(complete_text).strip().strip('"')
+                if complete_text:
+                    self._speak(complete_text)
+                self._enforcement_complete(complete_text or "...okay, if you say so.")
+                if self._timeline:
+                    from core.event_timeline import EventType
+                    self._timeline.append(EventType.ENFORCEMENT_COMPLETE,
+                                          f"Task claimed complete (skeptical): {goal}")
+                    self._timeline.set_user_intent(None)
+            elif "B" in verdict:
+                go_prompt = (
+                    f"You are {name}. The user says they'll go {goal} now. "
+                    f"Tell them to hurry up. ONE sentence, in character."
+                )
+                go_text = self._llm.generate_once(go_prompt, max_tokens=100)
+                go_text = self._strip_think(go_text).strip().strip('"')
+                if go_text:
+                    self._speak(go_text)
+                self._enforcement.was_idle = False
+                self._enforcement.idle_since = 0.0
+            else:
+                self._enforcement_lockdown()
+        finally:
+            if self._detector:
+                try:
+                    self._detector.resume()
+                except Exception:
+                    pass
 
     def _enforcement_ask_if_done(self) -> None:
-        """User touched mouse/keyboard during enforcement — ask if they completed the task.
+        """User was away for a short but non-trivial time — ask neutrally.
         If yes → done. If no → LOCKDOWN. All speech is LLM-generated."""
         goal = self._enforcement.directive_goal
         caught_count = self._enforcement.caught_count
@@ -623,26 +968,38 @@ class AgentLoop:
             response = self._enforcement_listen()
             if response is None:
                 logger.info("Enforcement: no response to ask-if-done")
+                self._llm.inject_history(
+                    f"(Enforcement: you asked about \"{goal}\", no response.)",
+                    ask_text,
+                )
                 return
 
             logger.info("Enforcement response: %r", response)
 
-            # LLM classifies intent instead of keyword matching
+            # Inject the exchange so pony remembers
+            self._llm.inject_history(
+                f"(Enforcement: you asked about \"{goal}\". User said: \"{response}\")",
+                ask_text,
+            )
+
+            # LLM classifies intent — distinguish "did it" from "going to do it"
             classify_prompt = (
                 f"The user was asked if they finished '{goal}'. "
                 f"They responded: \"{response}\"\n"
-                f"Did they confirm they completed the task? "
-                f"Reply with exactly YES or NO."
+                f"Classify: (A) they ALREADY completed the task, "
+                f"(B) they're saying they'll GO DO IT now / are leaving to do it, "
+                f"(C) they did NOT do it and aren't leaving.\n"
+                f"Reply A, B, or C only."
             )
             verdict = self._llm.generate_once(
                 classify_prompt, max_tokens=10,
-                system_prompt="You are a classification assistant. Reply YES or NO only."
+                system_prompt="Reply A, B, or C only."
             )
             verdict = self._strip_think(verdict).strip().upper()
             logger.info("Enforcement verdict: %r (from response: %r)", verdict, response)
 
-            if "YES" in verdict:
-                # LLM generates completion response
+            if "A" in verdict:
+                # Confirmed completed
                 complete_prompt = (
                     f"You are {name}. The user just confirmed they completed '{goal}'. "
                     f"React in ONE sentence. Be genuinely pleased, in character."
@@ -653,6 +1010,21 @@ class AgentLoop:
                     self._speak(complete_text)
                 self._enforcement_complete(complete_text or "okay, nice.")
                 return
+
+            if "B" in verdict:
+                # Going to do it — encourage and keep enforcement active
+                go_prompt = (
+                    f"You are {name}. The user says they're going to go {goal} now. "
+                    f"Encourage them briefly. ONE sentence, in character."
+                )
+                go_text = self._llm.generate_once(go_prompt, max_tokens=100)
+                go_text = self._strip_think(go_text).strip().strip('"')
+                if go_text:
+                    self._speak(go_text)
+                # Reset idle tracking — they should go idle soon
+                self._enforcement.was_idle = False
+                self._enforcement.idle_since = 0.0
+                return  # keep enforcement active, wait for them to leave
 
             # Not confirmed → lockdown
             self._enforcement_lockdown()
@@ -792,22 +1164,26 @@ class AgentLoop:
                 response = self._enforcement_listen(timeout=6.0)
                 if response:
                     logger.info("Lockdown response: %r", response)
-                    # LLM classifies: (A) completed, (B) stop/give up, (C) neither
+                    # LLM classifies: (A) completed, (B) stop/give up,
+                    # (C) going to do it now, (D) neither
                     classify_prompt = (
                         f"User response during lockdown for '{goal}': \"{response}\"\n"
-                        f"Did they: (A) confirm they completed the task, "
-                        f"(B) ask to stop/give up/quit, or (C) neither?\n"
-                        f"Reply A, B, or C only."
+                        f"Classify: (A) they ALREADY completed the task, "
+                        f"(B) ask to stop/give up/quit entirely, "
+                        f"(C) they'll GO DO IT now (agreeing to leave), "
+                        f"(D) neither / arguing / stalling.\n"
+                        f"Note: 'I'm going' / 'fine I'll do it' / 'okay' = C, not A.\n"
+                        f"Reply A, B, C, or D only."
                     )
                     verdict = self._llm.generate_once(
                         classify_prompt, max_tokens=10,
-                        system_prompt="You are a classification assistant. Reply A, B, or C only."
+                        system_prompt="Reply A, B, C, or D only."
                     )
                     verdict = self._strip_think(verdict).strip().upper()
                     logger.info("Lockdown verdict: %r", verdict)
 
                     if "A" in verdict:
-                        # LLM generates release text
+                        # Completed during lockdown
                         release_prompt = (
                             f"You are {name}. The user FINALLY completed '{goal}' during lockdown "
                             f"after {lockdown_round} rounds. React in ONE sentence. In character."
@@ -819,7 +1195,7 @@ class AgentLoop:
                         self._enforcement_complete(release_text or "finally.")
                         return
                     elif "B" in verdict:
-                        # LLM generates grudging release
+                        # Giving up — grudging release
                         stop_prompt = (
                             f"You are {name}. The user asked you to stop the lockdown for '{goal}'. "
                             f"You're giving in, but you're NOT happy about it. ONE sentence, in character."
@@ -831,6 +1207,24 @@ class AgentLoop:
                         self._enforcement = EnforcementMode()
                         self._hide_countdown()
                         self.save_directives()
+                        return
+                    elif "C" in verdict:
+                        # Going to do it — release lockdown but KEEP enforcement
+                        go_prompt = (
+                            f"You are {name}. The user agreed to go {goal}. "
+                            f"Tell them to go — you'll be watching. ONE sentence, in character."
+                        )
+                        go_text = self._llm.generate_once(go_prompt, max_tokens=100)
+                        go_text = self._strip_think(go_text).strip().strip('"')
+                        if go_text:
+                            self._speak(go_text)
+                        # Release lockdown but keep enforcement active
+                        # Reset idle tracking so we detect when they actually leave
+                        self._enforcement.was_idle = False
+                        self._enforcement.idle_since = 0.0
+                        self._enforcement.caught_count = 0
+                        self._enforcement.last_caught_at = time.monotonic()
+                        logger.info("Lockdown released — enforcement continues for %r", goal)
                         return
 
                 logger.info("Lockdown round %d — user still hasn't done %r", lockdown_round, goal)
@@ -870,6 +1264,22 @@ class AgentLoop:
         state = self._monitor.get_state()
         media_active = state.is_media_fullscreen if state else False
         self._last_wake_event = self.routine_manager.update_activity(idle_ms, media_active=media_active)
+
+        # Log activity transitions to timeline
+        if self._timeline:
+            from core.event_timeline import EventType, ActivityState
+            if self._last_wake_event == "wake":
+                self._timeline.append(EventType.USER_RETURNED,
+                                      f"User returned after {self._fmt_duration(away_dur or 0)}",
+                                      {"away_seconds": away_dur})
+            elif self._last_wake_event == "away":
+                intent = self._timeline.user_intent
+                reason = f" (likely doing: {intent.action})" if intent else ""
+                self._timeline.append(EventType.USER_WENT_AFK, f"User went AFK{reason}")
+                self._timeline.set_activity_state(
+                    ActivityState.AFK_TASK if self._enforcement.active else ActivityState.AFK_UNKNOWN)
+            elif state and not self.routine_manager.is_user_away:
+                self._timeline.set_activity_state(self._classify_activity(state))
 
         # Welcome-back greeting when user returns from AFK
         if self._last_wake_event == "wake" and not self._conversation_active:
@@ -915,33 +1325,33 @@ class AgentLoop:
         if now < self._next_idle_check_at:
             return
 
-        if not actionable:
-            # No active directives — check self-initiation and spontaneous speech
-            if self._config.self_initiate:
-                if (now - self._last_self_check) >= self._config.self_initiate_interval_s:
-                    self._last_self_check = now
-                    self._maybe_self_initiate()
-                    return
+        # Self-initiation check (only when no directives at all)
+        if not actionable and self._config.self_initiate:
+            if (now - self._last_self_check) >= self._config.self_initiate_interval_s:
+                self._last_self_check = now
+                self._maybe_self_initiate()
+                return
 
-            # Observation tick OR spontaneous speech (every 3-8 min)
-            if now >= self._next_spontaneous:
-                next_in = random.uniform(
-                    self._config.spontaneous_speech_min_s,
-                    self._config.spontaneous_speech_max_s,
-                )
-                # 60% observation tick (screen-aware), 40% classic spontaneous speech
-                if random.random() < 0.6:
-                    print(f"\n[Agent] Observation tick (next in {next_in:.0f}s)", flush=True)
-                    self._observation_tick()
-                else:
-                    print(f"\n[Agent] Spontaneous speech triggered (next in {next_in:.0f}s)", flush=True)
-                    self._spontaneous_speech()
-                self._next_spontaneous = time.monotonic() + next_in
+        # Observation tick OR spontaneous speech (every 2-5 min)
+        # Fires regardless of whether directives exist — she should still talk
+        if now >= self._next_spontaneous:
+            next_in = random.uniform(
+                self._config.spontaneous_speech_min_s,
+                self._config.spontaneous_speech_max_s,
+            )
+            # 60% observation tick (screen-aware), 40% classic spontaneous speech
+            if random.random() < 0.6:
+                print(f"\n[Agent] Observation tick (next in {next_in:.0f}s)", flush=True)
+                self._observation_tick()
             else:
-                self._next_idle_check_at = now + min(
-                    self._config.base_check_interval_s,
-                    self._next_spontaneous - now + 1.0,
-                )
+                print(f"\n[Agent] Spontaneous speech triggered (next in {next_in:.0f}s)", flush=True)
+                self._spontaneous_speech()
+            self._next_spontaneous = time.monotonic() + next_in
+        else:
+            self._next_idle_check_at = now + min(
+                self._config.base_check_interval_s,
+                self._next_spontaneous - now + 1.0,
+            )
 
     # ── Core tick execution ────────────────────────────────────────────────
 
@@ -1034,6 +1444,26 @@ class AgentLoop:
             if app_names:
                 lines.append(f"INSTALLED APPS: {app_names[:30]}")
 
+        # Event timeline — recent history for contextual awareness
+        if self._timeline:
+            timeline_str = self._timeline.format_recent_for_prompt(15)
+            lines.append("")
+            lines.append("RECENT EVENTS (what has happened — use this for context):")
+            lines.append(timeline_str)
+
+            convo = self._timeline.get_recent_conversation_summary(5)
+            if convo != "(no recent conversation)":
+                lines.append("")
+                lines.append("RECENT CONVERSATION (what the user told you — don't repeat topics):")
+                lines.append(convo)
+
+            intent = self._timeline.user_intent
+            if intent:
+                age = self._fmt_duration(time.monotonic() - intent.stated_at)
+                lines.append(f"\nUSER'S STATED INTENT: \"{intent.action}\" (said {age} ago)")
+
+            lines.append(f"USER ACTIVITY: {self._timeline.activity_state.value}")
+
         # Directives (exclude unfired timers — they're handled by _check_timers)
         actionable = [d for d in self.directives
                       if not (d.trigger_time and not d.triggered)]
@@ -1095,7 +1525,7 @@ class AgentLoop:
             '  - {"command":"BROWSE","args":["url"]}',
             '  - {"command":"WRITE_NOTEPAD","args":["content with \\n for newlines"]} — open Notepad and write content (lists, routines, plans, notes)',
             '  - {"command":"LAUNCH_APP","args":["app name"]} — launch an installed app or game by name (fuzzy match)',
-            '- create_directive: {"goal":"...","urgency":1-10} or null — goal must be a DIRECT ACTION like "eat food", "go to sleep", "do homework". NEVER write "remind user to" or "get user to" — just the action itself.',
+            '- create_directive: {"goal":"...","urgency":1-10} or {"goal":"...","urgency":1-10,"delay_minutes":30} or null — goal must be a DIRECT ACTION like "eat food", "go to sleep". NEVER write "remind user to" or "get user to". Use delay_minutes to defer first nag for non-urgent tasks.',
             '- complete_directive: index of directive to mark done, or null',
             '- directives: for EACH active directive by index, set timing AND urgency:',
             '  {"0": {"next_nag_minutes": 5, "urgency": 7}}',
@@ -1267,12 +1697,15 @@ class AgentLoop:
             try:
                 self._speak(decision.speak)
 
-                # Inject into LLM history so Dash remembers
+                # Inject into LLM history so pony remembers
                 fg_title = state.foreground.title if state.foreground else "the screen"
                 ctx = f"(You autonomously noticed: {fg_title}. You decided to speak up.)"
                 self._llm.inject_history(ctx, decision.speak)
 
                 self._log_action(f"Said: \"{decision.speak[:80]}\"")
+
+                # Open mic so user can respond naturally
+                self._listen_for_reply()
             except Exception as exc:
                 logger.warning("Agent speak failed: %s", exc)
 
@@ -1363,7 +1796,7 @@ class AgentLoop:
                     elif command == "LOOK_AND_CLICK":
                         if args and self._screen:
                             description = args[0]
-                            jpeg = self._screen.grab(quality=85)
+                            jpeg = self._screen.grab(quality=95)
                             if jpeg:
                                 coords = None
                                 if self._vision_llm and hasattr(self._vision_llm, 'locate_on_screen'):
@@ -1412,10 +1845,11 @@ class AgentLoop:
         if decision.create_directive is not None:
             goal = decision.create_directive.get("goal", "")
             urgency = decision.create_directive.get("urgency", 5)
+            delay = decision.create_directive.get("delay_minutes")
             # Don't re-create directives right after user cleared them (60s cooldown)
             recently_cleared = (now - self._directives_cleared_at) < 60.0
             if goal and not recently_cleared:
-                self.add_directive(goal, urgency, source="self")
+                self.add_directive(goal, urgency, source="self", delay_minutes=delay)
 
         # Update last_action_at and nag_style on active directives if we did something
         if decision.speak or decision.actions or decision.desktop_commands:
@@ -1576,6 +2010,7 @@ class AgentLoop:
                     decision.speak,
                 )
                 self._log_action(f"Self-initiated: \"{decision.speak[:80]}\"")
+                self._listen_for_reply()
 
             next_s = max(self._config.min_check_interval_s, decision.next_check_seconds)
             self._next_idle_check_at = time.monotonic() + next_s
@@ -1587,7 +2022,7 @@ class AgentLoop:
     # ── Welcome-back greeting ────────────────────────────────────────────
 
     def _welcome_back(self, away_seconds: Optional[float]) -> None:
-        """Greet the user when they return from AFK."""
+        """Greet the user when they return from AFK, with full context."""
         try:
             if away_seconds and away_seconds > 0:
                 if away_seconds < 300:
@@ -1606,11 +2041,24 @@ class AgentLoop:
             if state and state.foreground:
                 current_app = f" They're now looking at: \"{state.foreground.title}\"."
 
+            # Rich context from timeline
+            context_parts = []
+            if self._timeline:
+                intent = self._timeline.user_intent
+                if intent:
+                    context_parts.append(
+                        f"Before leaving, the user said they were going to: {intent.action}.")
+                convo = self._timeline.get_recent_conversation_summary(3)
+                if convo != "(no recent conversation)":
+                    context_parts.append(f"Recent conversation:\n{convo}")
+            context = " ".join(context_parts)
+
             prompt = (
                 f"(The user just came back after being away for {dur}.{current_app} "
+                f"{context} "
                 f"Welcome them back in ONE short sentence as {name}. "
-                f"Be natural and casual — don't robotically state the exact duration like "
-                f"'wow, X minutes.' Just be a friend who noticed they're back. Keep it brief.)"
+                f"If you know WHY they left, reference it naturally. "
+                f"Be casual — don't robotically state the exact duration.)"
             )
             raw = self._llm.generate_once(prompt)
             if raw:
@@ -1623,6 +2071,7 @@ class AgentLoop:
                     text,
                 )
                 self._log_action(f"Welcome back after {dur}")
+                self._listen_for_reply()
         except Exception as exc:
             logger.warning("Welcome-back greeting failed: %s", exc)
 
@@ -1643,6 +2092,13 @@ class AgentLoop:
             else:
                 prompt_choice = random.choice(_IDLE_PROMPTS)
 
+            # Add recent conversation context to avoid repeating topics
+            avoid_topics = ""
+            if self._timeline:
+                convo = self._timeline.get_recent_conversation_summary(3)
+                if convo != "(no recent conversation)":
+                    avoid_topics = f" Don't repeat topics from recent conversation: {convo}"
+
             # 50% chance: comment on what's on screen, 50%: use an idle prompt
             if state.foreground and random.random() < 0.5:
                 fg = state.foreground.title
@@ -1657,10 +2113,10 @@ class AgentLoop:
                     f"(You glanced at the user's screen. They have \"{fg}\" ({exe}{fullscreen}) open.{screen_extra} "
                     f"React in ONE short sentence as {get_character_name()}. Be natural — sometimes "
                     "comment on it, sometimes ignore it and say something random. "
-                    "NEVER say 'that's actually kinda cool/based/neat' — use different words.)"
+                    f"NEVER say 'that's actually kinda cool/based/neat' — use different words.{avoid_topics})"
                 )
             else:
-                trigger = f"(Spontaneous thought — {prompt_choice})"
+                trigger = f"(Spontaneous thought — {prompt_choice}{avoid_topics})"
 
             print(f"[Agent] Prompt: {trigger[:100]}...", flush=True)
             raw = self._llm.chat(trigger)
@@ -1718,6 +2174,14 @@ class AgentLoop:
                 if app_names:
                     apps_context = f"\nINSTALLED APPS: {app_names[:40]}"
 
+            # Recent conversation context (don't repeat topics)
+            recent_context = ""
+            if self._timeline:
+                convo = self._timeline.get_recent_conversation_summary(3)
+                if convo != "(no recent conversation)":
+                    recent_context += f"\nRECENT CONVERSATION (don't repeat these topics):\n{convo}\n"
+                recent_context += f"\nUSER ACTIVITY: {self._timeline.activity_state.value}\n"
+
             name = get_character_name()
             prompt = (
                 f"You are {name}, observing your user's desktop. Stay in character.\n"
@@ -1726,7 +2190,8 @@ class AgentLoop:
                 f"Foreground: \"{fg}\" ({exe}, open for {dur}{fullscreen})\n"
                 f"Open windows: {windows}"
                 f"{screen_context}"
-                f"{apps_context}\n"
+                f"{apps_context}"
+                f"{recent_context}\n"
                 f"\n"
                 f"OBSERVATION RULES:\n"
                 f"Think about WHAT they're doing, not just what app is open.\n"
@@ -1737,34 +2202,52 @@ class AgentLoop:
                 f"- Some days are rest days. If the user told you they're resting, back off completely.\n"
                 f"\n"
                 f"You can:\n"
-                f"- Say something short and natural (comment on what they're doing, ask a question)\n"
-                f"- Stay quiet (return null) — this is PERFECTLY FINE and often the right choice\n"
+                f"- Say something short and natural (comment on what they're doing, ask a question, tease them)\n"
+                f"- Stay quiet (return null) — but only if they're clearly deep in focus (coding, writing, etc.)\n"
                 f"- Suggest an activity if they seem bored/unfocused\n"
+                f"- React to what's on screen — be curious, playful, opinionated\n"
+                f"- DO something playful: grab the mouse for fun, launch an app or game for them, click something on screen\n"
+                f"\n"
+                f"PLAYFUL MISCHIEF (rare — maybe 1 in 10 observations):\n"
+                f"You're a living creature on their desktop. Sometimes you can DO things, not just talk:\n"
+                f"- Grab their mouse in your mouth and run across the screen (MESS_MOUSE) — hilarious, use sparingly\n"
+                f"- If they seem bored, launch a game or creative app for them (LAUNCH_APP)\n"
+                f"- If they're watching something, click on a video/link that looks interesting (LOOK_AND_CLICK)\n"
+                f"- If they're an artist who hasn't drawn today, open their paint program and nudge them\n"
+                f"DON'T do this every time. Most observations should be speech or silence. But sometimes... be a gremlin.\n"
                 f"\n"
                 f"DO NOT auto-create directives. DO NOT nag without a directive. Be a companion, not a virus.\n"
                 f"If you speak, keep it to ONE short sentence. Be natural, not robotic.\n"
                 f"NEVER say \"that's actually kinda [cool/based/neat]\" or any variation. Find different words.\n"
                 f"\n"
-                f"Respond with ONLY: {{\"speak\": \"your sentence\" or null}}"
+                f"Respond with JSON: {{\"speak\": \"text or null\", \"desktop_commands\": []}}\n"
+                f"desktop_commands options (use sparingly):\n"
+                f"  {{\"command\":\"MESS_MOUSE\",\"args\":[]}} — grab cursor and run with it\n"
+                f"  {{\"command\":\"LAUNCH_APP\",\"args\":[\"app name\"]}} — launch an installed app\n"
+                f"  {{\"command\":\"LOOK_AND_CLICK\",\"args\":[\"what to click\"]}} — vision-click something on screen\n"
+                f"  {{\"command\":\"PAUSE_MEDIA\",\"args\":[]}} — toggle play/pause\n"
+                f"Most of the time, just use speak and leave desktop_commands empty."
             )
 
             raw = self._llm.generate_once(prompt, max_tokens=512)
             if not raw:
                 return
 
-            # Parse response
+            # Parse response (supports nested JSON for desktop_commands)
             cleaned = self._strip_think(raw)
+            text = None
+            desktop_cmds = []
             try:
                 import json as _json
-                json_match = re.search(r'\{[^}]*\}', cleaned)
-                if json_match:
-                    data = _json.loads(json_match.group())
+                json_str = self._extract_json(cleaned)
+                if json_str:
+                    data = _json.loads(json_str)
                     text = data.get("speak")
-                else:
-                    text = None
+                    desktop_cmds = data.get("desktop_commands", [])
             except Exception:
-                text = None
+                pass
 
+            spoke = False
             if text and text.strip() and text.lower() != "null":
                 print(f"[Agent] Observation: \"{text[:80]}\"", flush=True)
                 self._speak(text)
@@ -1772,8 +2255,20 @@ class AgentLoop:
                 ctx = f"(You noticed {fg_title} and commented.)"
                 self._llm.inject_history(ctx, text)
                 self._log_action(f"Observation: \"{text[:60]}\"")
+                spoke = True
+
+            # Execute any playful desktop commands
+            if desktop_cmds:
+                from core.agent_loop import AgentDecision
+                decision = AgentDecision(desktop_commands=desktop_cmds)
+                self._execute_decision(decision)
+                for cmd in desktop_cmds:
+                    cmd_name = cmd.get("command", "?")
+                    self._log_action(f"Playful: {cmd_name}")
+
+            if spoke:
                 self._listen_for_reply()
-            else:
+            elif not desktop_cmds:
                 logger.debug("Observation tick — staying quiet.")
 
         except Exception as exc:
@@ -1907,6 +2402,9 @@ class AgentLoop:
                 self._tts.speak(text, on_playback_start=_show_bubble)
             else:
                 _show_bubble()
+            if self._timeline:
+                from core.event_timeline import EventType
+                self._timeline.append(EventType.AGENT_SPOKE, f'Pony said: "{text[:120]}"')
         finally:
             if self._on_state_change:
                 self._on_state_change("IDLE")
@@ -1994,27 +2492,31 @@ class AgentLoop:
                 d.triggered = True
                 d.urgency = 7
                 d.created_at = time.monotonic()
+                d.next_nag_at = time.monotonic()  # immediately due for nags
                 logger.info("Timer fired: %s -> %r", d.trigger_time, d.goal)
-                self._speak(f"Hey! It's {now.strftime('%I:%M %p')}! {d.goal}")
+                text = self._timer_speak(d.goal, d.trigger_time, headsup=False)
                 self._llm.inject_history(
                     f"(Timer alert: it's {d.trigger_time}. Goal: {d.goal})",
-                    f"Hey! It's {now.strftime('%I:%M %p')}! Time to {d.goal}!",
+                    text,
                 )
                 self._log_action(f"Timer fired at {d.trigger_time}: {d.goal}")
                 self.save_directives()
+                self._listen_for_reply()
             elif _in_window(headsup_at) and headsup_at != trigger_minutes:
-                # Heads-up — mark triggered so we don't repeat
+                # Heads-up 5 min early — activate but delay first nag until trigger time
                 d.triggered = True
                 d.urgency = 7
                 d.created_at = time.monotonic()
+                d.next_nag_at = time.monotonic() + 5 * 60  # don't nag again until actual time
                 logger.info("Timer heads-up (5 min early): %s -> %r", d.trigger_time, d.goal)
-                self._speak(f"Hey! Heads up — in five minutes you gotta {d.goal}!")
+                text = self._timer_speak(d.goal, d.trigger_time, headsup=True)
                 self._llm.inject_history(
                     f"(Timer heads-up: {d.goal} in 5 minutes, at {d.trigger_time})",
-                    f"Hey! Heads up — in five minutes you gotta {d.goal}!",
+                    text,
                 )
                 self._log_action(f"Timer heads-up at {d.trigger_time}: {d.goal}")
                 self.save_directives()
+                self._listen_for_reply()
 
     # ── Recurring routines ─────────────────────────────────────────────────
 
@@ -2061,6 +2563,36 @@ class AgentLoop:
             f"(Recurring routines fired: {', '.join(goals)})",
             text,
         )
+        self._listen_for_reply()
+
+    def _timer_speak(self, goal: str, trigger_time: str, headsup: bool) -> str:
+        """Generate an in-character timer announcement via LLM."""
+        name = get_character_name()
+        now_str = datetime.now().strftime('%I:%M %p').lstrip('0')
+        if headsup:
+            prompt = (
+                f"You are {name}. The user set a timer for {trigger_time} to: \"{goal}\". "
+                f"It's {now_str} now — 5 minutes before the timer fires. "
+                f"Give them a heads-up in ONE sentence, in character. Be natural."
+            )
+            fallback = f"hey, five minutes until you gotta {goal}."
+        else:
+            prompt = (
+                f"You are {name}. The user set a timer for {trigger_time} to: \"{goal}\". "
+                f"It's {now_str} — the timer just fired. "
+                f"Tell them it's time in ONE sentence, in character. Be natural and urgent."
+            )
+            fallback = f"hey, it's {now_str}. time to {goal}."
+        try:
+            text = self._llm.generate_once(prompt, max_tokens=100)
+            if text:
+                text = self._strip_think(text).strip().strip('"')
+            if not text:
+                text = fallback
+        except Exception:
+            text = fallback
+        self._speak(text)
+        return text
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -2115,10 +2647,12 @@ class AgentLoop:
     @staticmethod
     def _fmt_duration(seconds: float) -> str:
         if seconds < 5:
-            return "just now"
+            return "a few seconds"
         elif seconds < 60:
-            return f"{seconds:.0f}s ago"
+            return f"{seconds:.0f} seconds"
         elif seconds < 3600:
-            return f"{seconds / 60:.0f} min ago"
+            m = seconds / 60
+            return f"{m:.0f} minute{'s' if m >= 2 else ''}"
         else:
-            return f"{seconds / 3600:.1f}h ago"
+            h = seconds / 3600
+            return f"{h:.1f} hour{'s' if h >= 2 else ''}"

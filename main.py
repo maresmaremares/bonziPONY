@@ -18,6 +18,7 @@ import random
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 
 
@@ -97,8 +98,9 @@ def main() -> None:
     scan_ponies(ponies_root)
 
     # ── Apply preset ───────────────────────────────────────────────────────────
-    from llm.prompt import set_preset
+    from llm.prompt import set_preset, set_relationship
     set_preset(config.llm.preset)
+    set_relationship(config.llm.relationship, config.llm.relationship_custom)
     logger.info("Loaded preset: %s", config.llm.preset)
 
     # ── Build pipeline components ─────────────────────────────────────────────
@@ -153,6 +155,8 @@ def main() -> None:
                 base_url=base_url or "https://generativelanguage.googleapis.com/v1beta/openai",
                 max_requests_per_key_per_day=vlm_cfg.max_requests_per_key_per_day,
                 temperature=vlm_cfg.temperature,
+                max_tokens=vlm_cfg.max_tokens,
+                locate_max_tokens=vlm_cfg.locate_max_tokens,
             )
             logger.info("Dedicated vision LLM: %s (%d keys)", vlm_cfg.model, len(vlm_cfg.api_keys))
         except Exception as exc:
@@ -279,6 +283,10 @@ def main() -> None:
             logger.warning("Screen monitor disabled: %s", exc)
             screen_monitor = None
 
+    # Shared event timeline (bridges Pipeline ↔ AgentLoop context)
+    from core.event_timeline import EventTimeline
+    timeline = EventTimeline()
+
     # Agent loop (autonomous brain)
     agent_loop = None
     if config.agent.enabled and screen_monitor:
@@ -299,6 +307,7 @@ def main() -> None:
             vision_config=config.vision,
             on_grab_cursor=None,  # wired after _on_grab_cursor is defined
             vision_llm=vision_llm,
+            timeline=timeline,
         )
 
     # Compact user profile and prune stale events on startup
@@ -325,6 +334,7 @@ def main() -> None:
         screen_monitor=screen_monitor,
         moondream=moondream,
         vision_llm=vision_llm,
+        timeline=timeline,
     )
 
     # ── Context menu (right-click settings UI) ──────────────────────────────
@@ -416,6 +426,8 @@ def main() -> None:
                     base_url=base_url or "https://generativelanguage.googleapis.com/v1beta/openai",
                     max_requests_per_key_per_day=vlm_cfg.max_requests_per_key_per_day,
                     temperature=vlm_cfg.temperature,
+                    max_tokens=vlm_cfg.max_tokens,
+                    locate_max_tokens=vlm_cfg.locate_max_tokens,
                 )
                 logger.info("Vision LLM reloaded: %s (%d keys)", vlm_cfg.model, len(vlm_cfg.api_keys))
             except Exception as exc:
@@ -592,6 +604,7 @@ def main() -> None:
     _ptt_recording = False               # guard against key-repeat
     _ptt_result_text = None  # completed transcription (str or None)
     _ptt_result_ready = threading.Event()   # signals pipeline that text is ready
+    _ptt_last_press: float = 0.0         # monotonic time of last PTT press (suppress wake words)
 
     ptt_key = config.audio.ptt_key or "f6"
     _ptt_available = False
@@ -628,7 +641,7 @@ def main() -> None:
                 activation_event.set()  # wake the pipeline loop
 
         def _ptt_on_press(key):
-            nonlocal _ptt_recording
+            nonlocal _ptt_recording, _ptt_last_press
             try:
                 if key != _ptt_key_obj:
                     return
@@ -637,12 +650,19 @@ def main() -> None:
             if _ptt_recording:
                 return  # already recording (key repeat)
             _ptt_recording = True
+            _ptt_last_press = time.monotonic()
             _ptt_stop.clear()
             _ptt_result_ready.clear()
             # Pause wake word detector IMMEDIATELY so it doesn't also fire on
             # "hey dash" spoken while PTT is held (race condition: wake word
             # would detect before the recording thread could pause it)
             detector.pause()
+            # Interrupt any active agent-initiated listen() so PTT can take
+            # the mic.  listen_ptt() also calls interrupt_listening() and
+            # acquires the listening lock, but doing it here too means the
+            # agent listen starts releasing the mic immediately — before the
+            # PTT thread even spawns.
+            transcriber.interrupt_listening()
             print(f"[PTT] Recording... (release {ptt_key} to send)", flush=True)
             t = threading.Thread(target=_ptt_record_thread, daemon=True, name="ptt-recorder")
             t.start()
@@ -752,6 +772,13 @@ def main() -> None:
                                 if not _shutdown_requested.is_set():
                                     detector.resume()
                     continue
+
+                # Suppress wake words: disabled in config, or within 10s of PTT press
+                if keyword_index is not None:
+                    if not config.wake_word.enabled:
+                        continue
+                    if (time.monotonic() - _ptt_last_press) < 10.0:
+                        continue
 
                 # Wake word or double-click — run full conversation
                 detector.pause()

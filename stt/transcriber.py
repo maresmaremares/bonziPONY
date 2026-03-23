@@ -113,6 +113,9 @@ class Transcriber:
         self._whisper_model = None  # lazy-loaded
         self._stop_event = threading.Event()
 
+        # Prevents concurrent mic access (PTT vs agent listen)
+        self._listening_lock = threading.Lock()
+
         # Called right after recording finishes, before Whisper runs
         # Lets the GUI transition away from LISTEN state immediately
         self.on_recording_done = None
@@ -122,7 +125,11 @@ class Transcriber:
         self._voice_filter_checked = False
 
     def interrupt_listening(self) -> None:
-        """Interrupt active listening — process whatever audio was captured so far."""
+        """Interrupt active listening — process whatever audio was captured so far.
+
+        Safe to call from any thread (e.g. PTT key press handler).
+        Sets the stop event so the current listen() call exits promptly.
+        """
         self._stop_event.set()
 
     def _get_recognizer(self):
@@ -188,6 +195,23 @@ class Transcriber:
         initial_discard_ms: discard this many ms of mic input before listening.
             Use after TTS playback to flush echo/bleed from the input buffer.
         """
+        import speech_recognition as sr
+        from stt.mic_lock import safe_microphone
+
+        # Acquire listening lock — if PTT is active, wait for it to finish.
+        # Use a timeout so we don't block forever; if we can't get the lock
+        # it means PTT is recording — just bail out.
+        if not self._listening_lock.acquire(timeout=0.5):
+            logger.info("listen() skipped — mic in use (PTT active).")
+            return None
+
+        try:
+            return self._listen_inner(speech_start_timeout_s, initial_discard_ms)
+        finally:
+            self._listening_lock.release()
+
+    def _listen_inner(self, speech_start_timeout_s: float, initial_discard_ms: int) -> Optional[str]:
+        """Inner listen implementation (called with _listening_lock held)."""
         import speech_recognition as sr
         from stt.mic_lock import safe_microphone
 
@@ -279,13 +303,25 @@ class Transcriber:
 
         Unlike listen(), this doesn't use silence detection — it records
         continuously until the PTT key is released (stop_event is set).
+
+        PTT always preempts agent-initiated listen() calls.
         """
-        import struct
         try:
             import pyaudio
         except ImportError:
             logger.error("pyaudio not available for PTT")
             return None
+
+        # Interrupt any active listen() call so it releases the mic
+        self._stop_event.set()
+
+        # Acquire listening lock — wait for any active listen() to finish
+        # releasing the mic. Give it a few seconds (Whisper transcription
+        # from an interrupted listen can take a moment).
+        if not self._listening_lock.acquire(timeout=5.0):
+            logger.warning("PTT: couldn't acquire mic lock after 5s — proceeding anyway.")
+        else:
+            logger.debug("PTT: acquired mic lock.")
 
         frames: list[bytes] = []
         frame_size = int(SAMPLE_RATE * 30 / 1000)  # 30ms frames
@@ -353,3 +389,9 @@ class Transcriber:
         except Exception as exc:
             logger.error("PTT listen failed: %s", exc)
             return None
+        finally:
+            # Release the listening lock so agent listen() can proceed again
+            try:
+                self._listening_lock.release()
+            except RuntimeError:
+                pass  # lock wasn't acquired (timeout case)

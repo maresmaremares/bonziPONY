@@ -13,7 +13,7 @@ pvrecorder>=1.2.0
 
 # ── Speech-to-text (STT) ─────────────────────────────────────
 SpeechRecognition>=3.10.0       # Google Web Speech API + mic input
-pyaudio>=0.2.13
+PyAudioWPatch>=0.2.13          # prebuilt fork — avoids needing C++ build tools
 openai-whisper>=20230314
 webrtcvad-wheels>=2.0.11        # prebuilt — avoids needing C++ build tools
 

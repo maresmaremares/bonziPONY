@@ -710,6 +710,8 @@ class ContextMenuBuilder:
                          lambda c: self._set("agent", "self_initiate", c))
         self._add_toggle(feat_menu, "Desktop Control", cfg.desktop_control.enabled,
                          lambda c: self._set("desktop_control", "enabled", c))
+        self._add_toggle(feat_menu, "Wake Word", cfg.wake_word.enabled,
+                         lambda c: self._set("wake_word", "enabled", c))
         self._add_toggle(feat_menu, "TTS (Voice)", cfg.tts.enabled,
                          lambda c: self._set("tts", "enabled", c))
         self._add_toggle(feat_menu, "Speech Bubbles", cfg.desktop_pet.speech_bubble,
@@ -770,6 +772,10 @@ class ContextMenuBuilder:
         set_url_act = llm_menu.addAction(f"Base URL: {url_label}...")
         set_url_act.triggered.connect(lambda: self._set_base_url(parent))
 
+        prefill_label = cfg.llm.prefill[:30] + "..." if len(cfg.llm.prefill) > 30 else cfg.llm.prefill or "(default)"
+        set_prefill_act = llm_menu.addAction(f"Prefill: {prefill_label}...")
+        set_prefill_act.triggered.connect(lambda: self._set_prefill(parent))
+
         # ── LLM Model submenu (auto-fetched from API) ─────────────────
         model_choices = self._get_model_choices()
         self._radio_submenu(menu, "LLM Model", model_choices, cfg.llm.model,
@@ -805,6 +811,28 @@ class ContextMenuBuilder:
         from llm.prompt import get_character_name
         char_act = menu.addAction(f"Character: {get_character_name()}...")
         char_act.triggered.connect(lambda: self._show_character_picker(parent))
+
+        # ── Relationship submenu ─────────────────────────────────────
+        rel_menu = menu.addMenu("Relationship")
+        rel_group = QActionGroup(rel_menu)
+        current_rel = cfg.llm.relationship
+
+        for label, slug in [
+            ("Lover / Partner", "lover"),
+            ("Best Friend", "best_friend"),
+            ("Roommate", "roommate"),
+            ("Caretaker", "caretaker"),
+        ]:
+            act = QAction(label, rel_menu)
+            act.setCheckable(True)
+            act.setChecked(current_rel == slug)
+            act.triggered.connect(lambda checked, s=slug: self._apply_relationship(s))
+            rel_group.addAction(act)
+            rel_menu.addAction(act)
+
+        rel_menu.addSeparator()
+        custom_rel_act = rel_menu.addAction("Custom...")
+        custom_rel_act.triggered.connect(lambda: self._set_custom_relationship(parent))
 
         # ── TTS / ElevenLabs submenu ─────────────────────────────────
         tts_menu = menu.addMenu("TTS")
@@ -1206,6 +1234,63 @@ class ContextMenuBuilder:
         """Hot-swap the active character."""
         if self.on_character_change:
             self.on_character_change(preset_slug)
+
+    def _apply_relationship(self, slug: str) -> None:
+        """Switch relationship mode."""
+        self.config.llm.relationship = slug
+        _save_yaml_value("llm.relationship", slug, self.config_path)
+        from llm.prompt import set_relationship
+        set_relationship(slug, self.config.llm.relationship_custom)
+        if self.llm:
+            self.llm.reset_history()
+        logger.info("Relationship changed to: %s", slug)
+
+    def _set_custom_relationship(self, parent: QWidget) -> None:
+        """Open a text dialog for custom relationship prompt."""
+        from PyQt5.QtWidgets import QInputDialog
+        current = self.config.llm.relationship_custom or ""
+        text, ok = QInputDialog.getMultiLineText(
+            parent, "Custom Relationship",
+            "Describe how the character should relate to you.\n"
+            "This replaces the default relationship prompt.\n\n"
+            "Examples:\n"
+            "- You are the user's study buddy. Help them focus.\n"
+            "- You are the user's rival. Everything is a competition.",
+            current,
+        )
+        if not ok:
+            return
+        text = text.strip()
+        self.config.llm.relationship = "custom"
+        self.config.llm.relationship_custom = text
+        _save_yaml_value("llm.relationship", "custom", self.config_path)
+        _save_yaml_value("llm.relationship_custom", text, self.config_path)
+        from llm.prompt import set_relationship
+        set_relationship("custom", text)
+        if self.llm:
+            self.llm.reset_history()
+        logger.info("Custom relationship set (%d chars)", len(text))
+
+    def _set_prefill(self, parent: QWidget) -> None:
+        """Set the custom LLM prefill text."""
+        from PyQt5.QtWidgets import QInputDialog
+        current = self.config.llm.prefill or ""
+        text, ok = QInputDialog.getText(
+            parent, "LLM Prefill",
+            "Custom prefill injected as a first assistant turn.\n"
+            "Use {name} for the character's name. Leave blank for default.\n\n"
+            "Default: (I am {name}. I stay in character at all times.)",
+            QLineEdit.Normal, current,
+        )
+        if not ok:
+            return
+        text = text.strip()
+        self.config.llm.prefill = text
+        _save_yaml_value("llm.prefill", text, self.config_path)
+        # Hot-swap: re-create provider so it picks up the new prefill
+        if self.on_provider_change:
+            self.on_provider_change(self.config.llm.provider)
+        logger.info("LLM prefill updated to: %s", text[:50] if text else "(default)")
 
     def _open_ack_folder(self) -> None:
         """Open the current character's acknowledgement sounds folder."""

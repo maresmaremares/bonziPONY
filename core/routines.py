@@ -186,6 +186,8 @@ class RoutineManager:
         if is_away and not self._was_away:
             self._was_away = True
             self._away_since = datetime.now()
+            self._save_wake_state()
+            return "away"
 
         # Throttle state saves to every ~30 seconds while user is active
         now = _time.monotonic()

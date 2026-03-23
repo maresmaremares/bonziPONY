@@ -146,10 +146,11 @@ class SpeechBubble(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
 
         fm = QFontMetrics(self._font)
-        # Calculate text bounding rect
+        # Use FULL text for bubble dimensions — keeps bubble stable during typing
+        measure_text = self._full_text or self._visible_text
         text_rect = fm.boundingRect(
             0, 0, _MAX_BUBBLE_WIDTH - 2 * _BUBBLE_PADDING, 1000,
-            Qt.TextWordWrap, self._visible_text,
+            Qt.TextWordWrap, measure_text,
         )
         text_w = max(text_rect.width(), _MIN_BUBBLE_WIDTH) + 2 * _BUBBLE_PADDING
         text_h = text_rect.height() + 2 * _BUBBLE_PADDING
@@ -216,8 +217,7 @@ class SpeechBubble(QWidget):
         if self._char_index < len(self._full_text):
             self._char_index += 1
             self._visible_text = self._full_text[: self._char_index]
-            self._resize_to_text()
-            self.update()
+            self.update()  # repaint only — widget stays at full-text size
         else:
             self._typing_timer.stop()
             # Auto-hide after display duration
