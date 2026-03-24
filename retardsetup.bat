@@ -19,7 +19,7 @@ if errorlevel 1 (
     echo  2. CHECK "Add Python to PATH" at the bottom of the installer!
     echo  3. Reboot and run this script again.
     echo.
-    echo  Recommended: Python 3.11 (most compatible)
+    echo  Recommended: Python 3.11 -- most compatible
     echo.
     pause
     exit /b 1
@@ -139,7 +139,7 @@ if errorlevel 1 (
 
 %PY% -c "import torch" >nul 2>&1
 if errorlevel 1 (
-    echo  [X] PyTorch — AI/ML (this is a ~2GB download, may have timed out)
+    echo  [X] PyTorch -- AI/ML, ~2GB download, may have timed out
     echo      ^> Try: %PY% -m pip install torch
     set MISSING=1
 )
@@ -200,7 +200,7 @@ echo.
 
 %PY% -c "import yaml" >nul 2>&1
 if errorlevel 1 (
-    echo  [ERROR] Core dependency (PyYAML) missing. Install may have failed.
+    echo  [ERROR] Core dependency PyYAML missing. Install may have failed.
     echo  Try deleting the "venv" folder and running this script again.
     pause
     exit /b 1
