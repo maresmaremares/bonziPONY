@@ -50,13 +50,13 @@ _PIGGYBACK_PROMPT_TEMPLATE = (
 
 _SPONTANEOUS_PROMPT_TEMPLATE = (
     "(You're hanging out on the desktop with {companions}. "
-    "Say something casual to start a conversation — bring up something from "
-    "a previous chat, ask what they've been up to, share a thought about "
-    "something real that happened, or ask about the user. "
+    "{screen_info}"
+    "Say something casual to start a conversation — you could comment on what "
+    "the user is doing, bring up something from a previous chat, share a random "
+    "thought, or ask about the user. "
     "Keep it short — 1-2 sentences max.\n"
-    "IMPORTANT: Do NOT make up things you can't see. You don't have screen access "
-    "right now, so don't describe weather, clouds, scenery, or anything visual. "
-    "Stick to things you actually know.\n"
+    "IMPORTANT: Only reference things you can actually see or know. "
+    "Do NOT invent scenery, weather, clouds, or anything not listed above.\n"
     "Be a real character, not a caricature. Don't lean into your most obvious trait "
     "every single time — real ponies have range.\n"
     "Do NOT include any tags like [CONVO:...] — just speak naturally.)"
@@ -76,7 +76,8 @@ class GroupConversation:
         self._depth = 0
         self._max_depth = max_depth
 
-    def start(self, initiator: "PonyInstance", trigger: str = "spontaneous") -> None:
+    def start(self, initiator: "PonyInstance", trigger: str = "spontaneous",
+              screen_context: str = "") -> None:
         """Kick off a conversation.  The initiator speaks first, then others
         get a chance to respond in turn."""
         from core.tts_queue import PRIORITY_SPONTANEOUS_CHAT
@@ -86,8 +87,14 @@ class GroupConversation:
         if not companions:
             return
 
+        # Format screen info for the prompt
+        screen_info = ""
+        if screen_context:
+            screen_info = f"{screen_context}\n"
+
         prompt = _SPONTANEOUS_PROMPT_TEMPLATE.format(
             companions=", ".join(companions),
+            screen_info=screen_info,
         )
 
         try:

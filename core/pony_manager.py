@@ -236,10 +236,24 @@ class PonyManager:
         initiator = random.choice(self.ponies)
         logger.info("Spontaneous inter-pony chat triggered by %s", initiator.display_name)
 
+        # Get screen context so ponies can reference what's actually on screen
+        screen_context = ""
+        if self._screen_monitor:
+            try:
+                state = self._screen_monitor.get_state()
+                if state and state.foreground:
+                    fg = state.foreground.title
+                    windows = [w.title for w in state.open_windows[:8] if w.title.strip()]
+                    screen_context = f"The user's screen right now: \"{fg}\" is in the foreground."
+                    if windows:
+                        screen_context += f" Open windows: {', '.join(windows)}."
+            except Exception:
+                pass
+
         try:
             from core.group_conversation import GroupConversation
             convo = GroupConversation(self, max_depth=self.max_chat_depth)
-            convo.start(initiator, trigger="spontaneous")
+            convo.start(initiator, trigger="spontaneous", screen_context=screen_context)
         except Exception as exc:
             logger.error("Spontaneous chat failed: %s", exc)
 
