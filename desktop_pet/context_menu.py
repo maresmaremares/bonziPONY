@@ -34,8 +34,9 @@ def _save_yaml_value(key_path: str, value, config_path: str = "config.yaml") -> 
     new config keys (like ``tts.provider``) persist across restarts.
     """
     try:
-        path = Path(config_path)
+        path = Path(config_path).resolve()
         if not path.exists():
+            logger.warning("Config file not found for save: %s", path)
             return
         lines = path.read_text(encoding="utf-8").splitlines(True)
 
@@ -110,8 +111,9 @@ def _save_yaml_value(key_path: str, value, config_path: str = "config.yaml") -> 
 def _save_yaml_list(key_path: str, values: list, config_path: str = "config.yaml") -> None:
     """Save a list value (like api_keys) to config.yaml, replacing any existing list."""
     try:
-        path = Path(config_path)
+        path = Path(config_path).resolve()
         if not path.exists():
+            logger.warning("Config file not found for list save: %s", path)
             return
         lines = path.read_text(encoding="utf-8").splitlines(True)
 
@@ -643,9 +645,11 @@ class ContextMenuBuilder:
         tts=None,
         vision_llm=None,
         on_vision_llm_change: Optional[Callable[[], None]] = None,
+        pony_manager=None,
+        pony_instance=None,
     ) -> None:
         self.config = config
-        self.config_path = config_path
+        self.config_path = str(Path(config_path).resolve())
         self.agent_loop = agent_loop
         self.llm = llm_provider
         self.on_scale_change = on_scale_change
@@ -656,6 +660,8 @@ class ContextMenuBuilder:
         self.tts = tts
         self.vision_llm = vision_llm
         self.on_vision_llm_change = on_vision_llm_change
+        self.pony_manager = pony_manager      # PonyManager or None
+        self.pony_instance = pony_instance    # which PonyInstance this menu belongs to
 
     # ── Main builder ──────────────────────────────────────────────────────
 
@@ -663,6 +669,11 @@ class ContextMenuBuilder:
         """Build and return the full context menu."""
         menu = QMenu(parent)
         cfg = self.config
+
+        # ── Secondary pony: lightweight menu ──────────────────────────
+        inst = self.pony_instance
+        if inst and not inst.is_primary:
+            return self._build_secondary_menu(menu, parent)
 
         # ── Directives submenu ────────────────────────────────────────
         dir_menu = menu.addMenu("Directives")
@@ -859,6 +870,11 @@ class ContextMenuBuilder:
         enroll_act.triggered.connect(lambda: self._enroll_voice(parent))
         delete_act = voice_menu.addAction("Delete Voice Profile")
         delete_act.triggered.connect(self._delete_voice_profile)
+
+        # ── Multi-pony ─────────────────────────────────────────────────
+        if self.pony_manager is not None:
+            menu.addSeparator()
+            self._build_multi_pony_menu(menu, parent)
 
         menu.addSeparator()
 
@@ -1291,6 +1307,108 @@ class ContextMenuBuilder:
         if self.on_provider_change:
             self.on_provider_change(self.config.llm.provider)
         logger.info("LLM prefill updated to: %s", text[:50] if text else "(default)")
+
+    # ── Secondary pony menu ──────────────────────────────────────────────
+
+    def _build_secondary_menu(self, menu: QMenu, parent: QWidget) -> QMenu:
+        """Build a lightweight menu for secondary pony windows."""
+        inst = self.pony_instance
+        name = inst.display_name if inst else "Pony"
+
+        # Character name label (informational)
+        name_act = menu.addAction(f"Character: {name}")
+        name_act.setEnabled(False)
+
+        menu.addSeparator()
+
+        # Multi-pony controls (Add / Remove)
+        if self.pony_manager is not None:
+            self._build_multi_pony_menu(menu, parent)
+            menu.addSeparator()
+
+        # Scale submenu (shared)
+        cfg = self.config
+        self._radio_submenu(menu, "Scale", [
+            ("Tiny (1x)", 1.0),
+            ("Normal (2x)", 2.0),
+            ("Big (3x)", 3.0),
+            ("Huge (4x)", 4.0),
+        ], cfg.desktop_pet.scale,
+            lambda v: self._apply_scale(v))
+
+        menu.addSeparator()
+
+        quit_act = menu.addAction("Quit")
+        quit_act.triggered.connect(self.on_quit if self.on_quit else QApplication.quit)
+
+        return menu
+
+    # ── Multi-pony menu builders ─────────────────────────────────────────
+
+    def _build_multi_pony_menu(self, menu: QMenu, parent: QWidget) -> None:
+        """Add the 'Add Pony' submenu and optional 'Remove This Pony' action."""
+        mgr = self.pony_manager
+        if mgr is None:
+            return
+
+        # ── Add Pony submenu ──
+        add_menu = menu.addMenu("Add Pony")
+
+        # Quick-add: the 6 mane characters (minus any already active)
+        mane_six = [
+            ("Twilight Sparkle", "twilight_sparkle"),
+            ("Rainbow Dash", "rainbow_dash"),
+            ("Pinkie Pie", "pinkie_pie"),
+            ("Rarity", "rarity"),
+            ("Fluttershy", "fluttershy"),
+            ("Applejack", "applejack"),
+        ]
+        for display, slug in mane_six:
+            act = add_menu.addAction(display)
+            act.triggered.connect(lambda checked, s=slug: self._add_pony(s))
+            if len(mgr.ponies) >= mgr.max_ponies:
+                act.setEnabled(False)
+
+        add_menu.addSeparator()
+        browse_act = add_menu.addAction("Browse All...")
+        browse_act.triggered.connect(lambda: self._browse_add_pony(parent))
+        if len(mgr.ponies) >= mgr.max_ponies:
+            browse_act.setEnabled(False)
+
+        # ── Remove This Pony (only for secondaries) ──
+        inst = self.pony_instance
+        if inst and not inst.is_primary:
+            remove_act = menu.addAction(f"Remove {inst.display_name}")
+            remove_act.triggered.connect(lambda: self._remove_pony(inst))
+
+        # ── Show pony count ──
+        count_act = menu.addAction(f"Ponies: {len(mgr.ponies)}/{mgr.max_ponies}")
+        count_act.setEnabled(False)
+
+    def _add_pony(self, slug: str) -> None:
+        """Add a secondary pony via PonyManager."""
+        mgr = self.pony_manager
+        if mgr is None:
+            return
+        instance = mgr.add_pony(slug)
+        if instance is None:
+            logger.warning("Could not add pony: %s (at capacity?)", slug)
+
+    def _browse_add_pony(self, parent: QWidget) -> None:
+        """Open the full character picker to add any character."""
+        dlg = _CharacterPickerDialog("", parent)
+        dlg.setWindowTitle("Add Pony")
+        if dlg.exec_() == QDialog.Accepted:
+            slug = dlg.get_selected_slug()
+            if slug:
+                self._add_pony(slug)
+
+    def _remove_pony(self, instance) -> None:
+        """Remove a secondary pony via PonyManager."""
+        mgr = self.pony_manager
+        if mgr is None:
+            return
+        mgr.remove_pony(instance)
 
     def _open_ack_folder(self) -> None:
         """Open the current character's acknowledgement sounds folder."""

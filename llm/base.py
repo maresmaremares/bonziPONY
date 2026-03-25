@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Callable, Optional
 
 
 class LLMProvider(ABC):
-    """Base class for all LLM backends."""
+    """Base class for all LLM backends.
+
+    Subclasses may set ``system_prompt_fn`` to override the default
+    ``get_system_prompt()`` call used in ``chat()``.  Multi-pony mode
+    uses this so each pony gets its own prompt from *PromptConfig*.
+    """
+
+    system_prompt_fn: Optional[Callable[[], str]] = None
+    character_name: Optional[str] = None  # per-pony override for prefill
 
     @abstractmethod
     def chat(self, user_message: str) -> str:

@@ -253,12 +253,17 @@ class VisionProvider:
             logger.info("[TIMING] vision locate_on_screen() took %.2fs", elapsed)
 
             raw = response.choices[0].message.content or ""
-            # Extract JSON from response
+            # Extract JSON from response — try full parse first, then regex
             import json, re
-            json_match = re.search(r'\{[^}]+\}', raw)
-            if not json_match:
-                return None
-            data = json.loads(json_match.group())
+            data = None
+            try:
+                data = json.loads(raw.strip())
+            except (json.JSONDecodeError, ValueError):
+                # Fall back to regex that handles one level of nesting
+                json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw)
+                if not json_match:
+                    return None
+                data = json.loads(json_match.group())
             x = data.get("x")
             y = data.get("y")
             if x is None or y is None:

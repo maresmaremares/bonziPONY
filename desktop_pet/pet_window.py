@@ -586,6 +586,9 @@ class PetWindow(QWidget):
         self._dx = speed if self._facing_right else -speed
         self._dy = 0
         # Schedule random direction changes every 1-2s
+        if self._grab_run_timer is not None:
+            self._grab_run_timer.stop()
+            self._grab_run_timer.deleteLater()
         self._grab_run_timer = QTimer(self)
         self._grab_run_timer.timeout.connect(self._grab_run_change_dir)
         self._grab_run_timer.start(random.randint(800, 1800))

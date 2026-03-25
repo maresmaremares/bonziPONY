@@ -69,14 +69,16 @@ class AnthropicProvider(LLMProvider):
         self._history.append({"role": "user", "content": user_message})
         self._trim_history()
 
-        system_prompt = get_system_prompt()
+        _prompt_fn = self.system_prompt_fn or get_system_prompt
+        system_prompt = _prompt_fn()
         # Prefill for Claude: append to system prompt on first turn
         if len(self._history) == 1 and self._prefill:
             from llm.prompt import get_character_name
-            name = get_character_name()
+            name = self.character_name or get_character_name()
             prefill_text = self._prefill.replace("{name}", name)
             system_prompt += f"\n\nIMPORTANT REMINDER: {prefill_text}"
 
+        t0 = time.time()
         response = self._call_with_retry(
             model=self.model,
             system=system_prompt,
@@ -84,17 +86,21 @@ class AnthropicProvider(LLMProvider):
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
+        elapsed = time.time() - t0
+        logger.info("[TIMING] chat() API call took %.2fs", elapsed)
+        print(f"[LLM] chat() took {elapsed:.2f}s", flush=True)
 
         # If the response was truncated (hit token limit), retry with a higher limit.
         # WRITE_NOTEPAD gets unlimited (16k) so she can write as much as she wants.
         if getattr(response, "stop_reason", None) == "max_tokens":
-            partial = response.content[0].text if response.content else ""
+            partial = getattr(response.content[0], "text", "") if response.content else ""
             if "WRITE_NOTEPAD" in partial:
                 retry_tokens = 16384
                 logger.info("WRITE_NOTEPAD truncated — retrying with %d tokens.", retry_tokens)
             else:
                 retry_tokens = max(self.max_tokens * 4, 4096)
                 logger.info("Response truncated — retrying with %d tokens.", retry_tokens)
+            t0 = time.time()
             response = self._call_with_retry(
                 model=self.model,
                 system=system_prompt,
@@ -102,8 +108,11 @@ class AnthropicProvider(LLMProvider):
                 temperature=self.temperature,
                 max_tokens=retry_tokens,
             )
+            elapsed = time.time() - t0
+            logger.info("[TIMING] chat() retry took %.2fs", elapsed)
+            print(f"[LLM] chat() retry took {elapsed:.2f}s", flush=True)
 
-        assistant_text = response.content[0].text if response.content else ""
+        assistant_text = getattr(response.content[0], "text", "") if response.content else ""
         assistant_text = self._strip_think(assistant_text)
         self._history.append({"role": "assistant", "content": assistant_text})
         return assistant_text
@@ -129,8 +138,8 @@ class AnthropicProvider(LLMProvider):
                       system_prompt: str | None = None) -> str:
         """One-shot call — does not touch self._history."""
         if system_prompt is None:
-            from llm.prompt import get_system_prompt
-            system_prompt = get_system_prompt()
+            _prompt_fn = self.system_prompt_fn or get_system_prompt
+            system_prompt = _prompt_fn()
         response = self._call_with_retry(
             model=self.model,
             system=system_prompt,
@@ -164,7 +173,10 @@ class AnthropicProvider(LLMProvider):
             ],
             max_tokens=150,
         )
-        return response.content[0].text.strip() if response.content else None
+        if response.content:
+            text = getattr(response.content[0], "text", None)
+            return text.strip() if text else None
+        return None
 
     def describe_screen(self, jpeg_bytes: bytes) -> Optional[str]:
         """One-shot vision call — describe what's on a computer screen."""
@@ -205,7 +217,10 @@ class AnthropicProvider(LLMProvider):
             ],
             max_tokens=600,
         )
-        return response.content[0].text.strip() if response.content else None
+        if response.content:
+            text = getattr(response.content[0], "text", None)
+            return text.strip() if text else None
+        return None
 
     def inject_history(self, user_message: str, assistant_message: str) -> None:
         """Inject a fake exchange into history so Dash remembers autonomous actions."""

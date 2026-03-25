@@ -319,9 +319,9 @@ class Transcriber:
         # releasing the mic. Give it a few seconds (Whisper transcription
         # from an interrupted listen can take a moment).
         if not self._listening_lock.acquire(timeout=5.0):
-            logger.warning("PTT: couldn't acquire mic lock after 5s — proceeding anyway.")
-        else:
-            logger.debug("PTT: acquired mic lock.")
+            logger.warning("PTT: couldn't acquire mic lock after 5s — skipping.")
+            return None
+        logger.debug("PTT: acquired mic lock.")
 
         frames: list[bytes] = []
         frame_size = int(SAMPLE_RATE * 30 / 1000)  # 30ms frames

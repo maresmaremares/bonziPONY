@@ -35,6 +35,8 @@ from llm.prompt import get_character_name
 
 logger = logging.getLogger(__name__)
 
+_PROFILE_COOLDOWN_S = 4 * 3600  # 4 hours between profile extractions
+
 
 def _unrelated_prompts() -> list[str]:
     """Return spontaneous prompts using the active character's name."""
@@ -83,6 +85,9 @@ class Pipeline:
         self.transcriber = transcriber
         self.llm = llm_provider
         self.tts = tts
+        self.tts_queue = None          # set by main.py for multi-pony voice routing
+        self.primary_voice_slug = None  # set by main.py
+        self.pony_manager = None       # set by main.py for piggyback
         self.robot = robot
         self.camera = camera
         self.screen = screen
@@ -98,7 +103,6 @@ class Pipeline:
         self._visual_memory: List[str] = []
         self._last_end_conversation: bool = False  # LLM signaled conversation over
         self._last_profile_extraction: float = 0.0  # monotonic timestamp
-        _PROFILE_COOLDOWN_S = 4 * 3600  # 4 hours between profile extractions
 
         # Optional GUI callbacks
         self._on_state_change = None
@@ -121,6 +125,27 @@ class Pipeline:
         self._on_heard_text = on_heard_text
         self._on_conversation_start = on_conversation_start
         self._on_conversation_end = on_conversation_end
+
+    def _speak_with_queue(self, text: str, show_bubble_cb, priority: int = 0) -> None:
+        """Speak through TTSQueue if available, else direct TTS.
+
+        This ensures voice switching works correctly in multi-pony mode.
+        User-response speech (priority 0) blocks until playback finishes so
+        the pipeline doesn't start listening while the pony is still talking.
+        """
+        if self.tts_queue:
+            from core.tts_queue import PRIORITY_USER_RESPONSE
+            self.tts_queue.enqueue(
+                text,
+                priority=priority,
+                voice_slug=self.primary_voice_slug,
+                on_start=show_bubble_cb,
+                blocking=(priority == PRIORITY_USER_RESPONSE),
+            )
+        elif self.config.tts.enabled:
+            self.tts.speak(text, on_playback_start=show_bubble_cb)
+        else:
+            show_bubble_cb()
 
     # ── Public entry points ────────────────────────────────────────────────────
 
@@ -371,8 +396,8 @@ class Pipeline:
                             self._on_speech_text(parsed.text)
                         except Exception:
                             pass
-                if self.config.tts.enabled:
-                    self.tts.speak(parsed.text, on_playback_start=_show_bubble)
+                from core.tts_queue import PRIORITY_AUTONOMOUS
+                self._speak_with_queue(parsed.text, _show_bubble, priority=PRIORITY_AUTONOMOUS)
                 _show_bubble()
 
         except Exception as exc:
@@ -721,14 +746,23 @@ class Pipeline:
                             self._on_speech_text(parsed.text)
                         except Exception:
                             pass
-                if self.config.tts.enabled:
-                    self.tts.speak(parsed.text, on_playback_start=_show_bubble)
+                self._speak_with_queue(parsed.text, _show_bubble)
                 # Always ensure bubble was shown (fallback if TTS failed/skipped callback)
                 _show_bubble()
                 if self._timeline:
                     from core.event_timeline import EventType
                     self._timeline.append(EventType.PONY_SAID,
                                           f'Pony replied: "{parsed.text[:150]}"')
+                # Offer piggyback to other ponies after user response
+                if self.pony_manager and len(self.pony_manager.ponies) > 1:
+                    try:
+                        self.pony_manager.offer_piggyback(
+                            self.pony_manager.primary,
+                            user_text or "",
+                            parsed.text,
+                        )
+                    except Exception as exc:
+                        logger.debug("Piggyback offer failed: %s", exc)
                 return True
             return False
 
@@ -1077,8 +1111,8 @@ class Pipeline:
                             self._on_speech_text(parsed.text)
                         except Exception:
                             pass
-                if self.config.tts.enabled:
-                    self.tts.speak(parsed.text, on_playback_start=_show_bubble)
+                from core.tts_queue import PRIORITY_AUTONOMOUS
+                self._speak_with_queue(parsed.text, _show_bubble, priority=PRIORITY_AUTONOMOUS)
                 _show_bubble()
 
         except Exception as exc:
@@ -1107,9 +1141,9 @@ class Pipeline:
         if not self.llm.has_history():
             return
         now = time.monotonic()
-        if not force and (now - self._last_profile_extraction) < 4 * 3600:
+        if not force and (now - self._last_profile_extraction) < _PROFILE_COOLDOWN_S:
             logger.debug("Profile extraction skipped — cooldown active (%.0f min remaining)",
-                         (4 * 3600 - (now - self._last_profile_extraction)) / 60)
+                         (_PROFILE_COOLDOWN_S - (now - self._last_profile_extraction)) / 60)
             return
         try:
             import threading

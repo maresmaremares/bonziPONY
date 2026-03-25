@@ -112,6 +112,7 @@ class ScreenMonitor:
 
     def __init__(self, pet_hwnd: int = 0, poll_interval: float = 3.0) -> None:
         self._pet_hwnd = pet_hwnd
+        self._excluded_hwnds: set[int] = {pet_hwnd} if pet_hwnd else set()
         self._poll_interval = poll_interval
 
         # Foreground tracking
@@ -141,6 +142,14 @@ class ScreenMonitor:
             recent_changes=[],
             timestamp=time.monotonic(),
         )
+
+    def exclude_hwnd(self, hwnd: int) -> None:
+        """Add a window handle to the exclusion set (e.g. secondary pony windows)."""
+        self._excluded_hwnds.add(hwnd)
+
+    def include_hwnd(self, hwnd: int) -> None:
+        """Remove a window handle from the exclusion set."""
+        self._excluded_hwnds.discard(hwnd)
 
     def start(self) -> None:
         """Start the background polling thread."""
@@ -207,7 +216,7 @@ class ScreenMonitor:
         def _enum_callback(hwnd: int, _extra) -> None:
             if not win32gui.IsWindowVisible(hwnd):
                 return
-            if hwnd == self._pet_hwnd:
+            if hwnd == self._pet_hwnd or hwnd in self._excluded_hwnds:
                 return
             title = win32gui.GetWindowText(hwnd)
             if not title or not title.strip():

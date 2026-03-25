@@ -115,6 +115,8 @@ class RoutineManager:
                 logger.info("Restored wake_time from disk: %s", self._wake_time.strftime("%H:%M"))
             if data.get("last_active"):
                 last = datetime.fromisoformat(data["last_active"])
+                # Wall-clock subtraction is deliberate: wake/sleep are wall-clock
+                # concepts.  DST may cause a one-time ~1hr inaccuracy — acceptable.
                 elapsed_ms = (datetime.now() - last).total_seconds() * 1000
                 if elapsed_ms < AWAY_THRESHOLD_MS:
                     # User was active recently — don't trigger false wake on restart

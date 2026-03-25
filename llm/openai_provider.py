@@ -69,7 +69,8 @@ class OpenAIProvider(LLMProvider):
         self._history.append({"role": "user", "content": user_message})
         self._trim_history()
 
-        messages = [{"role": "system", "content": get_system_prompt()}]
+        _prompt_fn = self.system_prompt_fn or get_system_prompt
+        messages = [{"role": "system", "content": _prompt_fn()}]
         # Character prefill: inject an assistant greeting so the model sees
         # itself already in-character.  Skip for Claude models (message alternation rules).
         if len(self._history) == 1:
@@ -77,7 +78,7 @@ class OpenAIProvider(LLMProvider):
             is_claude = any(k in model_lower for k in ("claude", "opus", "sonnet", "haiku"))
             if not is_claude:
                 from llm.prompt import get_character_name
-                name = get_character_name()
+                name = self.character_name or get_character_name()
                 if self._prefill:
                     prefill_text = self._prefill.replace("{name}", name)
                 else:
@@ -145,8 +146,8 @@ class OpenAIProvider(LLMProvider):
                       system_prompt: str | None = None) -> str:
         """One-shot call — does not touch self._history."""
         if system_prompt is None:
-            from llm.prompt import get_system_prompt
-            system_prompt = get_system_prompt()
+            _prompt_fn = self.system_prompt_fn or get_system_prompt
+            system_prompt = _prompt_fn()
         t0 = time.time()
         response = self._call_with_retry(
             model=self.model,

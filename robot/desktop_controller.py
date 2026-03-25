@@ -401,6 +401,12 @@ class DesktopController:
                 self._cmd_scroll(cmd.args)
             elif command == "WRITE_NOTEPAD":
                 self._cmd_write_notepad(cmd.args)
+            elif command == "CLOSE":
+                self._cmd_close(cmd.args)
+            elif command == "CLOSE_TAB":
+                self._cmd_close_tab()
+            elif command == "SWITCH":
+                self._cmd_switch(cmd.args)
             else:
                 logger.warning("Unknown desktop command: %s", command)
         except Exception as exc:
@@ -579,6 +585,61 @@ class DesktopController:
 
         except Exception as exc:
             logger.warning("WRITE_NOTEPAD clipboard paste failed: %s", exc)
+
+    def _cmd_close(self, args: list[str]) -> None:
+        """Close a window by title substring. [DESKTOP:CLOSE:title]"""
+        if not args:
+            logger.warning("CLOSE requires a window title arg.")
+            return
+        title = ":".join(args).strip()
+        if not title:
+            logger.warning("CLOSE: empty title.")
+            return
+        found = self.close_window_by_title(title)
+        if not found:
+            logger.info("CLOSE: no window matching %r found.", title)
+
+    def _cmd_close_tab(self) -> None:
+        """Close the current browser tab (Ctrl+W)."""
+        hwnd = self._get_foreground_hwnd()
+        if hwnd == 0:
+            logger.warning("CLOSE_TAB: no foreground window.")
+            return
+        if self._is_pet_window(hwnd):
+            logger.info("CLOSE_TAB: foreground is pet window, skipping.")
+            return
+        if self._is_own_console(hwnd):
+            logger.info("CLOSE_TAB: foreground is our console, skipping.")
+            return
+        logger.info("CLOSE_TAB: sending Ctrl+W to HWND=%d", hwnd)
+        self._pyautogui.hotkey("ctrl", "w")
+
+    def _cmd_switch(self, args: list[str]) -> None:
+        """Switch to a window by title substring. [DESKTOP:SWITCH:title]"""
+        if not args:
+            logger.warning("SWITCH requires a window title arg.")
+            return
+        title = ":".join(args).strip()
+        if not title:
+            logger.warning("SWITCH: empty title.")
+            return
+        hwnd = self._find_window_by_title(title)
+        if hwnd is None:
+            logger.info("SWITCH: no window matching %r found.", title)
+            return
+        if self._is_pet_window(hwnd):
+            logger.info("SWITCH: matched window is pet window, skipping.")
+            return
+        try:
+            import win32gui
+            import win32con
+            # Restore if minimized
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
+            logger.info("SWITCH: brought %r to foreground (HWND=%d)", title, hwnd)
+        except Exception as exc:
+            logger.warning("SWITCH failed: %s", exc)
 
     # ── Advanced actions (called by agent loop) ──────────────────────────────
 

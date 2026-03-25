@@ -126,6 +126,9 @@ Advanced desktop commands (use when asked to interact with the screen):
 - [DESKTOP:BROWSE:url]       — open a website (e.g. youtube.com, 4chan.org, reddit.com)
 - [DESKTOP:SCROLL:amount]    — scroll up (+) or down (-)
 - [DESKTOP:WRITE_NOTEPAD:content] — open Notepad and write content into it. Use \n for newlines. Great for lists, routines, plans, recipes, notes, etc.
+- [DESKTOP:CLOSE:title]      — close a specific window by title (e.g. [DESKTOP:CLOSE:YouTube] closes the YouTube window/tab)
+- [DESKTOP:CLOSE_TAB]        — close the current browser tab (Ctrl+W)
+- [DESKTOP:SWITCH:title]     — switch to a window by title (e.g. [DESKTOP:SWITCH:Discord])
 
 IMPORTANT for BROWSE: The user may say website names phonetically (e.g. "four chan" = 4chan.org, "read it" = reddit.com). Interpret what they mean and use the correct URL.
 

@@ -185,6 +185,20 @@ def main() -> None:
             output_device_index=config.audio.output_device_index,
         )
 
+    # ── TTS thread safety lock ────────────────────────────────────────────
+    # Both the pipeline thread and the TTSQueue consumer thread call
+    # tts.speak().  Wrap it with a lock so they never overlap.
+    _tts_lock = threading.Lock()
+    _original_tts_speak = tts.speak
+    def _locked_tts_speak(*args, **kwargs):
+        with _tts_lock:
+            return _original_tts_speak(*args, **kwargs)
+    tts.speak = _locked_tts_speak
+
+    # ── TTS Queue (multi-pony: serialised audio playback) ──────────────────
+    from core.tts_queue import TTSQueue
+    tts_queue = TTSQueue(tts, pause_between=0.4)
+
     camera = None
     if config.vision.enabled:
         try:
@@ -310,6 +324,52 @@ def main() -> None:
             timeline=timeline,
         )
 
+    # ── Multi-pony: wrap primary as PonyInstance + create manager ──────────
+    from core.pony_instance import PonyInstance, _get_keywords_for
+    from core.pony_manager import PonyManager
+    from llm.prompt import PromptConfig, get_system_prompt_for
+
+    primary_prompt_config = PromptConfig(
+        preset=config.llm.preset,
+        relationship_mode=config.llm.relationship,
+        relationship_custom=config.llm.relationship_custom,
+    )
+    # Wire the primary LLM provider to use per-pony prompt (backward-compat:
+    # when no companions, get_system_prompt_for produces the same output)
+    llm_provider.system_prompt_fn = lambda: get_system_prompt_for(primary_prompt_config)
+    llm_provider.character_name = get_character_name()
+
+    primary_pony = PonyInstance(
+        slug=config.llm.preset,
+        display_name=get_character_name(),
+        is_primary=True,
+        prompt_config=primary_prompt_config,
+        llm=llm_provider,
+        pet_window=pet_window,
+        pet_controller=pet_controller,
+        speech_bubble=None,    # wired later after SpeechBubble creation
+        heard_text=None,       # wired later
+        sprite_manager=sprite_manager,
+        behavior_manager=behavior_manager,
+        effect_renderer=effect_renderer,
+        pony_dir=pony_dir,
+    )
+    primary_pony.agent_loop = agent_loop
+
+    mp_cfg = config.multi_pony
+    pony_manager = PonyManager(
+        config=config,
+        ponies_root=ponies_root,
+        tts_queue=tts_queue,
+        max_ponies=mp_cfg.max_ponies,
+        chat_interval_s=mp_cfg.chat_interval_s,
+        max_chat_depth=mp_cfg.max_chat_depth,
+        piggyback_chance=mp_cfg.piggyback_chance,
+    )
+    pony_manager.register_primary(primary_pony)
+    if screen_monitor:
+        pony_manager._screen_monitor = screen_monitor
+
     # Compact user profile and prune stale events on startup
     try:
         from core.user_profile import prune_events, compact_profile
@@ -336,22 +396,30 @@ def main() -> None:
         vision_llm=vision_llm,
         timeline=timeline,
     )
+    # Wire multi-pony resources into pipeline and agent loop
+    pipeline.tts_queue = tts_queue
+    pipeline.primary_voice_slug = config.llm.preset
+    pipeline.pony_manager = pony_manager
+    if agent_loop:
+        agent_loop._tts_queue = tts_queue
+        agent_loop._primary_voice_slug = config.llm.preset
 
     # ── Context menu (right-click settings UI) ──────────────────────────────
     from desktop_pet.context_menu import ContextMenuBuilder, _save_yaml_value
 
     def _on_scale_change(new_scale: float) -> None:
-        nonlocal effect_renderer
+        nonlocal sprite_manager, effect_renderer
         new_sm = SpriteManager(pony_dir, scale=new_scale)
         new_sm.build_sprite_map(behavior_manager)
         new_sm.preload_all()
+        sprite_manager = new_sm
         pet_window.sprite_manager = new_sm
         effect_renderer = EffectRenderer(new_sm, behavior_manager)
         pet_window.effect_renderer = effect_renderer
         pet_window._pick_and_start_behavior()
 
     def _on_character_change(preset_name: str) -> None:
-        nonlocal pony_dir, behavior_manager, effect_renderer
+        nonlocal pony_dir, sprite_manager, behavior_manager, effect_renderer
         # 1. Switch LLM persona
         set_preset(preset_name)
         config.llm.preset = preset_name
@@ -369,6 +437,7 @@ def main() -> None:
         new_sm = SpriteManager(pony_dir, scale=config.desktop_pet.scale)
         new_sm.build_sprite_map(behavior_manager)
         new_sm.preload_all()
+        sprite_manager = new_sm
 
         # 5. Rebuild effects
         effect_renderer = EffectRenderer(new_sm, behavior_manager)
@@ -393,17 +462,46 @@ def main() -> None:
         if hasattr(tts, "set_character"):
             tts.set_character(preset_name)
 
+        # 11. Update primary PonyInstance to reflect new character
+        from core.character_registry import get_display_name
+        primary_pony.slug = preset_name
+        primary_pony.display_name = get_display_name(preset_name)
+        primary_pony.pony_dir = pony_dir
+        primary_pony.sprite_manager = new_sm
+        primary_pony.behavior_manager = behavior_manager
+        primary_pony.effect_renderer = effect_renderer
+        primary_pony.name_keywords = _get_keywords_for(preset_name)
+        primary_pony.prompt_config.preset = preset_name
+        primary_pony.prompt_config.relationship_mode = config.llm.relationship
+        primary_pony.prompt_config.relationship_custom = config.llm.relationship_custom
+        llm_provider.character_name = get_display_name(preset_name)
+        try:
+            from tts.openai_compatible_tts import has_pvt_voice
+            primary_pony.has_voice = has_pvt_voice(preset_name)
+        except Exception:
+            primary_pony.has_voice = True
+        # Update voice slugs for pipeline/agent loop
+        pipeline.primary_voice_slug = preset_name
+        if agent_loop:
+            agent_loop._primary_voice_slug = preset_name
+        # Refresh companion lists so other ponies know the new name
+        pony_manager._refresh_all_companions()
+
         logger.info("Character switched to: %s", char_name)
 
     def _on_provider_change(provider_name: str) -> None:
         nonlocal llm_provider
         from llm.factory import get_provider
         new_provider = get_provider(config)
+        # Carry over the per-pony system prompt function
+        new_provider.system_prompt_fn = lambda: get_system_prompt_for(primary_prompt_config)
+        new_provider.character_name = primary_pony.display_name
         llm_provider = new_provider
         pipeline.llm = new_provider
         if agent_loop:
             agent_loop._llm = new_provider
         menu_builder.llm = new_provider
+        primary_pony.llm = new_provider
         # Clear cached model list
         menu_builder._model_choices_cache = None
         # Reset conversation history for fresh start
@@ -454,8 +552,21 @@ def main() -> None:
         tts=tts,
         vision_llm=vision_llm,
         on_vision_llm_change=_on_vision_llm_change,
+        pony_manager=pony_manager,
+        pony_instance=primary_pony,
     )
     pet_window.set_menu_builder(menu_builder)
+
+    # Factory for creating context menus on secondary pony windows
+    def _make_secondary_menu(instance):
+        from desktop_pet.context_menu import ContextMenuBuilder as _CMB
+        return _CMB(
+            config=config,
+            config_path=str(Path(args.config)),
+            pony_manager=pony_manager,
+            pony_instance=instance,
+        )
+    pony_manager._menu_builder_factory = _make_secondary_menu
 
     # Wire pipeline callbacks to PetController methods
     pipeline.set_callbacks(
@@ -476,6 +587,10 @@ def main() -> None:
 
     heard_text = HeardText()
     heard_text.set_anchor_widget(pet_window)
+
+    # Wire into primary PonyInstance (created before speech_bubble existed)
+    primary_pony.speech_bubble = speech_bubble
+    primary_pony.heard_text = heard_text
 
     countdown = CountdownTimer()
     countdown.set_anchor_widget(pet_window)
@@ -761,7 +876,13 @@ def main() -> None:
                             agent_loop.tick()
                         except Exception as exc:
                             logger.debug("Agent tick error: %s", exc)
-                    else:
+                    # Inter-pony spontaneous chat (runs alongside agent loop)
+                    if mp_cfg.inter_pony_chat and len(pony_manager.ponies) > 1:
+                        try:
+                            pony_manager.maybe_spontaneous_chat()
+                        except Exception as exc:
+                            logger.debug("Inter-pony chat error: %s", exc)
+                    if not agent_loop:
                         # Fallback: old random roll when agent is disabled
                         if random.random() < random_chance:
                             logger.debug("Random speech triggered.")
@@ -814,6 +935,13 @@ def main() -> None:
     def _shutdown(*_args) -> None:
         logger.info("Shutdown signal received — cleaning up...")
         _shutdown_requested.set()
+        pony_manager._shutting_down = True
+        # Stop TTS queue first to avoid audio playing during teardown
+        tts_queue.stop()
+        # Remove secondary ponies
+        for pony in list(pony_manager.ponies):
+            if not pony.is_primary:
+                pony_manager.remove_pony(pony)
         if screen_monitor:
             screen_monitor.stop()
         detector.stop()
@@ -826,13 +954,22 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _shutdown)
     menu_builder.on_quit = lambda: _shutdown()
 
+    # ── Auto-load secondary ponies from config ─────────────────────────────
+    for slug in mp_cfg.secondary_ponies:
+        try:
+            pony_manager.add_pony(slug)
+        except Exception as exc:
+            logger.warning("Failed to auto-load secondary pony %s: %s", slug, exc)
+
     # ── Launch ───────────────────────────────────────────────────────────────
 
     pet_window.show()
     pipeline_thread.start()
 
+    pony_count = len(pony_manager.ponies)
+    pony_info = f" ({pony_count} ponies)" if pony_count > 1 else ""
     print(
-        f"\n{get_character_name()} Desktop Pet is running!\n"
+        f"\n{get_character_name()} Desktop Pet is running!{pony_info}\n"
         f"  Wake phrases: {', '.join(detector.wake_phrases)}\n"
         f"  Double-click the pet to start a conversation.\n"
         f"  Right-click for menu. Close to exit.\n"

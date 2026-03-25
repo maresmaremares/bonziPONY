@@ -157,6 +157,16 @@ class DesktopPetConfig:
 
 
 @dataclass
+class MultiPonyConfig:
+    max_ponies: int = 3
+    inter_pony_chat: bool = True
+    chat_interval_s: float = 600.0        # seconds between spontaneous inter-pony chats
+    max_chat_depth: int = 6               # max exchanges per conversation chain
+    piggyback_chance: float = 0.30        # chance each other pony jumps in after a response
+    secondary_ponies: List[str] = field(default_factory=list)  # auto-load on startup
+
+
+@dataclass
 class AppConfig:
     wake_word: WakeWordConfig
     audio: AudioConfig
@@ -173,6 +183,7 @@ class AppConfig:
     watch_mode: WatchModeConfig = None
     tts: TTSConfig = None
     vision_llm: VisionLLMConfig = None
+    multi_pony: MultiPonyConfig = None
 
     def __post_init__(self):
         if self.desktop_pet is None:
@@ -187,6 +198,8 @@ class AppConfig:
             self.watch_mode = WatchModeConfig()
         if self.vision_llm is None:
             self.vision_llm = VisionLLMConfig()
+        if self.multi_pony is None:
+            self.multi_pony = MultiPonyConfig()
 
 
 def _parse_vision_llm(raw: dict | None) -> VisionLLMConfig | None:
@@ -241,6 +254,7 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
     wm_raw = raw.get("watch_mode", {})
     tts_raw = raw.get("tts", {})
     vlm_raw = raw.get("vision_llm", {})
+    mp_raw = raw.get("multi_pony", {})
 
     # ── Env var fallbacks for secrets (config.yaml wins, env is backup) ─────
     llm_api_key = llm_raw.get("api_key", "") or os.environ.get("BONZI_LLM_API_KEY", "")
@@ -352,4 +366,12 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
             sample_rate=tts_raw.get("sample_rate", 24000),
         ),
         vision_llm=_parse_vision_llm(vlm_raw or None),
+        multi_pony=MultiPonyConfig(
+            max_ponies=mp_raw.get("max_ponies", 3),
+            inter_pony_chat=mp_raw.get("inter_pony_chat", True),
+            chat_interval_s=mp_raw.get("chat_interval_s", 600.0),
+            max_chat_depth=mp_raw.get("max_chat_depth", 6),
+            piggyback_chance=mp_raw.get("piggyback_chance", 0.30),
+            secondary_ponies=mp_raw.get("secondary_ponies", []),
+        ),
     )

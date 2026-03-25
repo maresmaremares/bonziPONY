@@ -217,6 +217,11 @@ def parse_response(raw: str) -> ParsedResponse:
                 time_str = parts[0].strip()
                 action = ":".join(parts[1:]).strip() or "timer alert"
             timer = TimerTag(time_str=time_str, action=action)
+        else:
+            # Single-part: [TIMER:midnight] or [TIMER:9pm]
+            time_str = parts[0].strip()
+            if time_str:
+                timer = TimerTag(time_str=time_str, action="timer alert")
 
     # Parse ALL ROUTINE tags (multiple allowed)
     for match in _ROUTINE_PATTERN.finditer(raw):

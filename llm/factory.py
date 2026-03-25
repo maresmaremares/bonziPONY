@@ -57,6 +57,12 @@ def get_provider(config) -> LLMProvider:
         )
 
     # Everything else is OpenAI-compatible
+    if not cfg.api_key:
+        logger.warning(
+            "No API key configured for provider '%s'. "
+            "LLM calls will likely fail. Set 'api_key' in config.yaml.",
+            provider,
+        )
     base_url = cfg.base_url or _KNOWN_BASE_URLS.get(provider)
     from llm.openai_provider import OpenAIProvider
     return OpenAIProvider(

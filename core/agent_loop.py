@@ -208,6 +208,8 @@ class AgentLoop:
         self._llm = llm
         self._tts = tts
         self._tts_config = tts_config  # for checking tts.enabled
+        self._tts_queue = None          # set by main.py for multi-pony voice routing
+        self._primary_voice_slug = None # set by main.py
         self._desktop = desktop_controller
         self._robot = robot
         self._detector = detector
@@ -232,6 +234,7 @@ class AgentLoop:
         self._enforcement = EnforcementMode()
         self._enforcement_just_completed = False  # suppress welcome-back after enforcement
         self._directives_cleared_at: float = 0.0  # suppress re-creation after clear
+        self._stopped: bool = False
         self._mess_mouse_count: int = 0  # grows duration each trigger
         self._last_wake_event: Optional[str] = None  # set by tick(), consumed by _check_routines()
 
@@ -1254,6 +1257,10 @@ class AgentLoop:
         result = re.sub(r"<think>.*", "", result, flags=re.DOTALL)
         return result.strip()
 
+    def stop(self) -> None:
+        """Signal this agent loop to stop. Called by PonyInstance.destroy()."""
+        self._stopped = True
+
     def tick(self) -> None:
         """Called every ~1s from the pipeline thread. Decides if anything needs doing."""
         # Always track idle/wake state — needed for sleep detection even during conversation
@@ -1525,6 +1532,8 @@ class AgentLoop:
             '  - {"command":"BROWSE","args":["url"]}',
             '  - {"command":"WRITE_NOTEPAD","args":["content with \\n for newlines"]} — open Notepad and write content (lists, routines, plans, notes)',
             '  - {"command":"LAUNCH_APP","args":["app name"]} — launch an installed app or game by name (fuzzy match)',
+            '  - {"command":"SWITCH","args":["window title"]} — bring a specific window to the foreground',
+            '  - {"command":"CLOSE_TAB","args":[]} — close the current browser tab (Ctrl+W)',
             '- create_directive: {"goal":"...","urgency":1-10} or {"goal":"...","urgency":1-10,"delay_minutes":30} or null — goal must be a DIRECT ACTION like "eat food", "go to sleep". NEVER write "remind user to" or "get user to". Use delay_minutes to defer first nag for non-urgent tasks.',
             '- complete_directive: index of directive to mark done, or null',
             '- directives: for EACH active directive by index, set timing AND urgency:',
@@ -1556,11 +1565,20 @@ class AgentLoop:
             "  Extreme urgency (9-10): go nuclear IF the situation truly warrants it. Stack everything.",
             "  SHAKE does NOT work on fullscreen apps — use ALT_TAB (Win+D) instead.",
             "",
+            "DIRECTIVE SCOPE — READ THIS CAREFULLY:",
+            "- Read each directive LITERALLY. 'stop buying CS2 items' means stop BUYING, not stop playing or browsing CS2.",
+            "- Being near related content is NOT the same as doing the prohibited thing.",
+            "  Playing a game ≠ buying items. Browsing a store ≠ checking out. Watching YouTube about X ≠ doing X.",
+            "- Only escalate when the user is ACTIVELY doing the specific thing the directive says.",
+            "- 'Stop doing X' directives should trigger ONLY when you see them doing X, not when you see anything related to X.",
+            "- If the directive is about spending money, only escalate on checkout/payment screens, NOT on browsing or playing.",
+            "",
             "WHAT NOT TO DO:",
             "- Don't mechanically escalate urgency every single tick. Sometimes holding steady is right.",
             "- Don't nag more often than every 2 minutes unless urgency is 8+.",
             "- Don't let a directive go silent for more than 15 minutes between nags.",
             "- Don't use the exact same approach twice in a row (check last_nag_style).",
+            "- Don't escalate a 'stop doing X' directive just because the user is near X-related content.",
             "",
             "═════════════════════════════════════════════════════",
             "NAG VARIETY — THIS IS CRITICAL, DO NOT SKIP:",
@@ -2261,7 +2279,7 @@ class AgentLoop:
             if desktop_cmds:
                 from core.agent_loop import AgentDecision
                 decision = AgentDecision(desktop_commands=desktop_cmds)
-                self._execute_decision(decision)
+                self._execute_decision(decision, state)
                 for cmd in desktop_cmds:
                     cmd_name = cmd.get("command", "?")
                     self._log_action(f"Playful: {cmd_name}")
@@ -2350,7 +2368,16 @@ class AgentLoop:
                             self._on_speech_text(t)
                     tts_on = self._tts_config.enabled if self._tts_config else True
                     if tts_on:
-                        self._tts.speak(parsed.text, on_playback_start=_show_bubble)
+                        if self._tts_queue:
+                            from core.tts_queue import PRIORITY_AUTONOMOUS
+                            self._tts_queue.enqueue(
+                                parsed.text,
+                                priority=PRIORITY_AUTONOMOUS,
+                                voice_slug=self._primary_voice_slug,
+                                on_start=_show_bubble,
+                            )
+                        else:
+                            self._tts.speak(parsed.text, on_playback_start=_show_bubble)
                     else:
                         _show_bubble()
 
@@ -2399,7 +2426,16 @@ class AgentLoop:
                     self._on_speech_text(text)
             tts_on = self._tts_config.enabled if self._tts_config else True
             if tts_on:
-                self._tts.speak(text, on_playback_start=_show_bubble)
+                if self._tts_queue:
+                    from core.tts_queue import PRIORITY_AUTONOMOUS
+                    self._tts_queue.enqueue(
+                        text,
+                        priority=PRIORITY_AUTONOMOUS,
+                        voice_slug=self._primary_voice_slug,
+                        on_start=_show_bubble,
+                    )
+                else:
+                    self._tts.speak(text, on_playback_start=_show_bubble)
             else:
                 _show_bubble()
             if self._timeline:
@@ -2464,6 +2500,9 @@ class AgentLoop:
         still catch the timer.  Fires 5 minutes early as a heads-up, then
         the directive becomes active at the actual trigger time.
         """
+        # Respect the 60-second cooldown after directives were cleared
+        if (time.monotonic() - self._directives_cleared_at) < 60.0:
+            return
         now = datetime.now()
         now_minutes = now.hour * 60 + now.minute
         for d in self.directives:
@@ -2522,6 +2561,10 @@ class AgentLoop:
 
     def _check_routines(self) -> None:
         """Fire any due recurring directives. Wake/sleep tracking is done in tick()."""
+        # Respect the 60-second cooldown after directives were cleared
+        now = time.monotonic()
+        if (now - self._directives_cleared_at) < 60.0:
+            return
         wake = getattr(self, "_last_wake_event", None) == "wake"
         due = self.routine_manager.get_due_routines(wake_event=wake)
         if wake:
