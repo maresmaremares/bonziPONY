@@ -894,9 +894,12 @@ def main() -> None:
                             agent_loop.tick()
                         except Exception as exc:
                             logger.debug("Agent tick error: %s", exc)
-                    # Inter-pony spontaneous chat (runs alongside agent loop)
+                    # Inter-pony behavior (runs alongside agent loop)
                     if mp_cfg.inter_pony_chat and len(pony_manager.ponies) > 1:
                         try:
+                            # Individual pony remarks (each pony independently)
+                            pony_manager.maybe_individual_speech()
+                            # Coordinated group conversations (less frequent)
                             pony_manager.maybe_spontaneous_chat()
                         except Exception as exc:
                             logger.debug("Inter-pony chat error: %s", exc)

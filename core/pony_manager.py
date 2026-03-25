@@ -45,6 +45,7 @@ class PonyManager:
 
         self.ponies: list["PonyInstance"] = []
         self._last_inter_chat: float = time.monotonic()
+        self._next_individual_speech: dict[str, float] = {}  # slug -> next eligible time
         self._menu_builder_factory: Any = None  # set by main.py
         self._screen_monitor: Any = None  # set by main.py for HWND exclusion
         self._shutting_down: bool = False
@@ -258,6 +259,131 @@ class PonyManager:
             logger.error("Spontaneous chat failed: %s", exc)
 
         return True
+
+    def maybe_individual_speech(self) -> bool:
+        """Give each pony an independent chance to say something on their own.
+
+        Unlike ``maybe_spontaneous_chat`` (coordinated group conversation),
+        this lets individual ponies speak up randomly — a thought, a remark,
+        a comment about what's on screen.  Other ponies get a piggyback chance.
+
+        Called from the main tick loop.  Returns True if anyone spoke.
+        """
+        if self._shutting_down or len(self.ponies) < 2:
+            return False
+
+        now = time.monotonic()
+        spoke = False
+
+        for pony in self.ponies:
+            if getattr(pony, "_destroyed", False):
+                continue
+            # Primary pony has its own agent_loop for spontaneous speech — skip
+            if pony.is_primary:
+                continue
+
+            # Per-pony timer: 3-8 min between individual remarks
+            key = id(pony)
+            if key not in self._next_individual_speech:
+                self._next_individual_speech[key] = now + random.uniform(180.0, 480.0)
+            if now < self._next_individual_speech[key]:
+                continue
+
+            # Reset timer regardless of outcome
+            self._next_individual_speech[key] = now + random.uniform(180.0, 480.0)
+
+            # Generate individual remark
+            text = self._generate_individual_remark(pony)
+            if not text:
+                continue
+
+            spoke = True
+            self._speak_individual(pony, text)
+
+            # Offer piggyback to others
+            for other in self.ponies:
+                if other is pony or getattr(other, "_destroyed", False):
+                    continue
+                if random.random() > self.piggyback_chance:
+                    continue
+                try:
+                    from core.group_conversation import GroupConversation
+                    convo = GroupConversation(self, max_depth=2)
+                    convo.piggyback(
+                        other,
+                        original_speaker=pony.display_name,
+                        user_text="",
+                        response_text=text,
+                    )
+                except Exception as exc:
+                    logger.debug("Individual piggyback failed for %s: %s",
+                                 other.display_name, exc)
+
+            # Only one pony speaks per tick to avoid spam
+            break
+
+        return spoke
+
+    def _generate_individual_remark(self, pony: "PonyInstance") -> Optional[str]:
+        """Generate a short spontaneous remark for a single pony."""
+        from core.group_conversation import GroupConversation
+
+        # Build screen context
+        screen_info = ""
+        if self._screen_monitor:
+            try:
+                state = self._screen_monitor.get_state()
+                if state and state.foreground:
+                    screen_info = f"The user is currently looking at: \"{state.foreground.title}\". "
+            except Exception:
+                pass
+
+        companions = [p.display_name for p in self.ponies if p is not pony]
+        companion_str = ", ".join(companions) if companions else "the user"
+
+        prompt = (
+            f"(You're on the desktop with {companion_str}. {screen_info}"
+            f"Say something — a casual remark, a thought, a comment on what the user "
+            f"is doing, or just say something to one of your friends. "
+            f"Keep it to one sentence.\n"
+            f"IMPORTANT: Only reference things you actually know or can see above. "
+            f"Do NOT invent scenery or events.\n"
+            f"Be yourself — not a caricature. Don't lean on your most obvious trait.\n"
+            f"Say [PASS] if you have nothing worth saying right now.\n"
+            f"Do NOT include any tags like [CONVO:...] — just speak naturally.)"
+        )
+
+        try:
+            reply = pony.llm.generate_once(prompt, max_tokens=100)
+        except Exception as exc:
+            logger.debug("Individual speech failed for %s: %s", pony.display_name, exc)
+            return None
+
+        return GroupConversation._clean_reply(reply)
+
+    def _speak_individual(self, pony: "PonyInstance", text: str) -> None:
+        """Enqueue individual speech for a pony."""
+        from core.tts_queue import PRIORITY_SPONTANEOUS_CHAT
+
+        if getattr(pony, "_destroyed", False):
+            return
+
+        def _show_bubble():
+            if getattr(pony, "_destroyed", False):
+                return
+            try:
+                pony.pet_controller.speech_text.emit(text)
+            except Exception:
+                pass
+
+        self.tts_queue.enqueue(
+            text,
+            priority=PRIORITY_SPONTANEOUS_CHAT,
+            voice_slug=pony.slug,
+            on_start=_show_bubble,
+            skip_tts=not getattr(pony, "has_voice", True),
+        )
+        logger.info("Individual speech by %s: %r", pony.display_name, text[:60])
 
     def offer_piggyback(
         self,
