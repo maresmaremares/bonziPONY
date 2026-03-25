@@ -777,6 +777,10 @@ def main() -> None:
                 speech_bubble.hide_bubble()
             except Exception:
                 pass
+            # Suppress autonomous speech immediately — don't let the agent
+            # interject while Whisper is still transcribing what the user said
+            if agent_loop:
+                agent_loop.set_conversation_active(True)
             # Pause wake word detector IMMEDIATELY so it doesn't also fire on
             # "hey dash" spoken while PTT is held (race condition: wake word
             # would detect before the recording thread could pause it)
@@ -869,6 +873,9 @@ def main() -> None:
                                     detector.resume()
                         else:
                             print("[PTT] No speech detected.", flush=True)
+                            # PTT captured nothing — re-enable autonomous behavior
+                            if agent_loop:
+                                agent_loop.set_conversation_active(False)
                             if not _shutdown_requested.is_set():
                                 detector.resume()
                         continue
