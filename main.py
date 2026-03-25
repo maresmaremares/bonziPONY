@@ -678,7 +678,9 @@ def main() -> None:
     pet_controller.state_changed.connect(_on_state_changed, Qt.QueuedConnection)
     # BlockingQueuedConnection: pipeline thread blocks until main thread shows the bubble,
     # guaranteeing the bubble is visible BEFORE audio playback starts.
-    pet_controller.heard_text.connect(_on_heard_text, Qt.QueuedConnection)
+    # BlockingQueuedConnection so the heard text is guaranteed to be shown
+    # before the pipeline continues (prevents LLM fast-path from overriding it)
+    pet_controller.heard_text.connect(_on_heard_text, Qt.BlockingQueuedConnection)
     pet_controller.speech_text.connect(_on_speech_text, Qt.BlockingQueuedConnection)
     pet_controller.conversation_started.connect(_on_conversation_started, Qt.QueuedConnection)
     pet_controller.conversation_ended.connect(_on_conversation_ended, Qt.QueuedConnection)

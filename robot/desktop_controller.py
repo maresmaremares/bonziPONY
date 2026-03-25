@@ -391,6 +391,8 @@ class DesktopController:
                 self._cmd_click(cmd.args)
             elif command == "TYPE":
                 self._cmd_type(cmd.args)
+            elif command == "PASTE":
+                self._cmd_paste(cmd.args)
             elif command == "HOTKEY":
                 self._cmd_hotkey(cmd.args)
             elif command == "OPEN":
@@ -440,13 +442,56 @@ class DesktopController:
             return
 
         text = ":".join(args)  # Rejoin in case text contained colons
-        # 200-char limit for safety
-        if len(text) > 200:
-            text = text[:200]
-            logger.warning("TYPE text truncated to 200 chars.")
+        # 2000-char limit for safety
+        if len(text) > 2000:
+            text = text[:2000]
+            logger.warning("TYPE text truncated to 2000 chars.")
 
-        logger.info("Typing: %r", text)
-        self._pyautogui.write(text, interval=0.02)
+        logger.info("Typing: %r", text[:80])
+        # Use clipboard paste for reliability (handles unicode, newlines, speed)
+        self._paste_text(text)
+
+    def _cmd_paste(self, args: list[str]) -> None:
+        """Paste text into the focused app via clipboard. [DESKTOP:PASTE:text]"""
+        if not self._config.type_enabled:
+            logger.info("Type/paste disabled by config.")
+            return
+        if not args:
+            logger.warning("PASTE requires text arg.")
+            return
+
+        text = ":".join(args)  # Rejoin in case text contained colons
+        text = text.replace("\\n", "\n")  # Interpret \n as real newlines
+        # 5000-char limit for safety
+        if len(text) > 5000:
+            text = text[:5000]
+            logger.warning("PASTE text truncated to 5000 chars.")
+
+        logger.info("PASTE: %d chars into foreground app", len(text))
+        self._paste_text(text)
+
+    def _paste_text(self, text: str) -> None:
+        """Copy text to clipboard and Ctrl+V into the focused window."""
+        try:
+            import win32clipboard
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+            win32clipboard.CloseClipboard()
+            time.sleep(0.05)
+            self._pyautogui.hotkey("ctrl", "v")
+        except ImportError:
+            # Fallback: use pyperclip or pyautogui.write
+            try:
+                import pyperclip
+                pyperclip.copy(text)
+                self._pyautogui.hotkey("ctrl", "v")
+            except ImportError:
+                # Last resort: slow character-by-character
+                self._pyautogui.write(text, interval=0.02)
+        except Exception as exc:
+            logger.warning("Paste failed: %s — falling back to write()", exc)
+            self._pyautogui.write(text[:200], interval=0.02)
 
     def _cmd_hotkey(self, args: list[str]) -> None:
         if not args:

@@ -8,6 +8,40 @@ from pathlib import Path
 _PRESETS_DIR = Path(__file__).parent.parent / "presets"
 
 _active_preset: str = "rainbow_dash"
+
+# ── Desktop commands documentation (injected into system prompt) ──────────
+_DESKTOP_COMMANDS_BLOCK = (
+    "\n\n== DESKTOP COMMANDS ==\n"
+    "You can control the user's desktop by including these tags in your response. "
+    "You can combine multiple tags with your spoken text.\n\n"
+    "Typing & pasting:\n"
+    "  [DESKTOP:PASTE:text here] — paste text into the focused app (4chan posts, messages, etc.)\n"
+    "  [DESKTOP:TYPE:short text] — type text character by character (short strings only)\n"
+    "  [DESKTOP:WRITE_NOTEPAD:content with \\n for newlines] — open Notepad and write content\n\n"
+    "Keyboard shortcuts:\n"
+    "  [DESKTOP:HOTKEY:ctrl:w] — close tab\n"
+    "  [DESKTOP:HOTKEY:ctrl:t] — new tab\n"
+    "  [DESKTOP:HOTKEY:ctrl:c] — copy\n"
+    "  [DESKTOP:HOTKEY:ctrl:v] — paste\n"
+    "  [DESKTOP:HOTKEY:ctrl:z] — undo\n"
+    "  [DESKTOP:HOTKEY:ctrl:a] — select all\n"
+    "  [DESKTOP:HOTKEY:enter] — press Enter\n"
+    "  [DESKTOP:HOTKEY:tab] — press Tab\n"
+    "  [DESKTOP:HOTKEY:escape] — press Escape\n"
+    "  (any key combo works: [DESKTOP:HOTKEY:key1:key2:...])\n\n"
+    "Mouse & scrolling:\n"
+    "  [DESKTOP:SCROLL:5] — scroll up (positive = up, negative = down)\n"
+    "  [DESKTOP:SCROLL:-5] — scroll down\n"
+    "  [DESKTOP:CLICK:500:300] — click at screen coordinates (x, y)\n\n"
+    "Windows & apps:\n"
+    "  [DESKTOP:BROWSE:url] — open a URL in the browser\n"
+    "  [DESKTOP:OPEN:notepad] — launch an app\n"
+    "  [DESKTOP:SWITCH:window title] — bring a window to the foreground\n"
+    "  [DESKTOP:CLOSE:window title] — close a window by title\n"
+    "  [DESKTOP:CLOSE_TAB] — close the current browser tab (Ctrl+W)\n\n"
+    "IMPORTANT: When the user asks you to type/write/post something, use [DESKTOP:PASTE:text]. "
+    "Keep your spoken response SHORT and separate from the pasted text."
+)
 _relationship_mode: str = "lover"
 _relationship_custom: str = ""
 
@@ -82,6 +116,9 @@ def get_system_prompt() -> str:
         rel_text = _RELATIONSHIP_PROMPTS.get(_relationship_mode, _RELATIONSHIP_PROMPTS["lover"])
     text += f"\n\n{rel_text}"
 
+    # Desktop commands
+    text += _DESKTOP_COMMANDS_BLOCK
+
     # Identity guard — prevents model from breaking character
     guard = (
         f"\n\n== CRITICAL IDENTITY RULE ==\n"
@@ -91,7 +128,7 @@ def get_system_prompt() -> str:
         f"or anything meta. If you catch yourself breaking character, STOP and respond as {display_name} would.\n"
         f"NEVER output code, markdown, HTML, structured text, or programming syntax in your speech. "
         f"You are being spoken aloud through TTS. If you need to give the user code or written content, "
-        f"use [DESKTOP:WRITE_NOTEPAD:content] and keep your spoken response SHORT."
+        f"use [DESKTOP:PASTE:content] or [DESKTOP:WRITE_NOTEPAD:content] and keep your spoken response SHORT."
     )
     text += guard
 
@@ -157,6 +194,9 @@ def get_system_prompt_for(config: PromptConfig) -> str:
             "Have fun with it. You're both real. Don't freak out about it."
         )
 
+    # ── Desktop commands ──
+    text += _DESKTOP_COMMANDS_BLOCK
+
     # ── Identity guard ──
     guard = (
         f"\n\n== CRITICAL IDENTITY RULE ==\n"
@@ -166,7 +206,7 @@ def get_system_prompt_for(config: PromptConfig) -> str:
         f"or anything meta. If you catch yourself breaking character, STOP and respond as {display_name} would.\n"
         f"NEVER output code, markdown, HTML, structured text, or programming syntax in your speech. "
         f"You are being spoken aloud through TTS. If you need to give the user code or written content, "
-        f"use [DESKTOP:WRITE_NOTEPAD:content] and keep your spoken response SHORT."
+        f"use [DESKTOP:PASTE:content] or [DESKTOP:WRITE_NOTEPAD:content] and keep your spoken response SHORT."
     )
     text += guard
 
