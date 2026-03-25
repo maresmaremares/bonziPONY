@@ -151,76 +151,84 @@ class AnthropicProvider(LLMProvider):
 
     def describe_image(self, jpeg_bytes: bytes) -> Optional[str]:
         """One-shot vision call — returns a plain description of the image."""
-        b64 = base64.standard_b64encode(jpeg_bytes).decode("utf-8")
-        response = self._call_with_retry(
-            model=self.model,
-            system="You are a precise visual observer. Describe what you see in the image concisely in 1-3 sentences. Focus on people, objects, environment, and notable details.",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": b64,
+        try:
+            b64 = base64.standard_b64encode(jpeg_bytes).decode("utf-8")
+            response = self._call_with_retry(
+                model=self.model,
+                system="You are a precise visual observer. Describe what you see in the image concisely in 1-3 sentences. Focus on people, objects, environment, and notable details.",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/jpeg",
+                                    "data": b64,
+                                },
                             },
-                        },
-                        {"type": "text", "text": "What do you see?"},
-                    ],
-                }
-            ],
-            max_tokens=150,
-        )
-        if response.content:
-            text = getattr(response.content[0], "text", None)
-            return text.strip() if text else None
-        return None
+                            {"type": "text", "text": "What do you see?"},
+                        ],
+                    }
+                ],
+                max_tokens=150,
+            )
+            if response.content:
+                text = getattr(response.content[0], "text", None)
+                return text.strip() if text else None
+            return None
+        except Exception as exc:
+            logger.warning("describe_image failed: %s", exc)
+            return None
 
     def describe_screen(self, jpeg_bytes: bytes) -> Optional[str]:
         """One-shot vision call — describe what's on a computer screen."""
-        b64 = base64.standard_b64encode(jpeg_bytes).decode("utf-8")
-        response = self._call_with_retry(
-            model=self.model,
-            system=(
-                "You are a screen reader providing detailed descriptions of a computer screen "
-                "for someone who cannot see it. Your output is consumed by another AI, not a human."
-            ),
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": b64,
+        try:
+            b64 = base64.standard_b64encode(jpeg_bytes).decode("utf-8")
+            response = self._call_with_retry(
+                model=self.model,
+                system=(
+                    "You are a screen reader providing detailed descriptions of a computer screen "
+                    "for someone who cannot see it. Your output is consumed by another AI, not a human."
+                ),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/jpeg",
+                                    "data": b64,
+                                },
                             },
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                "Describe this screenshot in detail. Include:\n"
-                                "1. APPLICATIONS: Which programs/windows are open, which is focused\n"
-                                "2. TEXT/OCR: Read and transcribe any visible text — titles, tabs, chat messages, "
-                                "code, articles, captions, notifications, URLs. Quote key text verbatim.\n"
-                                "3. MEDIA: If a video/stream/game is playing, describe what's happening in it\n"
-                                "4. ACTIVITY: What the user appears to be doing (browsing, coding, chatting, gaming, etc.)\n"
-                                "Ignore the small animated pony sprite — that's a desktop pet overlay, not relevant.\n"
-                                "Be thorough. The more detail you provide, the better."
-                            ),
-                        },
-                    ],
-                }
-            ],
-            max_tokens=600,
-        )
-        if response.content:
-            text = getattr(response.content[0], "text", None)
-            return text.strip() if text else None
-        return None
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Describe this screenshot in detail. Include:\n"
+                                    "1. APPLICATIONS: Which programs/windows are open, which is focused\n"
+                                    "2. TEXT/OCR: Read and transcribe any visible text — titles, tabs, chat messages, "
+                                    "code, articles, captions, notifications, URLs. Quote key text verbatim.\n"
+                                    "3. MEDIA: If a video/stream/game is playing, describe what's happening in it\n"
+                                    "4. ACTIVITY: What the user appears to be doing (browsing, coding, chatting, gaming, etc.)\n"
+                                    "Ignore the small animated pony sprite — that's a desktop pet overlay, not relevant.\n"
+                                    "Be thorough. The more detail you provide, the better."
+                                ),
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=600,
+            )
+            if response.content:
+                text = getattr(response.content[0], "text", None)
+                return text.strip() if text else None
+            return None
+        except Exception as exc:
+            logger.warning("describe_screen failed: %s", exc)
+            return None
 
     def inject_history(self, user_message: str, assistant_message: str) -> None:
         """Inject a fake exchange into history so Dash remembers autonomous actions."""
@@ -232,3 +240,6 @@ class AnthropicProvider(LLMProvider):
         max_messages = self.max_history_turns * 2
         if len(self._history) > max_messages:
             self._history = self._history[-max_messages:]
+        # Anthropic requires first message to be "user"
+        while self._history and self._history[0].get("role") == "assistant":
+            self._history.pop(0)

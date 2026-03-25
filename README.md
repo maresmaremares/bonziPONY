@@ -88,23 +88,23 @@ main.py                          Entry point, wires everything together
 
 ## Quickstart
 
-```bash
-git clone https://github.com/maresmaresmares/bonziPONY.git
-cd bonziPONY
-pip install -r requirements.txt
-cp config.yaml.example config.yaml
-# Edit config.yaml — fill in your API keys
-python main.py
+```
+1. Download/clone this repo
+2. Double-click retardsetup.bat
+3. Wait for it to finish (it downloads everything for you)
+4. Edit config.yaml with your API keys (or right-click the pony to set them)
 ```
 
-A pony appears on your desktop. Say its name to start talking. Double-click it if you don't have a mic set up yet. Right-click for settings.
+That's it. The setup script handles Python, dependencies, everything. A pony appears on your desktop. Say its name to start talking. Double-click it if you don't have a mic set up yet. Right-click for settings.
 
 ## Setup
 
 ### Requirements
 
 - Windows 10/11
-- Python 3.9+
+- **Python 3.10, 3.11, or 3.12** (3.11 recommended — [direct download](https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe))
+  - **Python 3.13+ does NOT work** — PyQt5 and PyTorch don't have packages for it yet
+  - The setup script will download Python 3.11 automatically if you don't have a compatible version
 - A microphone (any USB or built-in mic works)
 - An LLM API key — pick one:
   - [Anthropic](https://console.anthropic.com/) (Claude) — recommended
@@ -117,19 +117,19 @@ A pony appears on your desktop. Say its name to start talking. Double-click it i
 
 ### Step 1: Install
 
+**Easiest way** — just double-click `retardsetup.bat`. It handles everything: downloads the right Python if you don't have it, creates a virtual environment, installs all dependencies, and launches the pony. You're done.
+
+**Manual install** (if you prefer):
+
 ```bash
 git clone https://github.com/maresmaresmares/bonziPONY.git
 cd bonziPONY
-pip install -r requirements.txt
-```
-
-If you're using a virtual environment (recommended):
-
-```bash
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
 ```
+
+> **Important:** Use Python 3.10-3.12. If `python --version` shows 3.13+, install [Python 3.11](https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe) first. Check "Add to PATH" in the installer.
 
 ### Step 2: Configure
 

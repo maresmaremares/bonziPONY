@@ -18,7 +18,7 @@ _ACTION_PATTERN = re.compile(r"\[ACTION:([A-Z_]+)\]", re.IGNORECASE)
 _DESKTOP_PATTERN = re.compile(r"\[DESKTOP:([^\]]+)\]", re.IGNORECASE)
 
 # Matches a truncated [DESKTOP:... tag at end of response (hit token limit before closing ])
-_DESKTOP_TRUNCATED = re.compile(r"\[DESKTOP:(.+)", re.IGNORECASE | re.DOTALL)
+_DESKTOP_TRUNCATED = re.compile(r"\[DESKTOP:([^\]]+)$", re.IGNORECASE | re.MULTILINE)
 
 # Matches [DIRECTIVE:nag user to go to gym:7]
 _DIRECTIVE_PATTERN = re.compile(r"\[DIRECTIVE:([^\]]+)\]", re.IGNORECASE)
@@ -157,7 +157,7 @@ def parse_response(raw: str) -> ParsedResponse:
             ))
 
     # Handle truncated DESKTOP tag (response cut off by token limit before closing ])
-    if not desktop_commands and "[DESKTOP:" in raw.upper():
+    if "[DESKTOP:" in raw.upper():
         trunc_match = _DESKTOP_TRUNCATED.search(raw)
         if trunc_match:
             content = trunc_match.group(1).rstrip()

@@ -652,32 +652,35 @@ class Pipeline:
 
             # Mark directive as completed if LLM used [DONE] or [DONE:keyword]
             if parsed.done_directive is not None and self.agent_loop and self.agent_loop.has_directives:
-                keyword = parsed.done_directive.lower()
-                removed = False
-                removed_d = None
-                if keyword:
-                    # Match by keyword against directive goals
-                    for i, d in enumerate(self.agent_loop.directives):
-                        if keyword in d.goal.lower():
-                            removed_d = self.agent_loop.directives.pop(i)
-                            logger.info("Directive completed via [DONE:%s]: %r", keyword, removed_d.goal)
-                            removed = True
-                            break
-                if not removed:
-                    # No keyword or no match — remove highest urgency directive
-                    if self.agent_loop.directives:
-                        best = max(range(len(self.agent_loop.directives)),
-                                   key=lambda i: self.agent_loop.directives[i].urgency)
-                        removed_d = self.agent_loop.directives.pop(best)
-                        logger.info("Directive completed via [DONE]: %r", removed_d.goal)
-                # End enforcement if the completed directive was the one being enforced
-                if removed_d and self.agent_loop._enforcement.active:
-                    if removed_d.goal == self.agent_loop._enforcement.directive_goal:
-                        self.agent_loop._enforcement.active = False
-                        logger.info("Enforcement ended: directive completed via conversation.")
-                if not self.agent_loop.directives:
-                    self.agent_loop._mess_mouse_count = 0
-                self.agent_loop.save_directives()
+                try:
+                    keyword = parsed.done_directive.lower()
+                    removed = False
+                    removed_d = None
+                    if keyword:
+                        # Match by keyword against directive goals
+                        for i, d in enumerate(self.agent_loop.directives):
+                            if keyword in d.goal.lower():
+                                removed_d = self.agent_loop.directives.pop(i)
+                                logger.info("Directive completed via [DONE:%s]: %r", keyword, removed_d.goal)
+                                removed = True
+                                break
+                    if not removed:
+                        # No keyword or no match — remove highest urgency directive
+                        if self.agent_loop.directives:
+                            best = max(range(len(self.agent_loop.directives)),
+                                       key=lambda i: self.agent_loop.directives[i].urgency)
+                            removed_d = self.agent_loop.directives.pop(best)
+                            logger.info("Directive completed via [DONE]: %r", removed_d.goal)
+                    # End enforcement if the completed directive was the one being enforced
+                    if removed_d and self.agent_loop._enforcement.active:
+                        if removed_d.goal == self.agent_loop._enforcement.directive_goal:
+                            self.agent_loop._enforcement.active = False
+                            logger.info("Enforcement ended: directive completed via conversation.")
+                    if not self.agent_loop.directives:
+                        self.agent_loop._mess_mouse_count = 0
+                    self.agent_loop.save_directives()
+                except (IndexError, RuntimeError) as exc:
+                    logger.debug("Directive modification race: %s", exc)
 
             # MOVETO — move pony to a screen region
             if parsed.moveto_region and self.robot:
@@ -758,7 +761,7 @@ class Pipeline:
                     try:
                         self.pony_manager.offer_piggyback(
                             self.pony_manager.primary,
-                            user_text or "",
+                            original_user_text or "",
                             parsed.text,
                         )
                     except Exception as exc:

@@ -506,6 +506,16 @@ def main() -> None:
         menu_builder._model_choices_cache = None
         # Reset conversation history for fresh start
         new_provider.reset_history()
+        # Update secondary ponies too
+        for pony in pony_manager.ponies:
+            if not pony.is_primary:
+                try:
+                    secondary_provider = get_provider(config)
+                    secondary_provider.character_name = pony.display_name
+                    pony.llm = secondary_provider
+                except Exception as exc:
+                    logger.warning("Failed to update secondary pony %s provider: %s",
+                                   pony.display_name, exc)
         logger.info("LLM provider hot-swapped to: %s", provider_name)
 
     def _on_vision_llm_change() -> None:
@@ -1004,8 +1014,6 @@ def main() -> None:
         if screen_monitor:
             screen_monitor.stop()
         detector.stop()
-        pipeline.summarize_session()
-        pipeline._extract_user_profile(force=True)
     except Exception as exc:
         logger.debug("Post-loop cleanup error (non-fatal): %s", exc)
     logger.info("Desktop Pony signing off. Catch ya later!")

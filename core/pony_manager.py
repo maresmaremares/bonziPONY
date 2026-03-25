@@ -283,7 +283,7 @@ class PonyManager:
                 continue
 
             # Per-pony timer: 3-8 min between individual remarks
-            key = id(pony)
+            key = pony.slug  # use stable identifier instead of id()
             if key not in self._next_individual_speech:
                 self._next_individual_speech[key] = now + random.uniform(180.0, 480.0)
             if now < self._next_individual_speech[key]:

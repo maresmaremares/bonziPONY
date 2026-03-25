@@ -167,6 +167,7 @@ class TTSQueue:
 
     def stop(self) -> None:
         """Shut down the consumer thread.  Drains remaining items first."""
+        self.flush()  # drain pending items and fire their on_done callbacks
         self._running = False
         # Put a sentinel so the thread unblocks from .get()
         self._queue.put(_TTSItem(priority=999, sequence=999_999_999, text=""))
@@ -214,8 +215,6 @@ class TTSQueue:
                 # Pause so the bubble is visible for a reasonable time
                 time.sleep(max(1.0, len(item.text) * 0.05))
             else:
-                # Switch voice + play must be atomic so no other thread
-                # sneaks a speak() between set_character and our speak().
                 try:
                     if item.voice_slug and hasattr(self._tts, "set_character"):
                         try:
@@ -223,11 +222,18 @@ class TTSQueue:
                         except Exception as exc:
                             logger.warning("TTSQueue: set_character(%r) failed: %s",
                                            item.voice_slug, exc)
-                    self._tts.speak(item.text, on_playback_start=item.on_start)
+                    _on_start_fired = False
+                    def _guarded_on_start():
+                        nonlocal _on_start_fired
+                        if not _on_start_fired:
+                            _on_start_fired = True
+                            if item.on_start:
+                                item.on_start()
+                    self._tts.speak(item.text, on_playback_start=_guarded_on_start)
                 except Exception as exc:
                     logger.error("TTSQueue: speak() failed: %s", exc)
-                    # Still fire on_start so speech bubble shows
-                    if item.on_start:
+                    # Still fire on_start so speech bubble shows (if not already fired)
+                    if item.on_start and not _on_start_fired:
                         try:
                             item.on_start()
                         except Exception:

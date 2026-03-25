@@ -268,6 +268,11 @@ class VisionProvider:
             y = data.get("y")
             if x is None or y is None:
                 return None
+            try:
+                x = float(x)
+                y = float(y)
+            except (TypeError, ValueError):
+                return None
 
             # Scale from image coordinates to real screen coordinates
             orig_w, orig_h = original_size

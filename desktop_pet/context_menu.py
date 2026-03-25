@@ -81,8 +81,22 @@ def _save_yaml_value(key_path: str, value, config_path: str = "config.yaml") -> 
                 indent = len(line) - len(line.lstrip())
                 prefix = " " * indent + f"{key}: "
 
-                # Preserve inline comment
-                comment_idx = line.find("#")
+                # Preserve inline comment (# preceded by whitespace, not inside quotes)
+                comment = ""
+                # Find # that's preceded by whitespace and not inside quotes
+                in_quote = False
+                quote_char = None
+                comment_idx = -1
+                for ci, ch in enumerate(line):
+                    if ch in ('"', "'") and not in_quote:
+                        in_quote = True
+                        quote_char = ch
+                    elif ch == quote_char and in_quote:
+                        in_quote = False
+                        quote_char = None
+                    elif ch == '#' and not in_quote and ci > 0 and line[ci-1] in (' ', '\t'):
+                        comment_idx = ci
+                        break
                 if comment_idx > 0 and comment_idx > len(prefix):
                     comment = line[comment_idx:].rstrip("\n")
                     new_line = f"{prefix}{yaml_val}"
@@ -162,6 +176,32 @@ def _save_yaml_list(key_path: str, values: list, config_path: str = "config.yaml
                 break
 
         if not found_key:
+            # Key doesn't exist — find section and insert
+            in_sec = False
+            sec_end = len(lines)
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if not stripped.startswith("#") and (stripped == f"{section}:" or stripped.startswith(f"{section}:")):
+                    in_sec = True
+                    continue
+                if in_sec and stripped and not line[0].isspace() and ":" in stripped:
+                    sec_end = i
+                    break
+            if in_sec or sec_end < len(lines):
+                # Section exists — insert key + list items at section boundary
+                new_lines = [f"  {key}:\n"]
+                for v in values:
+                    new_lines.append(f'    - "{v}"\n')
+                for nl in reversed(new_lines):
+                    lines.insert(sec_end, nl)
+            else:
+                # Section doesn't exist — append
+                if lines and not lines[-1].endswith("\n"):
+                    lines[-1] += "\n"
+                lines.append(f"\n{section}:\n  {key}:\n")
+                for v in values:
+                    lines.append(f'    - "{v}"\n')
+            path.write_text("".join(lines), encoding="utf-8")
             return
 
         indent = len(lines[key_line]) - len(lines[key_line].lstrip())

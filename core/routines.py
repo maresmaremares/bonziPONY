@@ -295,7 +295,7 @@ class RoutineManager:
         elif r.schedule == "daily":
             return f"Daily at {r.time}"
         elif r.schedule == "weekly":
-            return f"Every {r.day.title()} at {r.time}"
+            return f"Every {r.day.title() if r.day else '?'} at {r.time}"
         elif r.schedule == "interval":
-            return f"Every {r.interval_hours:.0f}h"
+            return f"Every {r.interval_hours:.0f}h" if r.interval_hours else "Recurring"
         return r.schedule

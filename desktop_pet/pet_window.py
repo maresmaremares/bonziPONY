@@ -297,16 +297,23 @@ class PetWindow(QWidget):
         h_sign = 1 if self._facing_right else -1
         v_sign = random.choice([-1, 1])
 
+        def _snap(val: float) -> int:
+            """Round to int, but ensure at least 1px in the intended direction."""
+            r = int(round(val))
+            if r == 0 and val != 0.0:
+                return 1 if val > 0 else -1
+            return r
+
         if movement == MovementType.HORIZONTAL_ONLY:
-            return int(speed * h_sign), 0
+            return _snap(speed * h_sign), 0
         elif movement == MovementType.VERTICAL_ONLY:
-            return 0, int(speed * v_sign)
+            return 0, _snap(speed * v_sign)
         elif movement == MovementType.DIAGONAL_VERTICAL:
-            return int(speed * h_sign * 0.3), int(speed * v_sign)
+            return _snap(speed * h_sign * 0.3), _snap(speed * v_sign)
         elif movement == MovementType.DIAGONAL_HORIZONTAL:
-            return int(speed * h_sign), int(speed * v_sign * 0.3)
+            return _snap(speed * h_sign), _snap(speed * v_sign * 0.3)
         elif movement == MovementType.ALL:
-            return int(speed * h_sign), int(speed * v_sign)
+            return _snap(speed * h_sign), _snap(speed * v_sign)
         else:
             return 0, 0
 
@@ -672,6 +679,9 @@ class PetWindow(QWidget):
 
     def mouseDoubleClickEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
+            # Cancel any drag state from the first press
+            self._dragging = False
+            self.setCursor(QCursor(Qt.ArrowCursor))
             from PyQt5.QtWidgets import QInputDialog, QLineEdit
             text, ok = QInputDialog.getText(
                 self, "Talk to the pony",

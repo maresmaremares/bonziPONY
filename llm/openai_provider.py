@@ -54,7 +54,7 @@ class OpenAIProvider(LLMProvider):
                 return self._client.chat.completions.create(**kwargs)
             except Exception as exc:
                 status = getattr(exc, "status_code", None)
-                retryable = status is not None and status >= 400
+                retryable = status is not None and (status >= 500 or status == 429)
                 if not retryable:
                     retryable = isinstance(exc, (ConnectionError, TimeoutError, OSError))
                 if retryable and attempt < _MAX_RETRIES - 1:

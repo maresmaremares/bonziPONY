@@ -302,7 +302,7 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
         ),
         conversation=ConversationConfig(
             timeout_s=conv_raw.get("timeout_s", 60.0),
-            listen_timeout_s=conv_raw.get("listen_timeout_s", 8.0),
+            listen_timeout_s=conv_raw.get("listen_timeout_s", 4.0),
             random_speech_chance=conv_raw.get("random_speech_chance", 0.001),
         ),
         vision=VisionConfig(

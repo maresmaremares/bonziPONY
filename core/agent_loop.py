@@ -15,7 +15,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from core.config_loader import AgentConfig
@@ -224,7 +224,7 @@ class AgentLoop:
         self._timeline = timeline      # shared event timeline
 
         self.directives: List[Directive] = []
-        self._action_log: List[str] = []         # recent actions, capped at 15
+        self._action_log: List[Tuple[float, str]] = []  # (monotonic_ts, description), capped at 15
         self._next_idle_check_at: float = time.monotonic() + 10.0  # for self-initiation/spontaneous
         self._last_self_check: float = 0.0
         self._next_spontaneous: float = time.monotonic() + random.uniform(
@@ -251,6 +251,7 @@ class AgentLoop:
     _GAME_CLASS_PATTERNS = (
         "unreal", "unity", "sdl_app", "glfw", "pygame", "godot",
         "unrealwindow", "launchunreal",
+        "allegro", "source engine", "cryengine", "gamemaker", "renpy",
     )
 
     _WORK_EXES = frozenset({
@@ -1141,6 +1142,12 @@ class AgentLoop:
             while self._enforcement.active:
                 lockdown_round += 1
 
+                if self._stopped or lockdown_round > 30:
+                    logger.warning("Enforcement lockdown ending after %d rounds (stopped=%s)",
+                                   lockdown_round, self._stopped)
+                    self._enforcement.active = False
+                    break
+
                 # Minimize all windows
                 if self._desktop:
                     self._desktop.minimize_all_windows()
@@ -1494,8 +1501,10 @@ class AgentLoop:
         if self._action_log:
             lines.append("")
             lines.append("YOUR RECENT ACTIONS:")
-            for entry in self._action_log[-5:]:
-                lines.append(f"- {entry}")
+            now = time.monotonic()
+            for ts, desc in self._action_log[-5:]:
+                elapsed = self._fmt_duration(now - ts)
+                lines.append(f"- {elapsed}: {desc}")
 
         # Instructions
         chaos_roll = random.randint(1, 100)
@@ -1929,12 +1938,6 @@ class AgentLoop:
         "kongregate", "newgrounds", "armor games", "miniclip", "poki",
     ]
 
-    # Window class names commonly used by game engines
-    _GAME_CLASS_PATTERNS: List[str] = [
-        "unrealwindow", "sdl_app", "unity", "godot", "pygame",
-        "glfw", "allegro", "source engine", "cryengine",
-        "gamemaker", "renpy",
-    ]
 
     def _is_likely_distraction(self, state: "ScreenState") -> bool:
         """Dynamically detect if the foreground window is a distraction.
@@ -2417,8 +2420,6 @@ class AgentLoop:
         if not text:
             return
         try:
-            if self._detector:
-                self._detector.pause()
             if self._on_state_change:
                 self._on_state_change("SPEAK")
             def _show_bubble():
@@ -2435,7 +2436,17 @@ class AgentLoop:
                         on_start=_show_bubble,
                     )
                 else:
-                    self._tts.speak(text, on_playback_start=_show_bubble)
+                    # Direct TTS — pause detector during playback
+                    if self._detector:
+                        self._detector.pause()
+                    try:
+                        self._tts.speak(text, on_playback_start=_show_bubble)
+                    finally:
+                        if self._detector:
+                            try:
+                                self._detector.resume()
+                            except Exception:
+                                pass
             else:
                 _show_bubble()
             if self._timeline:
@@ -2444,11 +2455,6 @@ class AgentLoop:
         finally:
             if self._on_state_change:
                 self._on_state_change("IDLE")
-            if self._detector:
-                try:
-                    self._detector.resume()
-                except Exception:
-                    pass
 
     # ── Watch mode reactions ─────────────────────────────────────────────
 
@@ -2646,16 +2652,9 @@ class AgentLoop:
 
     def _log_action(self, description: str) -> None:
         """Record an action for context in future ticks."""
-        elapsed = self._fmt_duration(0)  # "just now"
-        self._action_log.append(f"{elapsed}: {description}")
+        self._action_log.append((time.monotonic(), description))
         if len(self._action_log) > 15:
             self._action_log = self._action_log[-15:]
-        # Update timestamps to relative
-        self._refresh_action_timestamps()
-
-    def _refresh_action_timestamps(self) -> None:
-        """Noop for now — timestamps are set at creation time."""
-        pass
 
     @staticmethod
     def _extract_json(text: str) -> Optional[str]:
