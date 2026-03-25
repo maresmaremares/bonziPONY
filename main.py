@@ -768,6 +768,15 @@ def main() -> None:
             _ptt_last_press = time.monotonic()
             _ptt_stop.clear()
             _ptt_result_ready.clear()
+            # Immediately stop any TTS playback so the user isn't talking
+            # over the pony.  This also flushes pending queue items.
+            if tts_queue:
+                tts_queue.interrupt()
+            # Hide speech bubble so it's clear the pony stopped talking
+            try:
+                speech_bubble.hide_bubble()
+            except Exception:
+                pass
             # Pause wake word detector IMMEDIATELY so it doesn't also fire on
             # "hey dash" spoken while PTT is held (race condition: wake word
             # would detect before the recording thread could pause it)

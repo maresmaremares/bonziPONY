@@ -137,12 +137,33 @@ class TTSQueue:
         dropped = 0
         while True:
             try:
-                self._queue.get_nowait()
+                item = self._queue.get_nowait()
+                # Fire on_done so any blocking waiters unblock
+                if item.on_done:
+                    try:
+                        item.on_done()
+                    except Exception:
+                        pass
                 dropped += 1
             except queue.Empty:
                 break
         if dropped:
             logger.info("TTSQueue: flushed %d pending items.", dropped)
+
+    def interrupt(self) -> None:
+        """Stop current playback and flush pending items.
+
+        Called when the user presses PTT — immediately silences the pony
+        so the user can speak.
+        """
+        self.flush()
+        # Stop the audio that's currently playing
+        if hasattr(self._tts, "stop"):
+            try:
+                self._tts.stop()
+            except Exception:
+                pass
+        logger.debug("TTSQueue: interrupted.")
 
     def stop(self) -> None:
         """Shut down the consumer thread.  Drains remaining items first."""

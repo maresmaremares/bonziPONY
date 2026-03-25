@@ -192,3 +192,11 @@ class OpenAICompatibleTTS:
         sd.play(audio_f32, **play_kwargs)
         sd.wait()
         logger.debug("TTS playback complete.")
+
+    @staticmethod
+    def stop() -> None:
+        """Immediately stop any playing audio (e.g. user pressed PTT)."""
+        try:
+            sd.stop()
+        except Exception:
+            pass
