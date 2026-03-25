@@ -29,6 +29,11 @@ _TURN_PROMPT_TEMPLATE = (
     "{log_block}\n\n"
     "It's your turn. You can respond naturally, or say [PASS] if you have nothing to add.\n"
     "Keep it short — 1-2 sentences, like real banter between friends.\n"
+    "IMPORTANT: Do NOT make up things you can't actually see or know right now. "
+    "Only reference real things: your conversation history, things the user told you, "
+    "or what you've actually observed. Do NOT describe imaginary weather, clouds, scenery, etc.\n"
+    "Be yourself — not a caricature. Avoid leaning into your most stereotypical trait "
+    "in every single line. Real people don't do that.\n"
     "Do NOT include any tags like [CONVO:...] — just speak naturally.)"
 )
 
@@ -38,14 +43,22 @@ _PIGGYBACK_PROMPT_TEMPLATE = (
     "[{speaker}]: \"{response_text}\"\n\n"
     "You overheard this. If you want to jump in with a quick comment, go for it.\n"
     "Otherwise say [PASS]. Keep it short — one sentence max.\n"
+    "Be yourself — not a walking stereotype. Say what YOU would actually say, "
+    "not what a parody of you would say.\n"
     "Do NOT include any tags like [CONVO:...] — just speak naturally.)"
 )
 
 _SPONTANEOUS_PROMPT_TEMPLATE = (
     "(You're hanging out on the desktop with {companions}. "
-    "Say something casual to start a conversation — a random thought, "
-    "a comment about what's on screen, a question, whatever feels natural. "
+    "Say something casual to start a conversation — bring up something from "
+    "a previous chat, ask what they've been up to, share a thought about "
+    "something real that happened, or ask about the user. "
     "Keep it short — 1-2 sentences max.\n"
+    "IMPORTANT: Do NOT make up things you can't see. You don't have screen access "
+    "right now, so don't describe weather, clouds, scenery, or anything visual. "
+    "Stick to things you actually know.\n"
+    "Be a real character, not a caricature. Don't lean into your most obvious trait "
+    "every single time — real ponies have range.\n"
     "Do NOT include any tags like [CONVO:...] — just speak naturally.)"
 )
 
