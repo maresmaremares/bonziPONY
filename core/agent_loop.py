@@ -145,6 +145,41 @@ class Directive:
     last_nag_style: str = ""           # one-word label of last nag approach (avoid repeating)
 
 
+# ── Standing rules: permanent, auto-detecting enforcement ─────────────────
+#
+# Unlike regular directives (which the LLM decides when to nag about),
+# standing rules use CODE to detect violations in window titles every tick.
+# They can't be "completed" — they're permanent behavioral rules.
+
+@dataclass
+class StandingRule:
+    """A permanent rule that auto-enforces when detected in window titles."""
+    id: str                          # unique identifier
+    description: str                 # e.g. "quit porn", "stop buying CS2 items"
+    category: str                    # "nsfw", "spending", "custom"
+    custom_patterns: List[str] = field(default_factory=list)  # extra patterns for this rule
+    response: str = "close_and_nag"  # "close_and_nag", "nag", "lockdown"
+    catch_count: int = 0
+    last_triggered_at: float = 0.0   # monotonic
+    cooldown_s: float = 30.0         # min seconds between triggers
+
+
+# ── LLM prompt to generate detection patterns for a standing rule ─────────
+_PATTERN_GEN_PROMPT = """\
+The user wants to block: "{description}"
+
+Generate a comprehensive list of LOWERCASE search patterns (substrings) that would \
+appear in browser tab titles or application window titles when the user is violating \
+this rule. Include:
+- Website domain names (e.g. "pornhub", "reddit.com")
+- Common page-title keywords (e.g. "shopping cart", "checkout")
+- Slang, abbreviations, subreddit names, app names — anything relevant
+- Be EXTREMELY thorough — the user will try to find workarounds
+
+Output ONLY the patterns, one per line. No numbering, no explanations, no headers. \
+Just raw lowercase patterns. Aim for 50-200 patterns depending on the category."""
+
+
 @dataclass
 class EnforcementMode:
     """Tracks enforcement — verifying user actually went to do their task."""
@@ -235,15 +270,19 @@ class AgentLoop:
         self._enforcement = EnforcementMode()
         self._enforcement_just_completed = False  # suppress welcome-back after enforcement
         self._directives_cleared_at: float = 0.0  # suppress re-creation after clear
+        self._recently_completed_goals: List[Tuple[float, str]] = []  # (monotonic_ts, goal_lower) — suppress re-creation
         self._stopped: bool = False
         self._mess_mouse_count: int = 0  # grows duration each trigger
         self._last_wake_event: Optional[str] = None  # set by tick(), consumed by _check_routines()
+
+        # Standing rules — permanent, code-enforced behavioral rules
+        self._standing_rules: List[StandingRule] = []
 
         # Recurring routines (persistent across restarts)
         from core.routines import RoutineManager
         self.routine_manager = RoutineManager()
 
-        # Load persistent state (directives, enforcement, timers)
+        # Load persistent state (directives, enforcement, timers, standing rules)
         self._load_directives()
 
     # ── Activity classification ─────────────────────────────────────────────
@@ -321,10 +360,20 @@ class AgentLoop:
                 # Restore next_nag_at from offset (monotonic doesn't persist)
                 offset = dd.get("next_nag_offset_s", 0)
                 nag_at = now + max(0, offset)
+                # Restore real age from wall-clock created_at
+                created_wall = dd.get("created_at_wall")
+                if created_wall:
+                    try:
+                        age_s = (datetime.now() - datetime.fromisoformat(created_wall)).total_seconds()
+                        created_at = now - max(0, age_s)
+                    except Exception:
+                        created_at = now
+                else:
+                    created_at = now
                 d = Directive(
                     goal=dd["goal"],
                     urgency=dd.get("urgency", 5),
-                    created_at=now,   # monotonic doesn't persist; reset to now
+                    created_at=created_at,
                     last_action_at=now,
                     next_nag_at=nag_at,
                     source=dd.get("source", "user"),
@@ -363,8 +412,23 @@ class AgentLoop:
                     else:
                         logger.info("Enforcement expired while offline — skipping.")
 
+            # Restore standing rules
+            for sr in data.get("standing_rules", []):
+                rule = StandingRule(
+                    id=sr["id"],
+                    description=sr["description"],
+                    category=sr.get("category", "custom"),
+                    custom_patterns=sr.get("custom_patterns", []),
+                    response=sr.get("response", "close_and_nag"),
+                    catch_count=sr.get("catch_count", 0),
+                    cooldown_s=sr.get("cooldown_s", 30.0),
+                )
+                self._standing_rules.append(rule)
+
             if self.directives:
                 logger.info("Restored %d directive(s) from disk.", len(self.directives))
+            if self._standing_rules:
+                logger.info("Restored %d standing rule(s) from disk.", len(self._standing_rules))
         except Exception as exc:
             logger.warning("Failed to load directives: %s", exc)
 
@@ -374,6 +438,9 @@ class AgentLoop:
             dirs = []
             now = time.monotonic()
             for d in self.directives:
+                # Convert monotonic created_at to wall-clock for persistence
+                age_s = now - d.created_at
+                created_wall = datetime.now().timestamp() - age_s
                 dirs.append({
                     "goal": d.goal,
                     "urgency": d.urgency,
@@ -384,6 +451,7 @@ class AgentLoop:
                     "delayed": d.delayed,
                     "nag_count": d.nag_count,
                     "last_nag_style": d.last_nag_style,
+                    "created_at_wall": datetime.fromtimestamp(created_wall).isoformat(),
                 })
 
             enf_data = None
@@ -402,9 +470,23 @@ class AgentLoop:
                     "checkin_count": self._enforcement.checkin_count,
                 }
 
+            # Standing rules
+            sr_data = []
+            for sr in self._standing_rules:
+                sr_data.append({
+                    "id": sr.id,
+                    "description": sr.description,
+                    "category": sr.category,
+                    "custom_patterns": sr.custom_patterns,
+                    "response": sr.response,
+                    "catch_count": sr.catch_count,
+                    "cooldown_s": sr.cooldown_s,
+                })
+
             data = {
                 "directives": dirs,
                 "enforcement": enf_data,
+                "standing_rules": sr_data,
                 "saved_at": datetime.now().isoformat(),
             }
             _DIRECTIVES_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -441,13 +523,27 @@ class AgentLoop:
         instead of using the default urgency-based delay. This is for things the user
         mentioned needing to do LATER, not RIGHT NOW.
         """
+        goal = self._clean_goal(goal)
+        urgency = max(1, min(10, urgency))
+
         if len(self.directives) >= self._config.max_directives:
             logger.warning("Max directives reached (%d) — ignoring new directive.", self._config.max_directives)
             return
-        goal = self._clean_goal(goal)
-        urgency = max(1, min(10, urgency))
-        # Deduplicate: skip if a directive with the same goal (case-insensitive) exists
         goal_lower = goal.lower().strip()
+
+        # Block re-creation of recently completed directives (5 min cooldown)
+        now = time.monotonic()
+        self._recently_completed_goals = [
+            (ts, g) for ts, g in self._recently_completed_goals
+            if (now - ts) < 300.0
+        ]
+        for ts, completed_goal in self._recently_completed_goals:
+            if (goal_lower in completed_goal or completed_goal in goal_lower):
+                logger.info("Blocked re-creation of recently completed directive %r "
+                            "(completed %.0fs ago)", goal, now - ts)
+                return
+
+        # Deduplicate: skip if a directive with the same goal (case-insensitive) exists
         for existing in self.directives:
             if existing.goal.lower().strip() == goal_lower:
                 # Update urgency if the new one is higher
@@ -474,6 +570,60 @@ class AgentLoop:
             from core.event_timeline import EventType
             self._timeline.append(EventType.DIRECTIVE_CREATED,
                                   f'Directive created: "{goal}" (urgency {urgency}, source: {source}{delay_str})')
+
+    def add_standing_rule(self, description: str, category: str,
+                         custom_patterns: List[str] = None,
+                         response: str = "close_and_nag") -> None:
+        """Add a permanent standing rule that auto-enforces via window title detection.
+
+        Standing rules are separate from regular directives — they can't be
+        "completed" and they check window titles every tick using code, not the LLM.
+        """
+        # Deduplicate: skip if same description (case-insensitive) already exists
+        desc_lower = description.lower().strip()
+        for existing in self._standing_rules:
+            if existing.description.lower().strip() == desc_lower:
+                logger.info("Standing rule %r already exists — skipping.", description)
+                return
+        # Also skip if same category already exists (only one NSFW rule needed)
+        for existing in self._standing_rules:
+            if existing.category == category and category != "custom":
+                logger.info("Standing rule for category %r already exists (%r) — skipping.",
+                            category, existing.description)
+                return
+
+        rule_id = f"{category}_{int(time.time())}"
+        rule = StandingRule(
+            id=rule_id,
+            description=description,
+            category=category,
+            custom_patterns=custom_patterns or [],
+            response=response,
+        )
+        self._standing_rules.append(rule)
+        self.save_directives()
+        logger.info("Standing rule added [%s]: %r (response: %s, patterns: %s)",
+                     category, description, response, custom_patterns or "built-in")
+        print(f"[STANDING RULE] Created: \"{description}\" (category: {category})", flush=True)
+
+        if self._timeline:
+            from core.event_timeline import EventType
+            self._timeline.append(EventType.DIRECTIVE_CREATED,
+                                  f'Standing rule: "{description}" (category: {category})')
+
+    @property
+    def standing_rules(self) -> List[StandingRule]:
+        return list(self._standing_rules)
+
+    def remove_standing_rule(self, rule_id: str) -> bool:
+        """Remove a standing rule by ID. Returns True if found and removed."""
+        for i, rule in enumerate(self._standing_rules):
+            if rule.id == rule_id:
+                removed = self._standing_rules.pop(i)
+                self.save_directives()
+                logger.info("Standing rule removed: %r", removed.description)
+                return True
+        return False
 
     def add_timer(self, time_str: str, action: str) -> None:
         """Add a time-triggered directive (fires at a specific wall-clock time)."""
@@ -727,7 +877,7 @@ class AgentLoop:
     # ── Enforcement interaction (LLM-driven, temporally-aware) ──────────
 
     def _enforcement_auto_complete(self, away_seconds: float) -> None:
-        """User was away >= 70% of expected time — assume they did it. Welcome warmly."""
+        """User was away >= 50% of expected time — assume they did it. Welcome warmly."""
         goal = self._enforcement.directive_goal
         name = get_character_name()
         dur_str = self._fmt_duration(away_seconds)
@@ -758,7 +908,7 @@ class AgentLoop:
             self._timeline.set_user_intent(None)
 
     def _enforcement_casual_checkin(self, away_seconds: float) -> None:
-        """User was away 30-70% of expected time. Ask casually, not suspiciously."""
+        """User was away 20-50% of expected time. Ask casually, not suspiciously."""
         goal = self._enforcement.directive_goal
         name = get_character_name()
         dur_str = self._fmt_duration(away_seconds)
@@ -783,17 +933,15 @@ class AgentLoop:
 
             response = self._enforcement_listen()
             if response is None:
-                # No response — benefit of the doubt, they were gone a reasonable time
+                # No response — don't auto-complete, keep enforcement active.
+                # They were gone a reasonable time but we can't confirm they did it.
+                self._enforcement.caught_count += 1
                 self._llm.inject_history(
-                    f"(Enforcement for \"{goal}\": you asked how it went, no response.)",
+                    f"(Enforcement for \"{goal}\": you asked how it went, no response. "
+                    f"Keeping enforcement active — can't confirm completion without a response.)",
                     text,
                 )
-                self._enforcement_complete(text)
-                if self._timeline:
-                    from core.event_timeline import EventType
-                    self._timeline.append(EventType.ENFORCEMENT_COMPLETE,
-                                          f"Task completed (no response, reasonable absence): {goal}")
-                    self._timeline.set_user_intent(None)
+                logger.info("Enforcement casual checkin: no response, keeping enforcement active")
                 return
 
             # Classify response — distinguish "did it" from "going to do it"
@@ -880,9 +1028,15 @@ class AgentLoop:
             response = self._enforcement_listen()
             if response is None:
                 self._llm.inject_history(
-                    f"(Enforcement: you called out user about \"{goal}\", no response.)",
+                    f"(Enforcement: you called out user about \"{goal}\", no response. "
+                    f"This is ignored-ask #{caught_count}.)",
                     ask_text,
                 )
+                # Skeptical + no response: escalate to lockdown after 2+ catches
+                if caught_count >= 2:
+                    logger.info("Enforcement skeptical: %d ignored asks — lockdown",
+                                caught_count)
+                    self._enforcement_lockdown()
                 return
 
             # Inject the exchange so pony remembers
@@ -974,11 +1128,18 @@ class AgentLoop:
             # Open mic and listen for response
             response = self._enforcement_listen()
             if response is None:
-                logger.info("Enforcement: no response to ask-if-done")
+                logger.info("Enforcement: no response to ask-if-done (catch #%d)",
+                            caught_count)
                 self._llm.inject_history(
-                    f"(Enforcement: you asked about \"{goal}\", no response.)",
+                    f"(Enforcement: you asked about \"{goal}\", no response. "
+                    f"This is ignored-ask #{caught_count}.)",
                     ask_text,
                 )
+                # After 3+ ignored asks, treat silence as refusal → lockdown
+                if caught_count >= 3:
+                    logger.info("Enforcement: %d ignored asks — escalating to lockdown",
+                                caught_count)
+                    self._enforcement_lockdown()
                 return
 
             logger.info("Enforcement response: %r", response)
@@ -1079,6 +1240,9 @@ class AgentLoop:
                 self.directives.pop(i)
                 logger.info("Enforcement completed: %r", goal)
                 break
+        # Track so LLM doesn't re-create it
+        self._recently_completed_goals.append(
+            (time.monotonic(), goal.lower().strip()))
         self._enforcement = EnforcementMode()
         self._enforcement_just_completed = True  # suppress welcome-back
         self._hide_countdown()
@@ -1310,6 +1474,11 @@ class AgentLoop:
             else:
                 self._welcome_back(away_dur)
 
+        # Standing rules run ALWAYS — even during conversation or enforcement.
+        # They're passive detection: check window titles and react immediately.
+        if self._standing_rules and state and not self.routine_manager.is_user_away:
+            self._check_standing_rules(state)
+
         # Enforcement runs even during conversation for idle TRACKING, but
         # don't poll/react during active conversation (user IS at keyboard talking to Dash)
         if self._enforcement.active:
@@ -1372,6 +1541,155 @@ class AgentLoop:
                 self._next_spontaneous - now + 1.0,
             )
 
+    # ── Standing rule enforcement ──────────────────────────────────────────
+
+    def _check_standing_rules(self, state: "ScreenState") -> None:
+        """Check all window titles against standing rules. Runs every tick (~1s).
+
+        This is CODE-driven detection, not LLM-driven. It matches window titles
+        against known patterns (NSFW sites, spending sites, custom keywords) and
+        reacts immediately — closing the offending window and speaking.
+        """
+        now = time.monotonic()
+
+        # Build lowercase title list once (shared across all rules)
+        all_titles = []
+        for w in state.open_windows:
+            if w.title and w.title.strip():
+                all_titles.append((w.title, w.title.lower()))
+
+        for rule in self._standing_rules:
+            # Cooldown: don't re-trigger within cooldown_s
+            if (now - rule.last_triggered_at) < rule.cooldown_s:
+                continue
+
+            matched = self._match_standing_rule(rule, all_titles)
+            if matched:
+                self._trigger_standing_rule(rule, matched, state)
+
+    def _match_standing_rule(self, rule: StandingRule,
+                             all_titles: List[Tuple[str, str]]) -> Optional[str]:
+        """Check if any window title violates a standing rule.
+
+        Returns the original (un-lowered) title of the first match, or None.
+        """
+        for original_title, title_lower in all_titles:
+            # Category-specific detection
+            if rule.category == "nsfw" and _is_nsfw_title(title_lower):
+                return original_title
+            if rule.category == "spending" and _is_spending_title(title_lower, rule.custom_patterns):
+                return original_title
+
+            # Custom patterns (always checked, any category)
+            for pat in rule.custom_patterns:
+                if pat.lower() in title_lower:
+                    return original_title
+
+        return None
+
+    def _trigger_standing_rule(self, rule: StandingRule, matched_title: str,
+                               state: "ScreenState") -> None:
+        """React to a standing rule violation: close the window, speak, escalate."""
+        rule.catch_count += 1
+        rule.last_triggered_at = time.monotonic()
+        self.save_directives()
+
+        logger.info("STANDING RULE TRIGGERED: %r (catch #%d, matched: %r)",
+                     rule.description, rule.catch_count, matched_title[:80])
+        print(f"[STANDING RULE] Caught #{rule.catch_count}: \"{matched_title[:60]}\" "
+              f"(rule: {rule.description})", flush=True)
+
+        if self._timeline:
+            from core.event_timeline import EventType
+            self._timeline.append(
+                EventType.DIRECTIVE_CREATED,
+                f'Standing rule triggered: "{rule.description}" — '
+                f'caught: "{matched_title[:60]}" (#{rule.catch_count})')
+
+        # ── Step 1: Close the offending window/tab ──
+        closed = False
+        if self._desktop and rule.response in ("close_and_nag", "lockdown"):
+            try:
+                # Try closing by exact title match first
+                closed = self._desktop.close_window_by_title(matched_title)
+                if not closed:
+                    # Try partial match
+                    for w in state.open_windows:
+                        if w.title == matched_title:
+                            closed = self._desktop.close_window_by_title(w.title[:40])
+                            break
+                if closed:
+                    self._log_action(f"Closed window: \"{matched_title[:50]}\"")
+            except Exception as exc:
+                logger.warning("Failed to close window for standing rule: %s", exc)
+
+        # ── Step 2: Speak — LLM-generated reaction ──
+        name = get_character_name()
+        # Truncate title to avoid leaking explicit content into TTS
+        safe_title = matched_title[:30] + "..." if len(matched_title) > 30 else matched_title
+        try:
+            if rule.catch_count <= 1:
+                prompt = (
+                    f"You are {name}. You just caught the user breaking their rule: "
+                    f"'{rule.description}'. You closed the tab they were on. "
+                    f"React — be direct and disappointed. ONE sentence, in character."
+                )
+            elif rule.catch_count <= 3:
+                prompt = (
+                    f"You are {name}. You caught the user AGAIN — catch #{rule.catch_count} "
+                    f"breaking '{rule.description}'. You closed it. "
+                    f"Be angry/disappointed. They keep doing this. ONE sentence."
+                )
+            else:
+                prompt = (
+                    f"You are {name}. Catch #{rule.catch_count} for '{rule.description}'. "
+                    f"At this point you're furious. ONE sentence. Be brutal."
+                )
+            nag = self._llm.generate_once(prompt, max_tokens=80)
+            nag = self._strip_think(nag).strip().strip('"')
+        except Exception:
+            nag = None
+
+        if not nag:
+            nag = f"seriously? i literally JUST closed that. {rule.description}."
+        self._speak(nag)
+        self._log_action(f"Standing rule: \"{rule.description}\" catch #{rule.catch_count}")
+
+        # ── Step 3: Escalate on repeated violations ──
+        if rule.catch_count >= 3 and self._desktop:
+            # After 3+ catches: also minimize everything
+            try:
+                self._desktop.alt_tab()  # Win+D — minimize all
+                self._log_action("Minimized all windows (repeated standing rule violation)")
+            except Exception:
+                pass
+
+        if rule.catch_count >= 5 and self._desktop:
+            # After 5+ catches: lock mouse briefly
+            try:
+                import ctypes
+                import ctypes.wintypes
+                mon = self._desktop._get_monitor_rect()
+                cx = mon.left + mon.width // 2
+                cy = mon.top + mon.height // 2
+                rect = ctypes.wintypes.RECT(cx, cy, cx + 1, cy + 1)
+                ctypes.windll.user32.ClipCursor(ctypes.byref(rect))
+                self._log_action(f"Locked mouse (standing rule catch #{rule.catch_count})")
+                time.sleep(min(5.0 + rule.catch_count, 30.0))
+            except Exception:
+                pass
+            finally:
+                try:
+                    ctypes.windll.user32.ClipCursor(None)
+                except Exception:
+                    pass
+
+        if rule.catch_count >= 7 and self._on_grab_cursor:
+            # After 7+ catches: grab cursor and run with it
+            duration = min(15.0 + rule.catch_count * 3.0, 60.0)
+            self._on_grab_cursor(duration)
+            self._log_action(f"Grabbed cursor ({duration:.0f}s) — standing rule escalation")
+
     # ── Core tick execution ────────────────────────────────────────────────
 
     def _execute_tick(self) -> None:
@@ -1380,6 +1698,13 @@ class AgentLoop:
             state = self._monitor.get_state()
             directives_str = ", ".join(f'"{d.goal}" (urg {d.urgency})' for d in self.directives)
             print(f"\n[Agent] Directive tick — active: {directives_str}", flush=True)
+
+            # Snapshot which directives are due BEFORE the LLM call and timing updates
+            now_pre = time.monotonic()
+            actionable = [d for d in self.directives
+                          if not (d.trigger_time and not d.triggered)]
+            due_set = {id(d) for d in actionable if d.next_nag_at <= now_pre}
+
             prompt = self._build_tick_prompt(state)
 
             logger.debug("Agent tick prompt: %s", prompt[:200])
@@ -1387,17 +1712,21 @@ class AgentLoop:
             logger.debug("Agent tick response: %s", raw[:300])
 
             decision = self._parse_decision(raw)
-            self._execute_decision(decision, state)
+            self._execute_decision(decision, state, due_set)
 
             # Apply per-directive timings from LLM
             now_m = time.monotonic()
+            # Re-fetch actionable in case _execute_decision removed one
             actionable = [d for d in self.directives
                           if not (d.trigger_time and not d.triggered)]
             for i, d in enumerate(actionable):
                 key = str(i)
-                d.nag_count += 1
+                was_due = id(d) in due_set
                 if key in decision.directive_timings:
                     timing = decision.directive_timings[key]
+                    # Only bump nag_count if this directive was actually due
+                    if was_due:
+                        d.nag_count += 1
                     nag_min = float(timing.get("next_nag_minutes", 10))
                     # Hard floor: never nag more often than every 3 minutes
                     # (5 minutes for low urgency directives)
@@ -1406,10 +1735,12 @@ class AgentLoop:
                     d.next_nag_at = now_m + nag_min * 60.0
                     if "urgency" in timing:
                         d.urgency = max(1, min(10, int(timing["urgency"])))
-                else:
-                    # LLM didn't mention this directive — default 10 min
-                    if d.next_nag_at <= now_m:
-                        d.next_nag_at = now_m + 600.0
+                elif was_due:
+                    # Directive was due but LLM didn't mention it — default 10 min
+                    d.nag_count += 1
+                    d.next_nag_at = now_m + 600.0
+                # If directive was NOT due and LLM didn't mention it, leave
+                # its next_nag_at untouched — don't push out a future nag
             self.save_directives()
 
             timings_str = ", ".join(
@@ -1567,21 +1898,21 @@ class AgentLoop:
             f"  Chaos roll: {chaos_roll} (random 1-100, adds unpredictability)",
             "",
             "GENERAL PRINCIPLES:",
-            "- Urgency should TEND to increase over time when the user ignores a directive.",
-            "- But context matters: if they seem stressed, tired, or having a bad day, ease up.",
+            "- Urgency MUST increase when the user ignores a directive. Every 2-3 nags, bump urgency by 1-2.",
             "- If they're actively working on something productive, be patient even with pending tasks.",
-            "- If they're clearly procrastinating (endless scrolling, social media while tasks pile up), push harder.",
+            "- If they're clearly procrastinating (endless scrolling, social media while tasks pile up), push HARD.",
             "- The chaos roll adds randomness — sometimes you snap early, sometimes you let it slide.",
-            "- Vary your nag timing. Don't be predictable. 5-15 minutes between nags is the range (3 min minimum for urgency 7+).",
-            "- Some days are rest days. Not every directive needs urgency 10.",
+            "- Nag timing: 1.5-5 minutes at high urgency, 2.5-10 minutes at low urgency. Don't let things go quiet.",
+            "- You are NOT a gentle reminder app. You are an enforcer. ACT like it.",
             "",
-            "ACTION PALETTE (at your discretion based on urgency):",
+            "ACTION PALETTE — USE THESE. Talking alone is NOT enforcement:",
             f"  CHAOS ROLL: {chaos_roll}",
             "  Low urgency (1-3): speak only. Be conversational.",
-            "  Medium urgency (4-6): speak + consider shaking a window, pausing media. Use chaos roll for variety.",
-            "  High urgency (7-8): speak + ALT_TAB, MESS_MOUSE, LOCK_MOUSE. Stack actions when warranted.",
-            "  Extreme urgency (9-10): go nuclear IF the situation truly warrants it. Stack everything.",
+            "  Medium urgency (4-6): speak + DO SOMETHING: SHAKE a window, PAUSE media, MESS_MOUSE. Don't just talk.",
+            "  High urgency (7-8): speak + STACK actions: ALT_TAB + MESS_MOUSE + LOCK_MOUSE. Actually disrupt them.",
+            "  Extreme urgency (9-10): go nuclear. Stack EVERYTHING. ALT_TAB + LOCK_MOUSE + MESS_MOUSE. Make it impossible to ignore.",
             "  SHAKE does NOT work on fullscreen apps — use ALT_TAB (Win+D) instead.",
+            "  If urgency >= 5 and you ONLY return speak with no desktop_commands, you are FAILING at your job.",
             "",
             "DIRECTIVE SCOPE — READ THIS CAREFULLY:",
             "- Read each directive LITERALLY. 'stop buying CS2 items' means stop BUYING, not stop playing or browsing CS2.",
@@ -1592,11 +1923,11 @@ class AgentLoop:
             "- If the directive is about spending money, only escalate on checkout/payment screens, NOT on browsing or playing.",
             "",
             "WHAT NOT TO DO:",
-            "- Don't mechanically escalate urgency every single tick. Sometimes holding steady is right.",
-            "- Don't nag more often than every 5 minutes. Even at high urgency, 3 minutes is the hard floor.",
-            "- Don't let a directive go silent for more than 15 minutes between nags.",
+            "- Don't let urgency stagnate. If the user hasn't done it after 3+ nags, it MUST go up.",
+            "- Don't let a directive go silent for more than 10 minutes between nags.",
             "- Don't use the exact same approach twice in a row (check last_nag_style).",
             "- Don't escalate a 'stop doing X' directive just because the user is near X-related content.",
+            "- Don't be a pushover. If they're ignoring you, get in their face. That's your JOB.",
             "",
             "═════════════════════════════════════════════════════",
             "NAG VARIETY — THIS IS CRITICAL, DO NOT SKIP:",
@@ -1612,18 +1943,21 @@ class AgentLoop:
             '  EXTREMELY repetitive. The user has heard 500 of these. STOP doing them.',
             '- ANY "you\'re gonna/going to [colorful consequence]" pattern. Just stop.',
             '- Poetic/flowery language about what will happen if they don\'t do it.',
+            '- NEVER comment on the NUMBER of open windows. "you have so many windows open",',
+            '  "that\'s a lot of tabs", "look at all those windows" — this is MEANINGLESS and annoying.',
+            '  Having windows open is normal. Comment on WHAT they\'re doing, not window count.',
             "",
             "WHAT TO DO INSTEAD — genuinely different approaches:",
-            "  Nag 1-2: Don't even mention the task directly. Comment on what they're doing on screen.",
-            '    "so how long have you been on that page?" / "that looks important" (sarcastic or genuine)',
-            "  Nag 3-4: Short and blunt. No creativity needed. Just be direct and annoyed.",
-            '    "go." / "seriously?" / "still?" / "[task]. now." / "tick tock"',
-            "  Nag 5-6: Reference the SPECIFIC thing on their screen vs the task.",
-            '    "you\'ve been on discord for 20 minutes and [task] takes like 2"',
-            "  Nag 7-8: Get personal. Reference the count, the time, their pattern.",
-            '    "this is nag number 8. I\'ve been asking for 40 minutes." / "you always do this"',
-            "  Nag 9+: One word. Just the task. Or silence + actions. Or genuine frustration.",
-            '    "[task]." / just do actions with no speech / "I give up. do what you want."',
+            "  Nag 1: Comment on what they're doing. No task mention yet.",
+            '    "so how long have you been on that page?" / "that looks important" (sarcastic)',
+            "  Nag 2: Short and blunt. Direct.",
+            '    "go." / "seriously?" / "[task]. now." / "tick tock"',
+            "  Nag 3-4: Reference their screen vs the task + START USING ACTIONS (shake, mess mouse).",
+            '    "you\'ve been on discord for 20 minutes and [task] takes like 2" + SHAKE_TITLE',
+            "  Nag 5-6: Get personal + STACK ACTIONS. Reference count, time, pattern.",
+            '    "this is nag number 5. I\'ve been asking for 15 minutes." + MESS_MOUSE + ALT_TAB',
+            "  Nag 7+: Actions speak louder than words. Stack everything. Optional speech.",
+            '    "[task]." + ALT_TAB + LOCK_MOUSE + MESS_MOUSE / or just actions, no speech',
             "",
             "KEY PRINCIPLE: Short beats clever. 'go.' hits harder than a 30-word metaphor.",
             "Alternate between SHORT (1-5 words) and MEDIUM (one sentence) nags.",
@@ -1726,8 +2060,15 @@ class AgentLoop:
         logger.info("Fallback hardcoded nag (urgency %d): %s", top.urgency, speak)
         return AgentDecision(speak=speak, next_check_seconds=45.0)
 
-    def _execute_decision(self, decision: AgentDecision, state: ScreenState) -> None:
-        """Execute the agent's decision: speak, act, manage directives."""
+    def _execute_decision(self, decision: AgentDecision, state: ScreenState,
+                          due_set: set = None) -> None:
+        """Execute the agent's decision: speak, act, manage directives.
+
+        ``due_set`` (set of directive ``id()``s) identifies which directives
+        were actually due for a nag this tick.  Only those get their
+        ``last_action_at`` / ``last_nag_style`` updated so we don't corrupt
+        timing on directives that weren't addressed.
+        """
         now = time.monotonic()
 
         # ── Speak ──────────────────────────────────────────────────────────
@@ -1871,6 +2212,9 @@ class AgentLoop:
                 removed = self.directives.pop(idx)
                 self._log_action(f"Completed directive: \"{removed.goal}\"")
                 logger.info("Directive completed: %r", removed.goal)
+                # Track so LLM doesn't re-create it
+                self._recently_completed_goals.append(
+                    (time.monotonic(), removed.goal.lower().strip()))
                 # End enforcement if it was for this directive
                 if self._enforcement.active and self._enforcement.directive_goal == removed.goal:
                     self._enforcement = EnforcementMode()
@@ -1889,12 +2233,14 @@ class AgentLoop:
             if goal and not recently_cleared:
                 self.add_directive(goal, urgency, source="self", delay_minutes=delay)
 
-        # Update last_action_at and nag_style on active directives if we did something
+        # Update last_action_at and nag_style only on directives that were due
+        # (not all directives — that corrupts timing for ones we didn't nag about)
         if decision.speak or decision.actions or decision.desktop_commands:
             for d in self.directives:
-                d.last_action_at = now
-                if decision.nag_style:
-                    d.last_nag_style = decision.nag_style
+                if due_set is None or id(d) in due_set:
+                    d.last_action_at = now
+                    if decision.nag_style:
+                        d.last_nag_style = decision.nag_style
 
     # ── Self-initiation ────────────────────────────────────────────────────
 
@@ -2145,7 +2491,8 @@ class AgentLoop:
                     f"(You glanced at the user's screen. They have \"{fg}\" ({exe}{fullscreen}) open.{screen_extra} "
                     f"React in ONE short sentence as {get_character_name()}. Be natural — sometimes "
                     "comment on it, sometimes ignore it and say something random. "
-                    f"NEVER say 'that's actually kinda cool/based/neat' — use different words.{avoid_topics})"
+                    f"NEVER say 'that's actually kinda cool/based/neat' — use different words. "
+                    f"NEVER comment on how many windows are open — that's meaningless.{avoid_topics})"
                 )
             else:
                 trigger = f"(Spontaneous thought — {prompt_choice}{avoid_topics})"
@@ -2251,6 +2598,7 @@ class AgentLoop:
                 f"DO NOT auto-create directives. DO NOT nag without a directive. Be a companion, not a virus.\n"
                 f"If you speak, keep it to ONE short sentence. Be natural, not robotic.\n"
                 f"NEVER say \"that's actually kinda [cool/based/neat]\" or any variation. Find different words.\n"
+                f"NEVER comment on the number of open windows. \"you have so many windows open\" is meaningless and banned.\n"
                 f"\n"
                 f"Respond with JSON: {{\"speak\": \"text or null\", \"desktop_commands\": []}}\n"
                 f"desktop_commands options (use sparingly):\n"
@@ -2350,6 +2698,19 @@ class AgentLoop:
         if best_match:
             self.directives.remove(best_match)
             logger.info("Directive completed via user reply: %r", best_match.goal)
+
+            # Track this goal so the LLM doesn't immediately re-create it
+            self._recently_completed_goals.append(
+                (time.monotonic(), best_match.goal.lower().strip()))
+
+            # Cancel enforcement if it was for this directive
+            if (self._enforcement.active
+                    and self._enforcement.directive_goal == best_match.goal):
+                self._enforcement = EnforcementMode()
+                self._enforcement_just_completed = True
+                self._hide_countdown()
+                logger.info("Enforcement cancelled — directive completed via reply")
+
             name = get_character_name()
             ack_prompt = (
                 f"You are {name}. The user just told you they already completed '{best_match.goal}'. "

@@ -12,6 +12,45 @@ echo.
 cd /d "%~dp0"
 
 :: ══════════════════════════════════════════════════════════════
+::  AUTO-UPDATE: Pull newest version if this is a git repo
+:: ══════════════════════════════════════════════════════════════
+git --version >nul 2>&1
+if errorlevel 1 goto :skip_update
+if not exist ".git" goto :skip_update
+
+echo  Checking for updates...
+git fetch origin >nul 2>&1
+if errorlevel 1 (
+    echo  [WARN] Could not check for updates (no internet?). Continuing...
+    goto :skip_update
+)
+
+:: Check if we're behind the remote
+for /f "tokens=*" %%a in ('git rev-parse HEAD 2^>nul') do set "LOCAL=%%a"
+for /f "tokens=*" %%a in ('git rev-parse @{u} 2^>nul') do set "REMOTE=%%a"
+if "!LOCAL!"=="!REMOTE!" (
+    echo  [OK] Already up to date.
+) else (
+    echo  [!!] Update available! Pulling latest version...
+    git pull --ff-only origin 2>nul
+    if errorlevel 1 (
+        echo  [WARN] Auto-pull failed (local changes?). Trying reset...
+        git stash >nul 2>&1
+        git pull --ff-only origin 2>nul
+        if errorlevel 1 (
+            echo  [WARN] Update failed. Continuing with current version.
+            git stash pop >nul 2>&1
+        ) else (
+            echo  [OK] Updated! Stashed local changes (use "git stash pop" to restore).
+        )
+    ) else (
+        echo  [OK] Updated to latest version!
+    )
+)
+echo.
+:skip_update
+
+:: ══════════════════════════════════════════════════════════════
 ::  STEP 1: Find Python 3.10, 3.11, or 3.12
 ::  (3.13+ does NOT work — PyQt5 and torch have no wheels)
 :: ══════════════════════════════════════════════════════════════

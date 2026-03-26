@@ -237,6 +237,23 @@ def restart_application() -> None:
 
     logger.info("Restarting application: %s", " ".join(args))
 
+    # Destroy all Qt windows BEFORE launching the new process so the user
+    # never sees two ponies at once.  QApplication.instance() is None-safe.
+    try:
+        from PyQt5.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app:
+            for widget in app.topLevelWidgets():
+                try:
+                    widget.hide()
+                    widget.close()
+                    widget.deleteLater()
+                except Exception:
+                    pass
+            app.processEvents()      # flush pending deletions
+    except Exception:
+        pass
+
     # Use Popen to start the new process, then exit the current one.
     # CREATE_NEW_PROCESS_GROUP so the new process survives our exit.
     kwargs = {}

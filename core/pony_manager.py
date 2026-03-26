@@ -355,6 +355,7 @@ class PonyManager:
             f"Keep it to one sentence.\n"
             f"IMPORTANT: Only reference things you actually know or can see above. "
             f"Do NOT invent scenery or events.\n"
+            f"NEVER comment on the number of open windows — that is meaningless and banned.\n"
             f"Be yourself — not a caricature. Don't lean on your most obvious trait.\n"
             f"Say [PASS] if you have nothing worth saying right now.\n"
             f"Do NOT include any tags like [CONVO:...] — just speak naturally.)"

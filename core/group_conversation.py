@@ -57,6 +57,7 @@ _SPONTANEOUS_PROMPT_TEMPLATE = (
     "Keep it short — 1-2 sentences max.\n"
     "IMPORTANT: Only reference things you can actually see or know. "
     "Do NOT invent scenery, weather, clouds, or anything not listed above.\n"
+    "NEVER comment on the number of open windows — 'you have so many windows open' is banned and meaningless.\n"
     "Be a real character, not a caricature. Don't lean into your most obvious trait "
     "every single time — real ponies have range.\n"
     "Do NOT include any tags like [CONVO:...] — just speak naturally.)"
