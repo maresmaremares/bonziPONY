@@ -291,7 +291,7 @@ class Transcriber:
                 logger.error("Whisper transcription failed: %s", exc)
                 return None
 
-        except OSError as exc:
+        except (OSError, AttributeError) as exc:
             logger.error("Microphone error: %s", exc)
             return None
         except Exception as exc:

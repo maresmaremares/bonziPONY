@@ -7,7 +7,7 @@ import random
 import time
 from typing import Optional
 
-from PyQt5.QtCore import Qt, QPoint, QTimer, pyqtSignal, QRectF
+from PyQt5.QtCore import Qt, QPoint, QTimer, pyqtSignal, QRectF, QByteArray
 from PyQt5.QtGui import QPainter, QCursor, QColor, QPen, QBrush, QFont
 from PyQt5.QtWidgets import QApplication, QWidget, QMenu, QAction
 
@@ -126,6 +126,31 @@ class PetWindow(QWidget):
             )
         except Exception:
             pass
+
+    def _recover_after_sleep(self) -> None:
+        """Re-show and re-topmost the window after system sleep/resume."""
+        logger.info("System resume detected — recovering pony visibility.")
+        self.show()
+        self.raise_()
+        self._ensure_topmost()
+        self.update()
+
+    def nativeEvent(self, event_type: QByteArray, message):
+        """Catch Windows power broadcast events (sleep/resume)."""
+        try:
+            if event_type == b"windows_generic_MSG":
+                import ctypes.wintypes
+                msg = ctypes.wintypes.MSG.from_address(int(message))
+                WM_POWERBROADCAST = 0x0218
+                PBT_APMRESUMEAUTOMATIC = 0x0012
+                PBT_APMRESUMESUSPEND = 0x0007
+                if msg.message == WM_POWERBROADCAST and msg.wParam in (
+                    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
+                ):
+                    QTimer.singleShot(500, self._recover_after_sleep)
+        except Exception:
+            pass
+        return super().nativeEvent(event_type, message)
 
     def paintEvent(self, event) -> None:
         if self._current_anim is None or not self._current_anim.frames:

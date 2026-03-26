@@ -36,4 +36,15 @@ def safe_microphone(**kwargs):
         yield source
     finally:
         with _mic_lock:
-            mic.__exit__(None, None, None)
+            try:
+                mic.__exit__(None, None, None)
+            except AttributeError:
+                # sr.Microphone.__exit__ calls self.stream.close() even when
+                # the stream was never opened (e.g. device missing/busy).
+                # Clean up PyAudio directly if possible.
+                if hasattr(mic, "audio") and mic.audio is not None:
+                    try:
+                        mic.audio.terminate()
+                    except Exception:
+                        pass
+                    mic.stream = None

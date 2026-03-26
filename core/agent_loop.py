@@ -225,6 +225,7 @@ class AgentLoop:
 
         self.directives: List[Directive] = []
         self._action_log: List[Tuple[float, str]] = []  # (monotonic_ts, description), capped at 15
+        self._recently_spoken: List[str] = []  # last few spoken texts for echo detection
         self._next_idle_check_at: float = time.monotonic() + 10.0  # for self-initiation/spontaneous
         self._last_self_check: float = 0.0
         self._next_spontaneous: float = time.monotonic() + random.uniform(
@@ -2309,6 +2310,16 @@ class AgentLoop:
         try:
             if self._detector:
                 self._detector.pause()
+
+            # Wait for TTS queue to finish playing before opening the mic
+            if self._tts_queue:
+                deadline = time.monotonic() + 15.0
+                while self._tts_queue.is_speaking or self._tts_queue.pending_count > 0:
+                    if time.monotonic() > deadline:
+                        logger.warning("TTS queue didn't drain in 15s — listening anyway.")
+                        break
+                    time.sleep(0.1)
+
             if self._on_state_change:
                 self._on_state_change("LISTEN")
             print("[Agent] Listening for reply...", flush=True)
@@ -2316,7 +2327,7 @@ class AgentLoop:
             # Listen with a short timeout — don't wait too long for a reply
             user_text = self._transcriber.listen(
                 speech_start_timeout_s=5.0,
-                initial_discard_ms=600,
+                initial_discard_ms=800,
             )
 
             if not user_text or not user_text.strip():
@@ -2329,9 +2340,15 @@ class AgentLoop:
                 logger.debug("Filtered hallucination in listen_for_reply: %r", user_text)
                 return
 
+            # Filter echo — pony hearing its own TTS through the mic
+            if self._is_echo(user_text):
+                logger.info("Filtered echo in listen_for_reply: %r", user_text)
+                return
+
             logger.info("User replied to spontaneous speech: %r", user_text)
 
             # Conversational loop — keep going until CONVO:END or silence
+            max_echo_streak = 0  # consecutive echoes → bail out of loop
             from llm.response_parser import parse_response
             while user_text and user_text.strip():
                 # Add context so the LLM stays in character (matches pipeline._run_turn)
@@ -2378,27 +2395,41 @@ class AgentLoop:
                                 priority=PRIORITY_AUTONOMOUS,
                                 voice_slug=self._primary_voice_slug,
                                 on_start=_show_bubble,
+                                blocking=True,  # BLOCK until TTS finishes before listening again
                             )
                         else:
                             self._tts.speak(parsed.text, on_playback_start=_show_bubble)
                     else:
                         _show_bubble()
+                    # Track for echo detection
+                    self._recently_spoken.append(parsed.text)
+                    if len(self._recently_spoken) > 5:
+                        self._recently_spoken.pop(0)
 
                 # Check for conversation end signal
                 if parsed.end_conversation:
                     logger.debug("Spontaneous conversation ended by LLM.")
                     break
 
-                # Listen again (short timeout, filter hallucinations)
+                # Listen again (short timeout, filter hallucinations + echo)
                 if self._on_state_change:
                     self._on_state_change("LISTEN")
                 user_text = self._transcriber.listen(
                     speech_start_timeout_s=5.0,
-                    initial_discard_ms=600,
+                    initial_discard_ms=800,
                 )
                 if user_text and _is_whisper_hallucination(user_text):
                     logger.debug("Filtered hallucination in reply loop: %r", user_text)
                     user_text = None
+                if user_text and self._is_echo(user_text):
+                    logger.info("Filtered echo in reply loop: %r", user_text)
+                    max_echo_streak += 1
+                    if max_echo_streak >= 2:
+                        logger.warning("Multiple consecutive echoes — ending reply loop.")
+                        break
+                    user_text = None
+                else:
+                    max_echo_streak = 0
 
         except Exception as exc:
             logger.warning("Listen-for-reply failed: %s", exc)
@@ -2413,12 +2444,43 @@ class AgentLoop:
 
     _TAG_STRIP_RE = re.compile(r"\[[A-Z_]+(?::[^\]]*)?]")
 
+    def _is_echo(self, heard: str) -> bool:
+        """Check if transcribed text is the pony's own TTS echoing back through the mic.
+
+        Compares against recently spoken texts using normalized substring matching.
+        """
+        if not heard or not self._recently_spoken:
+            return False
+        h = heard.lower().strip()
+        if len(h) < 5:
+            return False
+        for spoken in self._recently_spoken:
+            s = spoken.lower().strip()
+            # Direct substring: mic picked up part of the TTS output
+            if h in s or s in h:
+                logger.debug("Echo detected (substring): heard=%r vs spoken=%r", h, s)
+                return True
+            # Word overlap: if >60% of heard words appear in spoken text, it's echo
+            h_words = set(h.split())
+            s_words = set(s.split())
+            if len(h_words) >= 3:
+                overlap = len(h_words & s_words) / len(h_words)
+                if overlap > 0.6:
+                    logger.debug("Echo detected (%.0f%% overlap): heard=%r vs spoken=%r",
+                                 overlap * 100, h, s)
+                    return True
+        return False
+
     def _speak(self, text: str) -> None:
         """Speak text via TTS with detector pause/resume and GUI callbacks."""
         # Strip any bracket tags the LLM leaked (e.g. [CONVO:CONTINUE])
         text = self._TAG_STRIP_RE.sub("", text).strip()
         if not text:
             return
+        # Track for echo detection
+        self._recently_spoken.append(text)
+        if len(self._recently_spoken) > 5:
+            self._recently_spoken.pop(0)
         try:
             if self._on_state_change:
                 self._on_state_change("SPEAK")

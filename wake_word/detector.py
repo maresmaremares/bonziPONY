@@ -219,6 +219,9 @@ class WakeWordDetector:
         if self._input_device_index >= 0:
             mic_kwargs["device_index"] = self._input_device_index
 
+        mic_fail_count = 0
+        mic_backoff = 2.0  # initial backoff seconds
+
         while not self._stop.is_set():
             # ── Paused: spin-wait until resumed ────────────────────────
             if self._paused.is_set():
@@ -229,6 +232,9 @@ class WakeWordDetector:
                 from stt.mic_lock import safe_microphone
                 with safe_microphone(**mic_kwargs) as source:
                     recognizer.adjust_for_ambient_noise(source, duration=0.3)
+                    # Mic opened successfully — reset backoff
+                    mic_fail_count = 0
+                    mic_backoff = 2.0
 
                     # Inner loop: listen while not paused/stopped
                     while not self._stop.is_set() and not self._paused.is_set():
@@ -289,13 +295,22 @@ class WakeWordDetector:
                         break
 
             except (OSError, AttributeError) as exc:
-                # AttributeError: speech_recognition's Microphone.__exit__
-                # calls self.stream.close() even when the stream was never
-                # opened (e.g. wrong device index, mic busy/missing).
                 if not self._stop.is_set():
-                    logger.warning("Microphone error in wake detector: %s", exc)
-                    time.sleep(2.0)
+                    mic_fail_count += 1
+                    if mic_fail_count <= 3:
+                        logger.warning("Microphone error in wake detector: %s", exc)
+                    elif mic_fail_count == 4:
+                        logger.error(
+                            "Microphone repeatedly unavailable (%d failures). "
+                            "Check that PyAudio is installed and a mic is connected. "
+                            "Will keep retrying with longer intervals.", mic_fail_count,
+                        )
+                    # Exponential backoff: 2s → 4s → 8s → ... capped at 60s
+                    time.sleep(mic_backoff)
+                    mic_backoff = min(mic_backoff * 2, 60.0)
             except Exception as exc:
                 if not self._stop.is_set():
+                    mic_fail_count += 1
                     logger.error("Wake detector error: %s", exc)
-                    time.sleep(1.0)
+                    time.sleep(mic_backoff)
+                    mic_backoff = min(mic_backoff * 2, 60.0)

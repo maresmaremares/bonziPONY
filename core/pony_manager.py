@@ -71,7 +71,14 @@ class PonyManager:
         """Add a secondary pony to the desktop.
 
         Returns the new PonyInstance, or None if at capacity.
+        Skips if the slug is already present (prevents duplicates).
         """
+        # Prevent duplicates — check if this slug is already loaded
+        for existing in self.ponies:
+            if existing.slug == slug:
+                logger.info("Pony '%s' already loaded — skipping duplicate.", slug)
+                return None
+
         if len(self.ponies) >= self.max_ponies:
             logger.warning("Max ponies (%d) reached — cannot add %s.", self.max_ponies, slug)
             return None

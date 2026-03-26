@@ -12,6 +12,22 @@ Usage:
 
 from __future__ import annotations
 
+# ── PyAudioWPatch shim ─────────────────────────────────────────────────
+# PyAudioWPatch is a drop-in replacement for PyAudio that ships prebuilt
+# wheels (no C++ compiler needed), but it installs as "pyaudiowpatch"
+# instead of "pyaudio". speech_recognition and other libs do
+# `import pyaudio`, so we register it under the expected name.
+import sys as _sys
+try:
+    import pyaudio as _pa  # noqa: F401  — already available, nothing to do
+except ImportError:
+    try:
+        import pyaudiowpatch as _pa
+        _sys.modules["pyaudio"] = _pa
+    except ImportError:
+        pass  # neither installed — mic features will be unavailable
+del _sys, _pa
+
 import argparse
 import logging
 import random

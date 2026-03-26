@@ -101,6 +101,7 @@ class Pipeline:
 
         self._recent_topics: List[str] = []
         self._visual_memory: List[str] = []
+        self._recently_spoken: List[str] = []  # echo detection
         self._last_end_conversation: bool = False  # LLM signaled conversation over
         self._last_profile_extraction: float = 0.0  # monotonic timestamp
 
@@ -125,6 +126,27 @@ class Pipeline:
         self._on_heard_text = on_heard_text
         self._on_conversation_start = on_conversation_start
         self._on_conversation_end = on_conversation_end
+
+    def _is_echo(self, heard: str) -> bool:
+        """Check if transcribed text is the pony's own TTS output echoing through the mic."""
+        if not heard or not self._recently_spoken:
+            return False
+        h = heard.lower().strip()
+        if len(h) < 5:
+            return False
+        for spoken in self._recently_spoken:
+            s = spoken.lower().strip()
+            if h in s or s in h:
+                logger.debug("Echo detected (substring): heard=%r", h)
+                return True
+            h_words = set(h.split())
+            s_words = set(s.split())
+            if len(h_words) >= 3:
+                overlap = len(h_words & s_words) / len(h_words)
+                if overlap > 0.6:
+                    logger.debug("Echo detected (%.0f%% overlap): heard=%r", overlap * 100, h)
+                    return True
+        return False
 
     def _speak_with_queue(self, text: str, show_bubble_cb, priority: int = 0) -> None:
         """Speak through TTSQueue if available, else direct TTS.
@@ -212,7 +234,7 @@ class Pipeline:
             print(f"\n[Listening... {remaining:.0f}s remaining]", flush=True)
             self._transition(PipelineState.LISTEN)
 
-            discard_ms = 600 if just_spoke else 0
+            discard_ms = 800 if just_spoke else 0
             user_text = self.transcriber.listen(speech_start_timeout_s=wait, initial_discard_ms=discard_ms)
             just_spoke = False
 
@@ -224,6 +246,11 @@ class Pipeline:
             from stt.transcriber import _is_whisper_hallucination
             if _is_whisper_hallucination(user_text):
                 logger.debug("Filtered hallucination in follow-up: %r", user_text)
+                continue
+
+            # Filter echo — pony hearing its own TTS through the mic
+            if self._is_echo(user_text):
+                logger.info("Filtered echo in conversation: %r", user_text)
                 continue
 
             spoke = self._run_turn(play_ack=False, user_text=user_text)
@@ -303,7 +330,7 @@ class Pipeline:
                 break
 
             self._transition(PipelineState.LISTEN)
-            discard_ms = 600 if just_spoke else 0
+            discard_ms = 800 if just_spoke else 0
             user_text = self.transcriber.listen(speech_start_timeout_s=wait, initial_discard_ms=discard_ms)
             just_spoke = False
 
@@ -312,6 +339,10 @@ class Pipeline:
 
             from stt.transcriber import _is_whisper_hallucination
             if _is_whisper_hallucination(user_text):
+                continue
+
+            if self._is_echo(user_text):
+                logger.info("Filtered echo in PTT conversation: %r", user_text)
                 continue
 
             spoke = self._run_turn(play_ack=False, user_text=user_text)
@@ -752,6 +783,10 @@ class Pipeline:
                 self._speak_with_queue(parsed.text, _show_bubble)
                 # Always ensure bubble was shown (fallback if TTS failed/skipped callback)
                 _show_bubble()
+                # Track for echo detection
+                self._recently_spoken.append(parsed.text)
+                if len(self._recently_spoken) > 5:
+                    self._recently_spoken.pop(0)
                 if self._timeline:
                     from core.event_timeline import EventType
                     self._timeline.append(EventType.PONY_SAID,

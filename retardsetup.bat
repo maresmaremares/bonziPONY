@@ -134,51 +134,39 @@ exit /b 1
 for /f "tokens=*" %%v in ('"!PYTHON!" --version 2^>^&1') do echo  [OK] Using %%v
 
 :: ── Check if existing venv was made with an incompatible Python ──
-if exist "venv\Scripts\python.exe" (
-    venv\Scripts\python.exe -c "import sys; exit(0 if 10<=sys.version_info.minor<=12 and sys.version_info.major==3 else 1)" >nul 2>&1
-    if errorlevel 1 (
-        echo  [WARN] Existing venv uses wrong Python version. Rebuilding...
-        rmdir /s /q venv >nul 2>&1
-    )
-)
+if not exist "venv\Scripts\python.exe" goto :venv_ok
+venv\Scripts\python.exe -c "import sys; exit(0 if 10<=sys.version_info.minor<=12 else 1)" >nul 2>&1
+if not errorlevel 1 goto :venv_ok
+echo  [WARN] Existing venv uses wrong Python version. Rebuilding...
+rmdir /s /q venv >nul 2>&1
+:venv_ok
 
 :: ── Install/check uv ────────────────────────────────────────
 set "USE_UV=0"
 "!PYTHON!" -m uv --version >nul 2>&1
-if not errorlevel 1 (
-    set "USE_UV=1"
-) else (
-    echo.
-    echo  Installing uv package manager...
-    "!PYTHON!" -m pip install uv --quiet >nul 2>&1
-    "!PYTHON!" -m uv --version >nul 2>&1
-    if not errorlevel 1 (
-        set "USE_UV=1"
-    ) else (
-        echo  [WARN] uv not available. Using pip (slower but fine).
-    )
-)
+if not errorlevel 1 set "USE_UV=1" & goto :uv_done
+echo.
+echo  Installing uv package manager...
+"!PYTHON!" -m pip install uv --quiet >nul 2>&1
+"!PYTHON!" -m uv --version >nul 2>&1
+if not errorlevel 1 set "USE_UV=1" & goto :uv_done
+echo  [WARN] uv not available. Using pip (slower but fine).
+:uv_done
 if "!USE_UV!"=="1" echo  [OK] uv ready.
 
 :: ── Create venv ─────────────────────────────────────────────
-if not exist "venv\Scripts\python.exe" (
-    echo.
-    echo  Creating virtual environment...
-    if "!USE_UV!"=="1" (
-        "!PYTHON!" -m uv venv venv
-    ) else (
-        "!PYTHON!" -m venv venv
-    )
-    if errorlevel 1 (
-        echo  [ERROR] Failed to create virtual environment.
-        echo  Delete the "venv" folder and run this script again.
-        pause
-        exit /b 1
-    )
-    echo  [OK] Virtual environment created.
-) else (
-    echo  [OK] Virtual environment exists.
-)
+if exist "venv\Scripts\python.exe" echo  [OK] Virtual environment exists. & goto :venv_ready
+echo.
+echo  Creating virtual environment...
+if not "!USE_UV!"=="1" goto :venv_pip
+"!PYTHON!" -m uv venv venv
+goto :venv_check
+:venv_pip
+"!PYTHON!" -m venv venv
+:venv_check
+if errorlevel 1 echo  [ERROR] Failed to create venv. Delete "venv" folder and rerun. & pause & exit /b 1
+echo  [OK] Virtual environment created.
+:venv_ready
 
 set "PY=venv\Scripts\python.exe"
 
@@ -189,30 +177,26 @@ set "PY=venv\Scripts\python.exe"
 :: ── Stage 1: Hash-verified lockfile (fastest, most reliable) ─
 echo.
 echo  [1/3] Installing dependencies (lockfile)...
-if "!USE_UV!"=="1" (
-    "!PYTHON!" -m uv pip install --require-hashes -r requirements-lock.txt --python %PY% >nul 2>&1
-) else (
-    %PY% -m pip install -r requirements-lock.txt --quiet >nul 2>&1
-)
-if not errorlevel 1 (
-    echo  [OK] Lockfile install succeeded.
-    goto :installdone
-)
+if not "!USE_UV!"=="1" goto :s1_pip
+"!PYTHON!" -m uv pip install --require-hashes -r requirements-lock.txt --python %PY% >nul 2>&1
+goto :s1_check
+:s1_pip
+%PY% -m pip install -r requirements-lock.txt --quiet >nul 2>&1
+:s1_check
+if not errorlevel 1 echo  [OK] Lockfile install succeeded. & goto :installdone
 
 :: ── Stage 2: Prebuilt wheels only (no C++ compiler needed) ──
 echo  [WARN] Lockfile didn't match your Python — trying prebuilt packages...
 echo.
 echo  [2/3] Installing from requirements (prebuilt wheels)...
 echo.
-if "!USE_UV!"=="1" (
-    "!PYTHON!" -m uv pip install --only-binary :all: -r requirements.txt --python %PY%
-) else (
-    %PY% -m pip install --only-binary :all: -r requirements.txt
-)
-if not errorlevel 1 (
-    echo  [OK] Prebuilt install succeeded.
-    goto :installdone
-)
+if not "!USE_UV!"=="1" goto :s2_pip
+"!PYTHON!" -m uv pip install --only-binary :all: -r requirements.txt --python %PY%
+goto :s2_check
+:s2_pip
+%PY% -m pip install --only-binary :all: -r requirements.txt
+:s2_check
+if not errorlevel 1 echo  [OK] Prebuilt install succeeded. & goto :installdone
 
 :: ── Stage 3: Allow source compilation (needs C++ build tools) ─
 echo.
@@ -220,15 +204,13 @@ echo  [WARN] Some packages need to compile from source...
 echo.
 echo  [3/3] Retrying with compilation allowed...
 echo.
-if "!USE_UV!"=="1" (
-    "!PYTHON!" -m uv pip install -r requirements.txt --python %PY%
-) else (
-    %PY% -m pip install -r requirements.txt
-)
-if not errorlevel 1 (
-    echo  [OK] Install succeeded (some packages compiled from source).
-    goto :installdone
-)
+if not "!USE_UV!"=="1" goto :s3_pip
+"!PYTHON!" -m uv pip install -r requirements.txt --python %PY%
+goto :s3_check
+:s3_pip
+%PY% -m pip install -r requirements.txt
+:s3_check
+if not errorlevel 1 echo  [OK] Install succeeded. & goto :installdone
 
 :: ══════════════════════════════════════════════════════════════
 ::  INSTALL FAILED — figure out what's missing
@@ -344,23 +326,21 @@ if errorlevel 1 (
 
 :: ── PyAudio fallback ────────────────────────────────────────
 %PY% -c "import pyaudio" >nul 2>&1
-if errorlevel 1 (
-    echo  [WARN] PyAudio missing — trying fallback install...
-    if "!USE_UV!"=="1" (
-        "!PYTHON!" -m uv pip install PyAudioWPatch --python %PY% >nul 2>&1
-    ) else (
-        %PY% -m pip install PyAudioWPatch --quiet >nul 2>&1
-    )
-    %PY% -c "import pyaudio" >nul 2>&1
-    if errorlevel 1 (
-        echo  [WARN] PyAudio still missing. Voice input won't work,
-        echo         but everything else will. You can install it later:
-        echo         %PY% -m pip install PyAudioWPatch
-    ) else (
-        echo  [OK] PyAudioWPatch installed.
-    )
-    echo.
-)
+if not errorlevel 1 goto :pyaudio_ok
+echo  [WARN] PyAudio missing — trying fallback install...
+if not "!USE_UV!"=="1" goto :pyaudio_pip
+"!PYTHON!" -m uv pip install PyAudioWPatch --python %PY% >nul 2>&1
+goto :pyaudio_verify
+:pyaudio_pip
+%PY% -m pip install PyAudioWPatch --quiet >nul 2>&1
+:pyaudio_verify
+%PY% -c "import pyaudio" >nul 2>&1
+if not errorlevel 1 echo  [OK] PyAudioWPatch installed. & goto :pyaudio_ok
+echo  [WARN] PyAudio still missing. Voice input won't work,
+echo         but everything else will. You can install it later:
+echo         %PY% -m pip install PyAudioWPatch
+echo.
+:pyaudio_ok
 
 :: ── Copy config if needed ───────────────────────────────────
 if not exist "config.yaml" (
