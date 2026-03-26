@@ -705,9 +705,9 @@ class AgentLoop:
             print(f"[ENFORCEMENT] User returned — away {away_dur:.0f}s / "
                   f"{duration:.0f}s expected (ratio {ratio:.1%})")
 
-            if ratio >= 0.7:
+            if ratio >= 0.5:
                 self._enforcement_auto_complete(away_dur)
-            elif ratio >= 0.3:
+            elif ratio >= 0.2:
                 self._enforcement_casual_checkin(away_dur)
             elif ratio >= 0.1:
                 self._enforcement_ask_if_done()
@@ -716,10 +716,10 @@ class AgentLoop:
         else:
             # User has been continuously active — never left or returned a while ago.
             # Only nag if they've been sitting here a long time without leaving.
-            if elapsed < 30.0:
+            if elapsed < 60.0:
                 return  # give them time to wrap up and leave
-            if (now - self._enforcement.last_caught_at) < 60.0:
-                return  # don't nag more than once per minute when they won't leave
+            if (now - self._enforcement.last_caught_at) < 180.0:
+                return  # don't nag more than once per 3 minutes when they won't leave
             self._enforcement.last_caught_at = now
             self._enforcement.caught_count += 1
             self._enforcement_ask_if_done()
@@ -931,6 +931,8 @@ class AgentLoop:
                     self._speak(go_text)
                 self._enforcement.was_idle = False
                 self._enforcement.idle_since = 0.0
+                # Grace period: don't check again for 3 minutes
+                self._enforcement.last_caught_at = time.monotonic() + 150.0
             else:
                 self._enforcement_lockdown()
         finally:
@@ -1017,7 +1019,7 @@ class AgentLoop:
                 return
 
             if "B" in verdict:
-                # Going to do it — encourage and keep enforcement active
+                # Going to do it — encourage and give them real time to leave
                 go_prompt = (
                     f"You are {name}. The user says they're going to go {goal} now. "
                     f"Encourage them briefly. ONE sentence, in character."
@@ -1029,6 +1031,8 @@ class AgentLoop:
                 # Reset idle tracking — they should go idle soon
                 self._enforcement.was_idle = False
                 self._enforcement.idle_since = 0.0
+                # Grace period: don't check again for 3 minutes
+                self._enforcement.last_caught_at = time.monotonic() + 150.0
                 return  # keep enforcement active, wait for them to leave
 
             # Not confirmed → lockdown
@@ -1395,6 +1399,10 @@ class AgentLoop:
                 if key in decision.directive_timings:
                     timing = decision.directive_timings[key]
                     nag_min = float(timing.get("next_nag_minutes", 10))
+                    # Hard floor: never nag more often than every 3 minutes
+                    # (5 minutes for low urgency directives)
+                    min_minutes = 3.0 if d.urgency >= 7 else 5.0
+                    nag_min = max(nag_min, min_minutes)
                     d.next_nag_at = now_m + nag_min * 60.0
                     if "urgency" in timing:
                         d.urgency = max(1, min(10, int(timing["urgency"])))
@@ -1564,7 +1572,7 @@ class AgentLoop:
             "- If they're actively working on something productive, be patient even with pending tasks.",
             "- If they're clearly procrastinating (endless scrolling, social media while tasks pile up), push harder.",
             "- The chaos roll adds randomness — sometimes you snap early, sometimes you let it slide.",
-            "- Vary your nag timing. Don't be predictable. 2-15 minutes between nags is the range.",
+            "- Vary your nag timing. Don't be predictable. 5-15 minutes between nags is the range (3 min minimum for urgency 7+).",
             "- Some days are rest days. Not every directive needs urgency 10.",
             "",
             "ACTION PALETTE (at your discretion based on urgency):",
@@ -1585,7 +1593,7 @@ class AgentLoop:
             "",
             "WHAT NOT TO DO:",
             "- Don't mechanically escalate urgency every single tick. Sometimes holding steady is right.",
-            "- Don't nag more often than every 2 minutes unless urgency is 8+.",
+            "- Don't nag more often than every 5 minutes. Even at high urgency, 3 minutes is the hard floor.",
             "- Don't let a directive go silent for more than 15 minutes between nags.",
             "- Don't use the exact same approach twice in a row (check last_nag_style).",
             "- Don't escalate a 'stop doing X' directive just because the user is near X-related content.",
@@ -2298,6 +2306,64 @@ class AgentLoop:
         finally:
             self._next_idle_check_at = time.monotonic() + self._config.base_check_interval_s
 
+    def _check_directive_completion_reply(self, user_text: str) -> bool:
+        """Check if the user's reply indicates they already completed a directive.
+
+        e.g. "I already did that", "I did it 20 minutes ago", "that's done",
+        "I literally just did that". If so, ask the LLM to confirm which
+        directive and complete it.
+
+        Returns True if a directive was completed (caller should stop processing).
+        """
+        if not self.directives:
+            return False
+
+        goals = "; ".join(f'"{d.goal}"' for d in self.directives)
+        classify_prompt = (
+            f"The user has active tasks: {goals}\n"
+            f"The user just said: \"{user_text}\"\n"
+            f"Is the user saying they ALREADY COMPLETED one of these tasks? "
+            f"Reply YES:<task goal> if so, or NO if they're just talking normally."
+        )
+        verdict = self._llm.generate_once(
+            classify_prompt, max_tokens=60,
+            system_prompt="Reply YES:<task goal> or NO only."
+        )
+        verdict = self._strip_think(verdict).strip()
+
+        if not verdict.upper().startswith("YES"):
+            return False
+
+        # Find and complete the matching directive
+        completed_goal = verdict.split(":", 1)[1].strip().strip('"') if ":" in verdict else ""
+        best_match = None
+        for d in self.directives:
+            if completed_goal.lower() in d.goal.lower() or d.goal.lower() in completed_goal.lower():
+                best_match = d
+                break
+        if not best_match and self.directives:
+            # If LLM couldn't match exactly, complete the most recently nagged one
+            best_match = max(self.directives, key=lambda d: d.nag_count)
+
+        if best_match:
+            self.directives.remove(best_match)
+            logger.info("Directive completed via user reply: %r", best_match.goal)
+            name = get_character_name()
+            ack_prompt = (
+                f"You are {name}. The user just told you they already completed '{best_match.goal}'. "
+                f"Acknowledge it casually — don't make a big deal. ONE sentence, in character."
+            )
+            ack_text = self._llm.generate_once(ack_prompt, max_tokens=80)
+            ack_text = self._strip_think(ack_text).strip().strip('"')
+            if ack_text:
+                self._speak(ack_text)
+            self.save_directives()
+            self._log_action(f"Directive completed (user said so): \"{best_match.goal[:40]}\"")
+            if not self.directives:
+                self._mess_mouse_count = 0
+            return True
+        return False
+
     def _listen_for_reply(self) -> None:
         """After spontaneous speech, open the mic briefly for a user response.
 
@@ -2343,6 +2409,10 @@ class AgentLoop:
             # Filter echo — pony hearing its own TTS through the mic
             if self._is_echo(user_text):
                 logger.info("Filtered echo in listen_for_reply: %r", user_text)
+                return
+
+            # Check if user is saying they already did a directive
+            if self.directives and self._check_directive_completion_reply(user_text):
                 return
 
             logger.info("User replied to spontaneous speech: %r", user_text)
