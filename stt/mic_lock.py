@@ -15,6 +15,29 @@ from __future__ import annotations
 import threading
 from contextlib import contextmanager
 
+def _ensure_pyaudio_importable() -> None:
+    """Ensure `import pyaudio` works (SpeechRecognition expects it).
+
+    PyAudioWPatch ships prebuilt wheels on Windows but installs as
+    `pyaudiowpatch`, so we alias it to the expected module name.
+    """
+    import sys
+    try:
+        import pyaudio  # noqa: F401
+        return
+    except Exception:
+        pass
+
+    try:
+        import pyaudiowpatch as _pa
+        sys.modules.setdefault("pyaudio", _pa)
+    except Exception:
+        # Neither is available; callers will fail gracefully when opening mic.
+        return
+
+
+_ensure_pyaudio_importable()
+
 import speech_recognition as sr
 
 _mic_lock = threading.Lock()
