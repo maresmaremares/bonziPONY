@@ -217,6 +217,96 @@ class PonyManager:
                 return pony
         return None
 
+    # ── Screen context for group chat ───────────────────────────────
+
+    @staticmethod
+    def _summarize_screen_for_chat(fg_exe: str, fg_title: str, open_windows: list) -> str:
+        """Summarize screen state into a simple description for group chat.
+
+        Instead of dumping raw window titles (which causes ponies to parrot
+        error messages and technical junk), describe WHAT the user is doing
+        in plain terms ponies can understand.
+        """
+        # Map exe names to friendly descriptions
+        _EXE_MAP = {
+            "chrome": "browsing the web", "firefox": "browsing the web",
+            "msedge": "browsing the web", "opera": "browsing the web",
+            "brave": "browsing the web",
+            "code": "writing code in VS Code", "devenv": "writing code in Visual Studio",
+            "pycharm": "writing code in PyCharm", "idea": "writing code",
+            "notepad++": "editing a text file", "notepad": "editing a text file",
+            "sublime_text": "editing code",
+            "discord": "chatting on Discord", "slack": "chatting on Slack",
+            "telegram": "chatting on Telegram",
+            "spotify": "listening to music", "foobar2000": "listening to music",
+            "vlc": "watching something", "mpv": "watching something",
+            "explorer": "browsing files",
+            "steam": "on Steam", "steamwebhelper": "on Steam",
+            "cs2": "playing CS2", "valorant": "playing Valorant",
+            "minecraft": "playing Minecraft",
+            "photoshop": "editing images", "gimp": "editing images",
+            "word": "writing a document", "winword": "writing a document",
+            "excel": "working on a spreadsheet",
+            "powershell": "using the terminal", "cmd": "using the terminal",
+            "windowsterminal": "using the terminal",
+        }
+
+        exe_lower = (fg_exe or "").lower().replace(".exe", "")
+        activity = _EXE_MAP.get(exe_lower)
+
+        if not activity:
+            # Try partial matches
+            for key, desc in _EXE_MAP.items():
+                if key in exe_lower:
+                    activity = desc
+                    break
+
+        if not activity:
+            activity = f"using {fg_exe}" if fg_exe else "on the computer"
+
+        # For browsers, extract the site/page from the title if possible
+        if "browsing" in activity and fg_title:
+            # Browser titles usually end with " - Chrome" etc, strip that
+            import re
+            clean_title = re.sub(r'\s*[-–—]\s*(Google Chrome|Mozilla Firefox|Microsoft Edge|Opera|Brave).*$', '', fg_title, flags=re.IGNORECASE).strip()
+            # Extract domain-like words but skip technical/error-looking stuff
+            if clean_title and len(clean_title) < 80:
+                # Skip titles that look like error messages
+                error_words = {"error", "failed", "refused", "timeout", "exception", "crash", "404", "500", "503", "denied"}
+                title_lower = clean_title.lower()
+                if not any(w in title_lower for w in error_words):
+                    activity = f"looking at \"{clean_title}\" in the browser"
+
+        # For code editors, try to get the file name
+        if "code" in activity and fg_title:
+            import re
+            # VS Code titles are like "filename.py - ProjectName - Visual Studio Code"
+            file_match = re.match(r'^([^\-–—]+)', fg_title)
+            if file_match:
+                fname = file_match.group(1).strip()
+                if fname and len(fname) < 60 and "." in fname:
+                    activity = f"editing {fname} in their code editor"
+
+        # Count what kinds of apps are open (without listing titles)
+        app_types = set()
+        for w in open_windows:
+            w_exe = (getattr(w, 'exe_name', '') or '').lower().replace('.exe', '')
+            if any(b in w_exe for b in ("chrome", "firefox", "msedge", "opera", "brave")):
+                app_types.add("browser tabs")
+            elif any(b in w_exe for b in ("code", "pycharm", "devenv", "sublime")):
+                app_types.add("code editor")
+            elif any(b in w_exe for b in ("discord", "slack", "telegram")):
+                app_types.add("chat apps")
+            elif any(b in w_exe for b in ("steam", "cs2", "valorant")):
+                app_types.add("games")
+
+        summary = f"The user is currently {activity}."
+        if app_types:
+            also = ", ".join(sorted(app_types))
+            summary += f" They also have {also} open."
+
+        return summary
+
     # ── Inter-pony chat triggers ────────────────────────────────────
 
     def maybe_spontaneous_chat(self) -> bool:
@@ -244,17 +334,18 @@ class PonyManager:
         initiator = random.choice(self.ponies)
         logger.info("Spontaneous inter-pony chat triggered by %s", initiator.display_name)
 
-        # Get screen context so ponies can reference what's actually on screen
+        # Get screen context — summarize what the user is DOING, not raw titles.
+        # Raw window titles cause ponies to parrot error messages, status text,
+        # and technical garbage they don't understand.
         screen_context = ""
         if self._screen_monitor:
             try:
                 state = self._screen_monitor.get_state()
                 if state and state.foreground:
-                    fg = state.foreground.title
-                    windows = [w.title for w in state.open_windows[:8] if w.title.strip()]
-                    screen_context = f"The user's screen right now: \"{fg}\" is in the foreground."
-                    if windows:
-                        screen_context += f" Open windows: {', '.join(windows)}."
+                    fg_exe = state.foreground.exe_name or "something"
+                    fg_title = state.foreground.title or ""
+                    # Summarize into a human-readable description
+                    screen_context = self._summarize_screen_for_chat(fg_exe, fg_title, state.open_windows[:8])
             except Exception:
                 pass
 
@@ -335,28 +426,46 @@ class PonyManager:
         """Generate a short spontaneous remark for a single pony."""
         from core.group_conversation import GroupConversation
 
-        # Build screen context
+        # Build screen context — summarized, not raw titles
         screen_info = ""
         if self._screen_monitor:
             try:
                 state = self._screen_monitor.get_state()
                 if state and state.foreground:
-                    screen_info = f"The user is currently looking at: \"{state.foreground.title}\". "
+                    screen_info = self._summarize_screen_for_chat(
+                        state.foreground.exe_name or "",
+                        state.foreground.title or "",
+                        state.open_windows[:8],
+                    ) + " "
             except Exception:
                 pass
 
         companions = [p.display_name for p in self.ponies if p is not pony]
         companion_str = ", ".join(companions) if companions else "the user"
 
+        # Pick a random conversation angle so individual remarks aren't always
+        # "oh what are you working on"
+        angles = [
+            "Say something to one of your friends — tease them, ask them something, or start banter.",
+            "Share a random thought or opinion that has nothing to do with the screen.",
+            "Comment on something the user is doing, but be specific and interesting about it.",
+            "Say something funny or sarcastic.",
+            "Ask the user or a friend a 'would you rather' or hypothetical question.",
+            "Complain about something or express a strong opinion.",
+        ]
+        angle = random.choice(angles)
+
+        recent_warning = GroupConversation._get_recent_topics_warning()
+
         prompt = (
             f"(You're on the desktop with {companion_str}. {screen_info}"
-            f"Say something — a casual remark, a thought, a comment on what the user "
-            f"is doing, or just say something to one of your friends. "
-            f"Keep it to one sentence.\n"
-            f"IMPORTANT: Only reference things you actually know or can see above. "
-            f"Do NOT invent scenery or events.\n"
-            f"NEVER comment on the number of open windows — that is meaningless and banned.\n"
-            f"Be yourself — not a caricature. Don't lean on your most obvious trait.\n"
+            f"{angle} Keep it to one sentence.\n"
+            f"RULES: Only reference things you actually know. "
+            f"Do NOT invent scenery, events, or errors. "
+            f"Do NOT parrot technical info from window titles. "
+            f"Do NOT comment on the number of open windows.\n"
+            f"{recent_warning}"
+            f"Be yourself — not a caricature.\n"
             f"Say [PASS] if you have nothing worth saying right now.\n"
             f"Do NOT include any tags like [CONVO:...] — just speak naturally.)"
         )

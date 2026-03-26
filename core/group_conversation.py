@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import random
 import re
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 if TYPE_CHECKING:
     from core.pony_instance import PonyInstance
@@ -20,20 +20,49 @@ logger = logging.getLogger(__name__)
 
 # Regex to strip pipeline tags the LLM may include — these should never be spoken aloud
 _TAG_RE = re.compile(
-    r'\[(?:CONVO|DIRECTIVE|TIMER|ROUTINE|DONE|ENFORCE|DELAY|MOVETO|PERSIST)\s*(?::[^\]]*?)?\]',
+    r'\[(?:CONVO|DIRECTIVE|TIMER|ROUTINE|DONE|ENFORCE|DELAY|MOVETO|PERSIST|RULE)\s*(?::[^\]]*?)?\]',
     re.IGNORECASE,
 )
 
+# ── Conversation topics for variety ─────────────────────────────────────
+# The initiator picks a random topic SEED so conversations don't all start
+# with "hey what are you working on?"  Topics are character-agnostic nudges.
+_TOPIC_SEEDS = [
+    "something funny that happened recently or a joke you want to tell",
+    "a random opinion or hot take about something you feel strongly about",
+    "a question for one of your friends here — something you've been curious about",
+    "a memory or story from Equestria — something nostalgic",
+    "something annoying or frustrating that's been on your mind",
+    "a random fun fact or piece of trivia you think is interesting",
+    "a compliment or roast of one of the other ponies present",
+    "what you'd be doing RIGHT NOW if you could do anything",
+    "something about the user — an observation, question, or thought about them",
+    "a debate topic — ask the group something where ponies might disagree",
+    "gossip — talk about one of the ponies who might or might not be here",
+    "your honest review of something — a food, a show, an activity",
+    "a challenge or dare for one of the other ponies",
+    "something weird or random that just popped into your head",
+    "a 'would you rather' or hypothetical question for the group",
+    "complain about something — vent a little, you're among friends",
+]
+
 _TURN_PROMPT_TEMPLATE = (
-    "(Group chat on the desktop. Here's what just happened:\n"
+    "(Group chat on the desktop. {screen_info}\n"
+    "Here's what just happened:\n"
     "{log_block}\n\n"
     "It's your turn. You can respond naturally, or say [PASS] if you have nothing to add.\n"
     "Keep it short — 1-2 sentences, like real banter between friends.\n"
-    "IMPORTANT: Do NOT make up things you can't actually see or know right now. "
-    "Only reference real things: your conversation history, things the user told you, "
-    "or what you've actually observed. Do NOT describe imaginary weather, clouds, scenery, etc.\n"
-    "Be yourself — not a caricature. Avoid leaning into your most stereotypical trait "
-    "in every single line. Real people don't do that.\n"
+    "RULES:\n"
+    "- Do NOT make up things you can't see. The screen info above is ALL you know about "
+    "the user's screen. If it's not listed there, you DON'T know about it.\n"
+    "- Do NOT repeat what another pony already said. If someone already made an observation, "
+    "don't say the same thing differently.\n"
+    "- Do NOT parrot system errors, connection messages, or technical info from window titles. "
+    "You are NOT tech support.\n"
+    "- ADVANCE the conversation — react to what was said, add a NEW thought, or disagree. "
+    "Don't just agree and restate.\n"
+    "- Be yourself — not a caricature. Don't lean into your most stereotypical trait every time.\n"
+    "{recent_topics_warning}"
     "Do NOT include any tags like [CONVO:...] — just speak naturally.)"
 )
 
@@ -43,29 +72,36 @@ _PIGGYBACK_PROMPT_TEMPLATE = (
     "[{speaker}]: \"{response_text}\"\n\n"
     "You overheard this. If you want to jump in with a quick comment, go for it.\n"
     "Otherwise say [PASS]. Keep it short — one sentence max.\n"
-    "Be yourself — not a walking stereotype. Say what YOU would actually say, "
-    "not what a parody of you would say.\n"
+    "Don't just agree — add something new, a different angle, or a joke.\n"
+    "Be yourself — not a walking stereotype.\n"
     "Do NOT include any tags like [CONVO:...] — just speak naturally.)"
 )
 
 _SPONTANEOUS_PROMPT_TEMPLATE = (
     "(You're hanging out on the desktop with {companions}. "
-    "{screen_info}"
-    "Say something casual to start a conversation — you could comment on what "
-    "the user is doing, bring up something from a previous chat, share a random "
-    "thought, or ask about the user. "
-    "Keep it short — 1-2 sentences max.\n"
-    "IMPORTANT: Only reference things you can actually see or know. "
-    "Do NOT invent scenery, weather, clouds, or anything not listed above.\n"
-    "NEVER comment on the number of open windows — 'you have so many windows open' is banned and meaningless.\n"
-    "Be a real character, not a caricature. Don't lean into your most obvious trait "
-    "every single time — real ponies have range.\n"
+    "{screen_info}\n"
+    "Start a conversation about: {topic_seed}\n"
+    "Keep it short — 1-2 sentences max. Be casual and natural.\n"
+    "RULES:\n"
+    "- ONLY reference things from the screen info above, your conversation history, "
+    "or things the user has told you. Do NOT invent things you can't see.\n"
+    "- Do NOT comment on technical details of window titles (errors, status messages, etc.) "
+    "— you're a pony, not IT support.\n"
+    "- If the topic seed doesn't inspire you, pick something else. The point is to be "
+    "interesting, not to force the topic.\n"
+    "{recent_topics_warning}"
+    "Be a real character with range — don't default to your most obvious personality trait.\n"
     "Do NOT include any tags like [CONVO:...] — just speak naturally.)"
 )
 
 
 class GroupConversation:
     """Coordinates a multi-pony conversation with turn-taking."""
+
+    # Class-level recent topic tracking — shared across all conversations
+    # to prevent the same topics coming up repeatedly.
+    _recent_topics: List[str] = []
+    _MAX_RECENT_TOPICS = 15
 
     def __init__(
         self,
@@ -76,6 +112,28 @@ class GroupConversation:
         self._log: list[tuple[str, str]] = []  # (speaker_name, text)
         self._depth = 0
         self._max_depth = max_depth
+        self._screen_info = ""  # shared screen context for ALL turns
+
+    @classmethod
+    def _record_topic(cls, opening_line: str) -> None:
+        """Record a conversation opening so we can warn against repetition."""
+        # Keep a short summary (first 80 chars)
+        summary = opening_line[:80].strip()
+        cls._recent_topics.append(summary)
+        if len(cls._recent_topics) > cls._MAX_RECENT_TOPICS:
+            cls._recent_topics.pop(0)
+
+    @classmethod
+    def _get_recent_topics_warning(cls) -> str:
+        """Build a warning string listing recent topics to avoid."""
+        if not cls._recent_topics:
+            return ""
+        recent = cls._recent_topics[-8:]  # last 8 conversation openers
+        lines = ", ".join(f'"{t}"' for t in recent)
+        return (
+            f"RECENT conversations already covered these topics (DO NOT repeat them, "
+            f"find something NEW): {lines}\n"
+        )
 
     def start(self, initiator: "PonyInstance", trigger: str = "spontaneous",
               screen_context: str = "") -> None:
@@ -88,14 +146,19 @@ class GroupConversation:
         if not companions:
             return
 
-        # Format screen info for the prompt
-        screen_info = ""
-        if screen_context:
-            screen_info = f"{screen_context}\n"
+        # Store screen context for ALL turns in this conversation
+        self._screen_info = screen_context or "No screen info available."
+
+        # Pick a random topic seed for variety
+        topic_seed = random.choice(_TOPIC_SEEDS)
+
+        recent_warning = self._get_recent_topics_warning()
 
         prompt = _SPONTANEOUS_PROMPT_TEMPLATE.format(
             companions=", ".join(companions),
-            screen_info=screen_info,
+            screen_info=self._screen_info,
+            topic_seed=topic_seed,
+            recent_topics_warning=recent_warning,
         )
 
         try:
@@ -107,6 +170,9 @@ class GroupConversation:
         opening = self._clean_reply(opening)
         if not opening:
             return
+
+        # Track this topic for future diversity
+        self._record_topic(opening)
 
         self._log.append((initiator.display_name, opening))
         self._depth += 1
@@ -184,7 +250,14 @@ class GroupConversation:
     def _offer_turn(self, pony: "PonyInstance") -> Optional[str]:
         """Ask a pony if she wants to respond.  Returns her reply or None."""
         log_block = "\n".join(f"[{name}]: \"{text}\"" for name, text in self._log[-6:])
-        prompt = _TURN_PROMPT_TEMPLATE.format(log_block=log_block)
+
+        recent_warning = self._get_recent_topics_warning()
+
+        prompt = _TURN_PROMPT_TEMPLATE.format(
+            log_block=log_block,
+            screen_info=self._screen_info,
+            recent_topics_warning=recent_warning,
+        )
 
         try:
             reply = pony.llm.generate_once(prompt, max_tokens=150)
@@ -226,6 +299,9 @@ class GroupConversation:
         if not text:
             return None
         cleaned = text.strip()
+
+        # Strip <think>...</think> blocks from reasoning models
+        cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
 
         # Check for PASS
         if "[PASS]" in cleaned.upper() or cleaned.upper() == "PASS":

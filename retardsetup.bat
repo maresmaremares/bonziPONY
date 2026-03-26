@@ -350,7 +350,7 @@ echo    - Try right-click ^> Run as Administrator
 echo    - If torch keeps timing out (it's a 2GB download), just keep
 echo      running the script - it'll pick up where it left off
 echo.
-echo  Still stuck? Post a screenshot of this window in the Discord.
+echo  Still stuck? Post a screenshot of this window in the thread.
 echo.
 pause
 exit /b 1
@@ -435,7 +435,7 @@ if errorlevel 1 (
     echo  - Make sure config.yaml has valid API keys
     echo  - Check the error message above
     echo.
-    echo  Post a screenshot of this window in the Discord if stuck.
+    echo  Post a screenshot of this window in the thread if stuck.
     echo.
     pause
 )
