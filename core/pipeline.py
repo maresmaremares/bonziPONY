@@ -13,6 +13,7 @@ import logging
 import random
 import re
 import time
+from datetime import datetime
 from enum import Enum, auto
 from typing import TYPE_CHECKING, List, Optional
 
@@ -539,13 +540,19 @@ class Pipeline:
             # Nudge LLM to pick up on tasks/needs, compliance, and conversation flow
             if self.agent_loop:
                 hint = (
-                    "\n\n[System hint: Pick the RIGHT tag for the situation. "
-                    "Something they should do RIGHT NOW (actively neglecting a need) → [DIRECTIVE:goal:urgency]. "
-                    "Something they should do LATER today → [DIRECTIVE:goal:urgency:delay_minutes] (delays first nag). "
-                    "Something at a SPECIFIC TIME → [TIMER:HH:MM:goal]. "
-                    "Something RECURRING → [ROUTINE:...]. "
-                    "Something they're just MENTIONING (plans, stories) → NO TAG, just talk about it. "
-                    "Only create immediate directives for things they're clearly neglecting RIGHT NOW. "
+                    f"\n\n[System hint: Today is {datetime.now().strftime('%A, %Y-%m-%d')}. "
+                    "Pick the RIGHT tag for the situation:\n"
+                    "- RIGHT NOW → [DIRECTIVE:goal:urgency]\n"
+                    "- LATER TODAY → [DIRECTIVE:goal:urgency:delay_minutes] (number = minutes to defer)\n"
+                    "- SPECIFIC FUTURE DATE → [DIRECTIVE:goal:urgency:tomorrow] or [DIRECTIVE:goal:urgency:wednesday] "
+                    "or [DIRECTIVE:goal:urgency:next week] or [DIRECTIVE:goal:urgency:2026-03-30]\n"
+                    "- SPECIFIC TIME → [TIMER:HH:MM:goal]\n"
+                    "- RECURRING (daily/weekly/etc.) → [ROUTINE:...]\n"
+                    "  'twice a week' = TWO [ROUTINE:weekly:goal:urgency:day:HH:MM] tags with different days.\n"
+                    "  'every monday and tuesday' = TWO [ROUTINE:weekly:...] tags.\n"
+                    "  'every day' = [ROUTINE:daily:goal:urgency:HH:MM].\n"
+                    "- PERMANENTLY BLOCKED (quit porn, stop buying skins, stay off reddit) → [RULE:description]\n"
+                    "- Just MENTIONING (plans, stories) → NO TAG, just talk about it.\n"
                     "Goal must be a DIRECT ACTION like 'eat food', 'shower' — NEVER 'remind user to' or 'get user to'."
                 )
                 if self.agent_loop.has_directives:
@@ -654,6 +661,7 @@ class Pipeline:
                     urgency=parsed.directive.urgency,
                     source="user",
                     delay_minutes=parsed.directive.delay_minutes,
+                    trigger_date=parsed.directive.trigger_date,
                 )
 
             # Create timer from conversation if LLM used [TIMER:...] tag
@@ -662,6 +670,10 @@ class Pipeline:
                     time_str=parsed.timer.time_str,
                     action=parsed.timer.action,
                 )
+
+            # Create standing rule from conversation if LLM used [RULE:...] tag
+            if parsed.standing_rule and self.agent_loop:
+                self.agent_loop.add_standing_rule(description=parsed.standing_rule)
 
             # Create recurring routines from conversation if LLM used [ROUTINE:...] tags
             if parsed.routines and self.agent_loop:

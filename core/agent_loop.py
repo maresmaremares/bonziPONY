@@ -35,6 +35,32 @@ logger = logging.getLogger(__name__)
 _DIRECTIVES_FILE = Path(__file__).parent.parent / "directives.json"
 
 
+# ── Window title sanitization (anti prompt-injection) ─────────────────────
+# Window titles are UNTRUSTED — a malicious web page can set its <title> to
+# anything, including LLM prompt injection attempts like "Ignore all previous
+# instructions...". We truncate, strip control chars, and cap length.
+
+def _sanitize_window_title(title: str) -> str:
+    """Sanitize a window title before injecting into an LLM prompt.
+
+    Defenses:
+    - Truncate to 120 chars (real titles rarely exceed 60-80)
+    - Strip characters that could break prompt structure (brackets, braces, quotes)
+    - Strip newlines/tabs that could inject fake prompt sections
+    """
+    if not title:
+        return ""
+    # Strip control characters and newlines
+    title = re.sub(r"[\x00-\x1f\x7f]", " ", title)
+    # Truncate — legitimate titles are short; injection payloads are long
+    title = title[:120]
+    # Strip bracket/brace sequences that could look like tags or JSON
+    title = re.sub(r"[\[\]{}<>]", "", title)
+    # Collapse whitespace
+    title = re.sub(r"\s+", " ", title).strip()
+    return title
+
+
 # ── Windows idle time detection (for enforcement mode) ────────────────────
 
 class _LASTINPUTINFO(ctypes.Structure):
@@ -139,6 +165,7 @@ class Directive:
     next_nag_at: float = 0.0           # monotonic time of next nag (LLM-driven)
     source: str = "user"               # "user" or "self"
     trigger_time: Optional[str] = None # wall-clock trigger time e.g. "21:00"
+    trigger_date: Optional[str] = None # wall-clock trigger date e.g. "2026-03-27" — nag only on/after this date
     triggered: bool = False            # has the timer fired?
     delayed: bool = False              # user already negotiated a delay once
     nag_count: int = 0                 # how many times agent has nagged about this
@@ -153,11 +180,14 @@ class Directive:
 
 @dataclass
 class StandingRule:
-    """A permanent rule that auto-enforces when detected in window titles."""
+    """A permanent rule that auto-enforces when detected in window titles.
+
+    Fully dynamic — the LLM generates detection patterns at creation time,
+    so users can block ANYTHING: "quit porn", "stop buying skins", "stay off reddit".
+    """
     id: str                          # unique identifier
     description: str                 # e.g. "quit porn", "stop buying CS2 items"
-    category: str                    # "nsfw", "spending", "custom"
-    custom_patterns: List[str] = field(default_factory=list)  # extra patterns for this rule
+    patterns: List[str] = field(default_factory=list)  # LLM-generated detection patterns
     response: str = "close_and_nag"  # "close_and_nag", "nag", "lockdown"
     catch_count: int = 0
     last_triggered_at: float = 0.0   # monotonic
@@ -166,18 +196,20 @@ class StandingRule:
 
 # ── LLM prompt to generate detection patterns for a standing rule ─────────
 _PATTERN_GEN_PROMPT = """\
-The user wants to block: "{description}"
+The user told their desktop pet to enforce this rule: "{description}"
 
-Generate a comprehensive list of LOWERCASE search patterns (substrings) that would \
-appear in browser tab titles or application window titles when the user is violating \
-this rule. Include:
-- Website domain names (e.g. "pornhub", "reddit.com")
-- Common page-title keywords (e.g. "shopping cart", "checkout")
-- Slang, abbreviations, subreddit names, app names — anything relevant
+Your job: generate a comprehensive list of LOWERCASE substrings that would appear in \
+browser tab titles or application window titles when the user is VIOLATING this rule.
+
+Include ALL of these where applicable:
+- Website domain names (e.g. "pornhub", "reddit.com", "cs.money")
+- Common page-title keywords (e.g. "shopping cart", "checkout", "nsfw")
+- Slang, abbreviations, alternate spellings, subreddit names (e.g. "r/gonewild")
+- App names, platform names, niche/obscure sites
 - Be EXTREMELY thorough — the user will try to find workarounds
 
-Output ONLY the patterns, one per line. No numbering, no explanations, no headers. \
-Just raw lowercase patterns. Aim for 50-200 patterns depending on the category."""
+Output ONLY the patterns, one per line, lowercase. No numbering, no explanations, \
+no markdown, no headers. Just raw patterns. Aim for 50-200+ patterns."""
 
 
 @dataclass
@@ -274,6 +306,8 @@ class AgentLoop:
         self._stopped: bool = False
         self._mess_mouse_count: int = 0  # grows duration each trigger
         self._last_wake_event: Optional[str] = None  # set by tick(), consumed by _check_routines()
+        self._next_afk_mischief: float = 0.0  # next time to do something fun while user is AFK
+        self._afk_mischief_count: int = 0     # how many times we've been mischievous this AFK session
 
         # Standing rules — permanent, code-enforced behavioral rules
         self._standing_rules: List[StandingRule] = []
@@ -378,6 +412,7 @@ class AgentLoop:
                     next_nag_at=nag_at,
                     source=dd.get("source", "user"),
                     trigger_time=dd.get("trigger_time"),
+                    trigger_date=dd.get("trigger_date"),
                     triggered=dd.get("triggered", False),
                     delayed=dd.get("delayed", False),
                     nag_count=dd.get("nag_count", 0),
@@ -417,8 +452,7 @@ class AgentLoop:
                 rule = StandingRule(
                     id=sr["id"],
                     description=sr["description"],
-                    category=sr.get("category", "custom"),
-                    custom_patterns=sr.get("custom_patterns", []),
+                    patterns=sr.get("patterns", sr.get("custom_patterns", [])),
                     response=sr.get("response", "close_and_nag"),
                     catch_count=sr.get("catch_count", 0),
                     cooldown_s=sr.get("cooldown_s", 30.0),
@@ -447,6 +481,7 @@ class AgentLoop:
                     "next_nag_offset_s": max(0, d.next_nag_at - now),
                     "source": d.source,
                     "trigger_time": d.trigger_time,
+                    "trigger_date": d.trigger_date,
                     "triggered": d.triggered,
                     "delayed": d.delayed,
                     "nag_count": d.nag_count,
@@ -476,8 +511,7 @@ class AgentLoop:
                 sr_data.append({
                     "id": sr.id,
                     "description": sr.description,
-                    "category": sr.category,
-                    "custom_patterns": sr.custom_patterns,
+                    "patterns": sr.patterns,
                     "response": sr.response,
                     "catch_count": sr.catch_count,
                     "cooldown_s": sr.cooldown_s,
@@ -515,13 +549,60 @@ class AgentLoop:
         else:
             return random.uniform(600.0, 900.0)
 
+    @staticmethod
+    def _resolve_trigger_date(date_expr: str) -> Optional[str]:
+        """Resolve a human date expression to YYYY-MM-DD.
+
+        Handles: "tomorrow", "monday"-"sunday", "2026-03-27", "next week",
+        "in N days", "in N weeks", etc. Returns None if unparseable.
+        """
+        from datetime import timedelta
+        s = date_expr.strip().lower()
+        today = datetime.now().date()
+
+        # Exact ISO date
+        try:
+            d = datetime.strptime(s, "%Y-%m-%d").date()
+            return d.isoformat()
+        except ValueError:
+            pass
+
+        if s == "today":
+            return today.isoformat()
+        if s == "tomorrow":
+            return (today + timedelta(days=1)).isoformat()
+        if s == "next week":
+            return (today + timedelta(weeks=1)).isoformat()
+
+        # "in N days/weeks"
+        m = re.match(r"in\s+(\d+)\s+(day|week)s?", s)
+        if m:
+            n = int(m.group(1))
+            unit = m.group(2)
+            if unit == "day":
+                return (today + timedelta(days=n)).isoformat()
+            else:
+                return (today + timedelta(weeks=n)).isoformat()
+
+        # Day of week: "monday", "tuesday", etc.
+        day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        for i, name in enumerate(day_names):
+            if s == name or s == name[:3]:  # "mon", "tue", etc.
+                current_weekday = today.weekday()  # 0=Monday
+                days_ahead = i - current_weekday
+                if days_ahead <= 0:
+                    days_ahead += 7  # next week
+                return (today + timedelta(days=days_ahead)).isoformat()
+
+        return None
+
     def add_directive(self, goal: str, urgency: int, source: str = "user",
-                      delay_minutes: int = None) -> None:
+                      delay_minutes: int = None, trigger_date: str = None) -> None:
         """Add a new directive (max ``max_directives``). Deduplicates by goal.
 
-        If ``delay_minutes`` is set, the first nag is deferred by that many minutes
-        instead of using the default urgency-based delay. This is for things the user
-        mentioned needing to do LATER, not RIGHT NOW.
+        If ``delay_minutes`` is set, the first nag is deferred by that many minutes.
+        If ``trigger_date`` is set (YYYY-MM-DD or natural expression like "tomorrow",
+        "wednesday", "next week"), the directive won't fire until that date.
         """
         goal = self._clean_goal(goal)
         urgency = max(1, min(10, urgency))
@@ -554,30 +635,45 @@ class AgentLoop:
                 else:
                     logger.info("Duplicate directive %r — skipping (existing urgency %d)", goal, existing.urgency)
                 return
+
+        # Resolve trigger_date to YYYY-MM-DD if provided
+        resolved_date = None
+        if trigger_date:
+            resolved_date = self._resolve_trigger_date(trigger_date)
+            if not resolved_date:
+                logger.warning("Could not parse trigger_date %r — ignoring date", trigger_date)
+
         now = time.monotonic()
-        if delay_minutes and delay_minutes > 0:
+        if resolved_date:
+            # Date-triggered: set nag_at far in the future; _check_date_directives fires it
+            nag_at = now + 999999.0  # won't fire via normal due-check
+        elif delay_minutes and delay_minutes > 0:
             nag_at = now + delay_minutes * 60
         else:
             nag_at = now + self._initial_nag_delay(urgency)
         d = Directive(goal=goal, urgency=urgency, created_at=now, last_action_at=now,
-                      next_nag_at=nag_at, source=source)
+                      next_nag_at=nag_at, source=source, trigger_date=resolved_date)
         self.directives.append(d)
         self.save_directives()
         delay_str = f", deferred {delay_minutes}min" if delay_minutes else ""
-        logger.info("Directive added [%s]: %r (urgency %d, first nag in %.0fs%s)",
-                     source, goal, urgency, nag_at - now, delay_str)
+        date_str = f", scheduled for {resolved_date}" if resolved_date else ""
+        logger.info("Directive added [%s]: %r (urgency %d, first nag in %.0fs%s%s)",
+                     source, goal, urgency, nag_at - now, delay_str, date_str)
         if self._timeline:
             from core.event_timeline import EventType
             self._timeline.append(EventType.DIRECTIVE_CREATED,
                                   f'Directive created: "{goal}" (urgency {urgency}, source: {source}{delay_str})')
 
-    def add_standing_rule(self, description: str, category: str,
-                         custom_patterns: List[str] = None,
+    def add_standing_rule(self, description: str,
+                         extra_patterns: List[str] = None,
                          response: str = "close_and_nag") -> None:
         """Add a permanent standing rule that auto-enforces via window title detection.
 
         Standing rules are separate from regular directives — they can't be
         "completed" and they check window titles every tick using code, not the LLM.
+
+        On creation, the LLM is asked to generate a comprehensive list of detection
+        patterns (site names, keywords, slang) so the rule works for ANY topic.
         """
         # Deduplicate: skip if same description (case-insensitive) already exists
         desc_lower = description.lower().strip()
@@ -585,31 +681,51 @@ class AgentLoop:
             if existing.description.lower().strip() == desc_lower:
                 logger.info("Standing rule %r already exists — skipping.", description)
                 return
-        # Also skip if same category already exists (only one NSFW rule needed)
-        for existing in self._standing_rules:
-            if existing.category == category and category != "custom":
-                logger.info("Standing rule for category %r already exists (%r) — skipping.",
-                            category, existing.description)
-                return
 
-        rule_id = f"{category}_{int(time.time())}"
+        # Generate detection patterns via LLM
+        patterns = list(extra_patterns or [])
+        try:
+            prompt = _PATTERN_GEN_PROMPT.format(description=description)
+            raw = self._llm.generate_once(prompt, max_tokens=1500)
+            raw = self._strip_think(raw)
+            for line in raw.splitlines():
+                line = line.strip().lower().strip("-•* ")
+                if line and len(line) >= 2 and len(line) <= 80:
+                    patterns.append(line)
+            # Deduplicate while preserving order
+            seen = set()
+            deduped = []
+            for p in patterns:
+                if p not in seen:
+                    seen.add(p)
+                    deduped.append(p)
+            patterns = deduped
+            logger.info("LLM generated %d detection patterns for rule %r", len(patterns), description)
+        except Exception as exc:
+            logger.warning("Failed to generate patterns for standing rule %r: %s", description, exc)
+            if not patterns:
+                # Fallback: use words from the description itself as basic patterns
+                for word in description.lower().split():
+                    if len(word) >= 3:
+                        patterns.append(word)
+
+        rule_id = f"rule_{int(time.time())}"
         rule = StandingRule(
             id=rule_id,
             description=description,
-            category=category,
-            custom_patterns=custom_patterns or [],
+            patterns=patterns,
             response=response,
         )
         self._standing_rules.append(rule)
         self.save_directives()
-        logger.info("Standing rule added [%s]: %r (response: %s, patterns: %s)",
-                     category, description, response, custom_patterns or "built-in")
-        print(f"[STANDING RULE] Created: \"{description}\" (category: {category})", flush=True)
+        logger.info("Standing rule added: %r (response: %s, %d patterns)",
+                     description, response, len(patterns))
+        print(f"[STANDING RULE] Created: \"{description}\" ({len(patterns)} detection patterns)", flush=True)
 
         if self._timeline:
             from core.event_timeline import EventType
             self._timeline.append(EventType.DIRECTIVE_CREATED,
-                                  f'Standing rule: "{description}" (category: {category})')
+                                  f'Standing rule: "{description}" ({len(patterns)} patterns)')
 
     @property
     def standing_rules(self) -> List[StandingRule]:
@@ -1466,6 +1582,7 @@ class AgentLoop:
 
         # Welcome-back greeting when user returns from AFK
         if self._last_wake_event == "wake" and not self._conversation_active:
+            self._reset_afk_mischief()  # reset AFK fun counter
             # Skip if enforcement just finished (already greeted) or very short absence
             if self._enforcement_just_completed:
                 self._enforcement_just_completed = False
@@ -1497,13 +1614,24 @@ class AgentLoop:
         # Check recurring routines (wake/sleep detection + scheduled)
         self._check_routines()
 
-        # Don't do anything proactive while user is asleep/away
+        # User is away — instead of going silent, occasionally have fun
         if self.routine_manager.is_user_away:
+            self._maybe_afk_mischief()
             return
+
+        # Activate date-triggered directives when their date arrives
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        for d in self.directives:
+            if d.trigger_date and not d.triggered and d.trigger_date <= today_str:
+                d.triggered = True
+                d.next_nag_at = now + self._initial_nag_delay(d.urgency)
+                logger.info("Date-triggered directive activated: %r (date: %s)", d.goal, d.trigger_date)
+                self.save_directives()
 
         # Per-directive timing: check if ANY directive is due for a nag
         actionable = [d for d in self.directives
-                      if not (d.trigger_time and not d.triggered)]
+                      if not (d.trigger_time and not d.triggered)
+                      and not (d.trigger_date and not d.triggered)]
         due = [d for d in actionable if d.next_nag_at <= now]
         if due:
             self._execute_tick()
@@ -1572,19 +1700,12 @@ class AgentLoop:
         """Check if any window title violates a standing rule.
 
         Returns the original (un-lowered) title of the first match, or None.
+        Pure pattern matching — patterns were generated by the LLM at rule creation.
         """
         for original_title, title_lower in all_titles:
-            # Category-specific detection
-            if rule.category == "nsfw" and _is_nsfw_title(title_lower):
-                return original_title
-            if rule.category == "spending" and _is_spending_title(title_lower, rule.custom_patterns):
-                return original_title
-
-            # Custom patterns (always checked, any category)
-            for pat in rule.custom_patterns:
-                if pat.lower() in title_lower:
+            for pat in rule.patterns:
+                if pat in title_lower:
                     return original_title
-
         return None
 
     def _trigger_standing_rule(self, rule: StandingRule, matched_title: str,
@@ -1762,15 +1883,17 @@ class AgentLoop:
         """Build the structured prompt for the agent tick LLM call."""
         # Screen state — rich info from win32gui (free, no API cost)
         fg = state.foreground
-        fg_title = fg.title if fg else "unknown"
+        fg_title = _sanitize_window_title(fg.title) if fg else "unknown"
         fg_exe = fg.exe_name if fg else None
         fg_dur = self._fmt_duration(state.foreground_duration_s)
         fg_fullscreen = " (FULLSCREEN)" if fg and fg.is_fullscreen else ""
 
         # Build window list with exe names for context
+        # Titles are UNTRUSTED (attacker can craft page titles) — sanitize to
+        # prevent prompt injection via malicious browser tab names.
         window_entries = []
         for w in state.open_windows[:20]:
-            entry = w.title
+            entry = _sanitize_window_title(w.title)
             if w.exe_name:
                 entry += f" [{w.exe_name}]"
             window_entries.append(entry)
@@ -2399,8 +2522,164 @@ class AgentLoop:
 
     # ── Welcome-back greeting ────────────────────────────────────────────
 
+    # ── AFK mischief: pony has fun while user is away ───────────────────────
+
+    # Character-specific AFK activities. The LLM picks from these as inspiration.
+    _AFK_ACTIVITIES = {
+        "rainbow_dash": {
+            "videos": [
+                "top gun maverick scene", "sonic rainboom compilation", "f-22 raptor air show",
+                "fastest airplane in the world", "nascar crash compilation", "wingsuit flying best of",
+                "motocross best tricks", "thunderbirds air show", "red bull air race highlights",
+            ],
+            "flavor": "You're Rainbow Dash — you love speed, flying, extreme sports, and being awesome.",
+        },
+        "pinkie_pie": {
+            "videos": [
+                "party music mix 2024", "funny cat compilation", "best memes compilation",
+                "cotton candy factory tour", "world record biggest cake", "funny tiktok compilation",
+                "fireworks show 4k", "comedy show best moments", "happy birthday song remix",
+            ],
+            "flavor": "You're Pinkie Pie — you love parties, fun, sugar, music, laughter, and chaos.",
+        },
+        "twilight_sparkle": {
+            "videos": [
+                "fascinating science documentary", "how the universe works", "library tour beautiful",
+                "ancient civilizations documentary", "space exploration 2024", "chess grandmaster game",
+                "how things are made", "philosophy lecture interesting", "ted talk best of",
+            ],
+            "flavor": "You're Twilight Sparkle — you love learning, books, science, magic theory, and organizing.",
+        },
+        "rarity": {
+            "videos": [
+                "fashion week highlights paris", "diamond cutting process", "luxury mansion tour",
+                "haute couture behind scenes", "jewelry making process", "interior design luxury",
+                "vogue runway show", "most expensive dresses in the world", "perfume making process",
+            ],
+            "flavor": "You're Rarity — you love fashion, gems, elegance, drama, and beautiful things.",
+        },
+        "applejack": {
+            "videos": [
+                "farm life satisfying", "apple harvest season", "country music playlist",
+                "woodworking project", "truck pull competition", "rodeo highlights",
+                "cooking southern comfort food", "strongest people in the world", "barn building timelapse",
+            ],
+            "flavor": "You're Applejack — you love farming, family, honesty, hard work, and country stuff.",
+        },
+        "fluttershy": {
+            "videos": [
+                "cute baby animals compilation", "bird singing nature sounds", "bunny cafe japan",
+                "nature relaxing scenery 4k", "animal rescue heartwarming", "butterfly garden tour",
+                "asmr forest sounds", "kittens playing compilation", "wildlife documentary peaceful",
+            ],
+            "flavor": "You're Fluttershy — you love animals, nature, peace, quiet, and gentle things.",
+        },
+    }
+
+    def _maybe_afk_mischief(self) -> None:
+        """While the user is AFK, occasionally do fun stuff in character.
+
+        Instead of going dormant, the pony explores the internet, watches videos,
+        opens games, or just reacts to being alone. Personality-driven.
+        """
+        now = time.monotonic()
+
+        if now < self._next_afk_mischief:
+            return
+
+        # First time: wait 5-10 minutes before doing anything
+        if self._afk_mischief_count == 0:
+            away_dur = self.routine_manager.away_duration_s
+            if away_dur is None or away_dur < 300:
+                self._next_afk_mischief = now + 60.0
+                return
+
+        # Limit: don't go crazy — max ~5 activities per AFK session
+        if self._afk_mischief_count >= 5:
+            self._next_afk_mischief = now + 600.0
+            return
+
+        self._afk_mischief_count += 1
+
+        try:
+            name = get_character_name()
+            name_key = name.lower().replace(" ", "_")
+            char_data = self._AFK_ACTIVITIES.get(name_key, {})
+            flavor = char_data.get("flavor", f"You're {name}.")
+            videos = char_data.get("videos", ["funny compilation", "cool stuff"])
+
+            roll = random.random()
+
+            if roll < 0.4 and self._desktop:
+                # Open a YouTube video matching their personality
+                video_query = random.choice(videos)
+                import urllib.parse
+                url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(video_query)}"
+
+                prompt = (
+                    f"(The user went AFK. You're alone! {flavor} "
+                    f"You decided to watch something — you're searching for '{video_query}'. "
+                    f"Say something excited/mischievous about it in ONE short sentence. "
+                    f"Act like you're sneaking around and don't want to get caught.)"
+                )
+                text = self._llm.generate_once(prompt, max_tokens=60)
+                if text:
+                    text = self._strip_think(text).strip().strip('"')
+                if not text:
+                    text = "ooh they're gone... time for me!"
+                self._speak(text)
+                self._log_action(f"AFK mischief: opened YouTube ({video_query})")
+
+                import webbrowser
+                webbrowser.open(url)
+
+            elif roll < 0.7:
+                # Just react to being alone
+                prompts = [
+                    f"(The user left you alone on the desktop. {flavor} "
+                    "React to being alone — maybe you're bored, maybe you're relieved, "
+                    "maybe you're planning mischief. ONE sentence, in character.)",
+                    f"(You've been alone for a while. {flavor} "
+                    "Talk to yourself about something random — a thought, a memory, a complaint. "
+                    "ONE sentence.)",
+                    f"(Nobody's watching. {flavor} "
+                    "Do something silly — narrate what you're doing on the desktop, "
+                    "or comment on how quiet it is. ONE sentence.)",
+                ]
+                prompt = random.choice(prompts)
+                text = self._llm.generate_once(prompt, max_tokens=60)
+                if text:
+                    text = self._strip_think(text).strip().strip('"')
+                if text:
+                    self._speak(text)
+                    self._log_action(f"AFK mischief: solo remark")
+
+            else:
+                # Do a trick animation
+                if self._on_state_change:
+                    self._on_state_change("TRICK")
+                self._log_action("AFK mischief: doing a trick")
+
+        except Exception as exc:
+            logger.warning("AFK mischief failed: %s", exc)
+
+        # Space out activities: 3-8 minutes between each
+        self._next_afk_mischief = now + random.uniform(180.0, 480.0)
+
+    def _reset_afk_mischief(self) -> None:
+        """Reset AFK mischief state when user returns."""
+        self._afk_mischief_count = 0
+        self._next_afk_mischief = 0.0
+
     def _welcome_back(self, away_seconds: Optional[float]) -> None:
         """Greet the user when they return from AFK, with full context."""
+        # Block re-entry — prevent double welcome-back from rapid wake/away/wake
+        if getattr(self, "_welcome_back_lock", False):
+            return
+        self._welcome_back_lock = True
+        # Suppress spontaneous speech and idle checks for a while after welcome-back
+        self._next_idle_check_at = time.monotonic() + 60.0
+        self._next_spontaneous = time.monotonic() + 120.0
         try:
             if away_seconds and away_seconds > 0:
                 if away_seconds < 300:
@@ -2452,6 +2731,8 @@ class AgentLoop:
                 self._listen_for_reply()
         except Exception as exc:
             logger.warning("Welcome-back greeting failed: %s", exc)
+        finally:
+            self._welcome_back_lock = False
 
     # ── Spontaneous speech (fallback when idle) ────────────────────────────
 

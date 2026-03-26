@@ -47,8 +47,11 @@ _PERSIST_PATTERN = re.compile(r"\[PERSIST:\s*(\d+)\s*\]", re.IGNORECASE)
 # Matches [MOVETO:top_left] — move pony to screen region
 _MOVETO_PATTERN = re.compile(r"\[MOVETO:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 
+# Matches [RULE:quit porn] or [RULE:stop buying CS2 items] — create a standing rule
+_RULE_PATTERN = re.compile(r"\[RULE:([^\]]+)\]", re.IGNORECASE)
+
 # Catch-all: strip any remaining [TAG:...] bracket expressions the LLM may produce
-_LEFTOVER_TAG_PATTERN = re.compile(r"\[(?:MOVETO|PERSIST|ANIM|ACTION|CONVO|DESKTOP|DIRECTIVE|TIMER|ROUTINE|ENFORCE|DONE|DELAY)\s*:[^\]]*\]", re.IGNORECASE)
+_LEFTOVER_TAG_PATTERN = re.compile(r"\[(?:MOVETO|PERSIST|ANIM|ACTION|CONVO|DESKTOP|DIRECTIVE|TIMER|ROUTINE|ENFORCE|DONE|DELAY|RULE)\s*:[^\]]*\]", re.IGNORECASE)
 
 # Strip <think>...</think> blocks from reasoning models (DeepSeek, QwQ, etc.)
 _THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -91,6 +94,7 @@ class DirectiveTag:
     goal: str
     urgency: int
     delay_minutes: Optional[int] = None  # deferred directive — wait N min before first nag
+    trigger_date: Optional[str] = None   # "tomorrow", "wednesday", "2026-03-27", "next week", etc.
 
 
 @dataclass
@@ -124,6 +128,7 @@ class ParsedResponse:
     end_conversation: bool = False         # LLM signals conversation is over
     persist_seconds: Optional[int] = None  # keep action animation for N seconds
     moveto_region: Optional[str] = None    # move pony to screen region
+    standing_rule: Optional[str] = None    # create a permanent standing rule
 
 
 def parse_response(raw: str) -> ParsedResponse:
@@ -169,22 +174,37 @@ def parse_response(raw: str) -> ParsedResponse:
                 ))
 
     # Parse first DIRECTIVE tag (only one allowed per response)
-    # Supports: [DIRECTIVE:goal:urgency] and [DIRECTIVE:goal:urgency:delay_minutes]
+    # Supports:
+    #   [DIRECTIVE:goal:urgency]
+    #   [DIRECTIVE:goal:urgency:30]          — delay_minutes (number)
+    #   [DIRECTIVE:goal:urgency:tomorrow]    — trigger_date (non-number)
+    #   [DIRECTIVE:goal:urgency:wednesday]   — trigger_date
+    #   [DIRECTIVE:goal:urgency:2026-03-27]  — trigger_date (ISO)
     dir_match = _DIRECTIVE_PATTERN.search(raw)
     if dir_match:
         content = dir_match.group(1)
-        # Try goal:urgency:delay format first (rsplit from right, max 2 splits)
+        # Try goal:urgency:extra format first (rsplit from right, max 2 splits)
         parts3 = content.rsplit(":", 2)
         parsed_dir = False
         if len(parts3) == 3:
             try:
                 urg = int(parts3[1].strip())
-                delay = int(parts3[2].strip())
-                directive = DirectiveTag(
-                    goal=parts3[0].strip(),
-                    urgency=max(1, min(10, urg)),
-                    delay_minutes=delay if delay > 0 else None,
-                )
+                extra = parts3[2].strip()
+                # If extra is a number → delay_minutes; otherwise → trigger_date
+                try:
+                    delay = int(extra)
+                    directive = DirectiveTag(
+                        goal=parts3[0].strip(),
+                        urgency=max(1, min(10, urg)),
+                        delay_minutes=delay if delay > 0 else None,
+                    )
+                except ValueError:
+                    # Not a number — treat as date expression
+                    directive = DirectiveTag(
+                        goal=parts3[0].strip(),
+                        urgency=max(1, min(10, urg)),
+                        trigger_date=extra if extra else None,
+                    )
                 parsed_dir = True
             except ValueError:
                 pass  # fall through to goal:urgency
@@ -299,6 +319,12 @@ def parse_response(raw: str) -> ParsedResponse:
     if moveto_match:
         moveto_region = moveto_match.group(1).strip().lower().replace(" ", "_")
 
+    # Parse [RULE:description] tag — create a permanent standing rule
+    standing_rule = None
+    rule_match = _RULE_PATTERN.search(raw)
+    if rule_match:
+        standing_rule = rule_match.group(1).strip()
+
     clean_text = _ACTION_PATTERN.sub("", raw)
     clean_text = _DESKTOP_PATTERN.sub("", clean_text)
     clean_text = _DESKTOP_TRUNCATED.sub("", clean_text)
@@ -311,6 +337,7 @@ def parse_response(raw: str) -> ParsedResponse:
     clean_text = _CONVO_PATTERN.sub("", clean_text)
     clean_text = _PERSIST_PATTERN.sub("", clean_text)
     clean_text = _MOVETO_PATTERN.sub("", clean_text)
+    clean_text = _RULE_PATTERN.sub("", clean_text)
     clean_text = _LEFTOVER_TAG_PATTERN.sub("", clean_text).strip()
     # Sanitize for TTS — strip code, markdown, HTML, URLs
     clean_text = sanitize_for_speech(clean_text)
@@ -319,7 +346,8 @@ def parse_response(raw: str) -> ParsedResponse:
                           enforce_minutes=enforce_minutes, done_directive=done_directive,
                           delay_minutes=delay_minutes, delay_keyword=delay_keyword,
                           end_conversation=end_conversation,
-                          persist_seconds=persist_seconds, moveto_region=moveto_region)
+                          persist_seconds=persist_seconds, moveto_region=moveto_region,
+                          standing_rule=standing_rule)
 
 
 def sanitize_for_speech(text: str) -> str:

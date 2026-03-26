@@ -40,6 +40,26 @@ _BLOCKED_HOTKEYS = {
     "ctrl+alt+delete", "ctrl+alt+del",
     "alt+f4",          # could close our own console/window and kill the process
     "win+l",           # lock workstation
+    "win+r",           # Run dialog — combined with PASTE = arbitrary command execution
+    "win+e",           # File Explorer (path traversal risk with PASTE)
+    "win+x",           # Power user menu
+    "win+i",           # Settings
+    "win+u",           # Accessibility settings
+    "win+pause",       # System info
+    "ctrl+shift+escape",  # Task manager
+}
+
+# Any hotkey starting with "win+" is blocked unless explicitly allowed here.
+# This prevents prompt-injection attacks from using Windows key combos to
+# reach shell/run dialogs for arbitrary command execution.
+_ALLOWED_WIN_HOTKEYS = {
+    "win+d",           # show desktop (used by ALT_TAB command)
+    "win+down",        # minimize window
+    "win+up",          # maximize window
+    "win+left",        # snap left
+    "win+right",       # snap right
+    "win+m",           # minimize all
+    "win+home",        # minimize all except foreground
 }
 
 
@@ -506,6 +526,15 @@ class DesktopController:
             logger.warning("Blocked hotkey: %s", combo)
             return
 
+        # Block ALL win+* combos except the safe allow-list.
+        # This prevents prompt-injection attacks from reaching Run dialog,
+        # File Explorer, or other shell entry points.
+        keys_lower = [a.lower() for a in args]
+        if "win" in keys_lower or "winleft" in keys_lower or "winright" in keys_lower:
+            if combo not in _ALLOWED_WIN_HOTKEYS:
+                logger.warning("Blocked unsafe Windows hotkey: %s", combo)
+                return
+
         logger.info("Hotkey: %s", "+".join(args))
         self._pyautogui.hotkey(*args)
 
@@ -540,9 +569,14 @@ class DesktopController:
         else:
             url = f"https://www.{raw}.com"
 
-        # Only allow http/https schemes
-        if not url.lower().startswith(("http://", "https://")):
+        # Only allow http/https schemes — block javascript:, file:, data:, vbscript: etc.
+        url_lower = url.lower().strip()
+        if not url_lower.startswith(("http://", "https://")):
             logger.warning("Blocked non-http URL scheme: %s", url)
+            return
+        # Block data: URIs disguised with double-encoding or padding
+        if "data:" in url_lower or "javascript:" in url_lower or "vbscript:" in url_lower:
+            logger.warning("Blocked dangerous URL content: %s", url[:80])
             return
 
         logger.info("Opening URL: %s", url)
@@ -1030,6 +1064,11 @@ class DesktopController:
                     results.append((name, os.path.join(root, fname), source, ""))
         return results
 
+    # File extensions that os.startfile is allowed to open.
+    # Blocks scripts (.bat, .cmd, .vbs, .ps1, .wsf, .js) that could execute
+    # arbitrary code if a malicious shortcut is placed on the Desktop.
+    _SAFE_LAUNCH_EXTS = frozenset({".exe", ".lnk", ".url", ".appref-ms"})
+
     def launch_app(self, name: str) -> tuple:
         """Launch an app by fuzzy name match. Returns (success, matched_name)."""
         if not DesktopController._installed_apps:
@@ -1044,6 +1083,11 @@ class DesktopController:
                     if path.startswith("steam://"):
                         webbrowser.open(path)
                     else:
+                        # Only allow safe file types — block scripts (.bat, .cmd, .vbs, .ps1)
+                        ext = os.path.splitext(path)[1].lower()
+                        if ext not in self._SAFE_LAUNCH_EXTS:
+                            logger.warning("Blocked unsafe file type for launch_app: %s (%s)", path, ext)
+                            return (False, app_name)
                         os.startfile(path)
                     logger.info("Launched app: %s (%s)", app_name, source)
                     return (True, app_name)
