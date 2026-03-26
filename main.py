@@ -26,7 +26,11 @@ except ImportError:
         _sys.modules["pyaudio"] = _pa
     except ImportError:
         pass  # neither installed — mic features will be unavailable
-del _sys, _pa
+del _sys
+try:
+    del _pa
+except NameError:
+    pass
 
 import argparse
 import logging

@@ -21,38 +21,43 @@ if not exist ".git" goto :skip_update
 echo  Checking for updates...
 git fetch origin >nul 2>&1
 if errorlevel 1 (
-    echo  [WARN] Could not check for updates (no internet?). Continuing...
+    echo  [WARN] Could not check for updates ^(no internet?^). Continuing...
     goto :skip_update
 )
 
-:: Check if we're behind the remote
+:: Check if we're behind the remote - use ls-remote instead of @{u}
+:: which breaks batch when no upstream is set
+set "LOCAL="
+set "REMOTE="
 for /f "tokens=*" %%a in ('git rev-parse HEAD 2^>nul') do set "LOCAL=%%a"
-for /f "tokens=*" %%a in ('git rev-parse @{u} 2^>nul') do set "REMOTE=%%a"
+for /f "tokens=1" %%a in ('git ls-remote origin HEAD 2^>nul') do set "REMOTE=%%a"
+if not defined LOCAL goto :skip_update
+if not defined REMOTE goto :skip_update
 if "!LOCAL!"=="!REMOTE!" (
     echo  [OK] Already up to date.
-) else (
-    echo  [!!] Update available! Pulling latest version...
-    git pull --ff-only origin 2>nul
-    if errorlevel 1 (
-        echo  [WARN] Auto-pull failed (local changes?). Trying reset...
-        git stash >nul 2>&1
-        git pull --ff-only origin 2>nul
-        if errorlevel 1 (
-            echo  [WARN] Update failed. Continuing with current version.
-            git stash pop >nul 2>&1
-        ) else (
-            echo  [OK] Updated! Stashed local changes (use "git stash pop" to restore).
-        )
-    ) else (
-        echo  [OK] Updated to latest version!
-    )
+    goto :skip_update
 )
+echo  [!!] Update available! Pulling latest version...
+git pull --ff-only origin master >nul 2>&1
+if not errorlevel 1 (
+    echo  [OK] Updated to latest version!
+    goto :skip_update
+)
+echo  [WARN] Auto-pull failed. Trying stash + pull...
+git stash >nul 2>&1
+git pull --ff-only origin master >nul 2>&1
+if not errorlevel 1 (
+    echo  [OK] Updated! Stashed local changes.
+    goto :skip_update
+)
+echo  [WARN] Update failed. Continuing with current version.
+git stash pop >nul 2>&1
 echo.
 :skip_update
 
 :: ══════════════════════════════════════════════════════════════
 ::  STEP 1: Find Python 3.10, 3.11, or 3.12
-::  (3.13+ does NOT work — PyQt5 and torch have no wheels)
+::  (3.13+ does NOT work - PyQt5 and torch have no wheels)
 :: ══════════════════════════════════════════════════════════════
 
 set "PYTHON="
@@ -94,7 +99,7 @@ for /f "tokens=*" %%p in ('python -c "import sys; v=sys.version_info; print(sys.
 if defined PYTHON goto :found_python
 
 :: ══════════════════════════════════════════════════════════════
-::  No compatible Python — download it automatically
+::  No compatible Python - download it automatically
 :: ══════════════════════════════════════════════════════════════
 echo  [!] No compatible Python found. Installing Python 3.11...
 echo.
@@ -108,7 +113,7 @@ if "%PROCESSOR_ARCHITECTURE%"=="x86" if not defined PROCESSOR_ARCHITEW6432 (
 )
 
 echo  Downloading %PYFILE%...
-echo  (about 25 MB — sit tight)
+echo  (about 25 MB - sit tight)
 echo.
 powershell -ExecutionPolicy Bypass -Command ^
     "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $ProgressPreference = 'SilentlyContinue'; try { Invoke-WebRequest -Uri '%PYURL%' -OutFile '%TEMP%\%PYFILE%' -UseBasicParsing } catch { Write-Host $_.Exception.Message; exit 1 }"
@@ -118,7 +123,7 @@ echo  [OK] Downloaded.
 echo.
 
 echo  Installing Python 3.11.9...
-echo  (a progress bar will appear — don't close it)
+echo  (a progress bar will appear - don't close it)
 echo.
 "%TEMP%\%PYFILE%" /passive PrependPath=1 Include_launcher=1 InstallLauncherAllUsers=0 Include_pip=1
 if errorlevel 1 (
@@ -136,13 +141,13 @@ del "%TEMP%\%PYFILE%" >nul 2>&1
 for /f "tokens=*" %%p in ('py -3.11 -c "import sys; print(sys.executable)" 2^>nul') do set "PYTHON=%%p"
 if defined PYTHON goto :found_python
 
-:: py launcher might not be in PATH yet — check default location
+:: py launcher might not be in PATH yet - check default location
 if exist "%LOCALAPPDATA%\Programs\Python\Python311\python.exe" (
     set "PYTHON=%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
     goto :found_python
 )
 
-:: PATH wasn't refreshed — need a restart of the script
+:: PATH wasn't refreshed - need a restart of the script
 echo  [!] Python was installed but this window can't see it yet.
 echo  Close this window and double-click setup again. That's it.
 echo.
@@ -225,7 +230,7 @@ goto :s1_check
 if not errorlevel 1 echo  [OK] Lockfile install succeeded. & goto :installdone
 
 :: ── Stage 2: Prebuilt wheels only (no C++ compiler needed) ──
-echo  [WARN] Lockfile didn't match your Python — trying prebuilt packages...
+echo  [WARN] Lockfile didn't match your Python - trying prebuilt packages...
 echo.
 echo  [2/3] Installing from requirements (prebuilt wheels)...
 echo.
@@ -252,11 +257,11 @@ goto :s3_check
 if not errorlevel 1 echo  [OK] Install succeeded. & goto :installdone
 
 :: ══════════════════════════════════════════════════════════════
-::  INSTALL FAILED — figure out what's missing
+::  INSTALL FAILED - figure out what's missing
 :: ══════════════════════════════════════════════════════════════
 echo.
 echo  ============================================
-echo     INSTALL FAILED — DIAGNOSING...
+echo     INSTALL FAILED - DIAGNOSING...
 echo  ============================================
 echo.
 
@@ -265,46 +270,49 @@ set CORE_OK=1
 
 %PY% -c "import PyQt5" >nul 2>&1
 if errorlevel 1 (
-    echo  [X] PyQt5 — the window/graphics library
+    echo  [X] PyQt5 - the window/graphics library
     set MISSING=1
     set CORE_OK=0
 )
 
 %PY% -c "import yaml" >nul 2>&1
 if errorlevel 1 (
-    echo  [X] PyYAML — config file reader
+    echo  [X] PyYAML - config file reader
     set MISSING=1
     set CORE_OK=0
 )
 
 %PY% -c "import numpy" >nul 2>&1
 if errorlevel 1 (
-    echo  [X] NumPy — math library
+    echo  [X] NumPy - math library
     set MISSING=1
     set CORE_OK=0
 )
 
 %PY% -c "import pyaudio" >nul 2>&1
 if errorlevel 1 (
-    echo  [X] PyAudio — microphone input
-    set MISSING=1
+    %PY% -c "import pyaudiowpatch" >nul 2>&1
+    if errorlevel 1 (
+        echo  [X] PyAudio - microphone input
+        set MISSING=1
+    )
 )
 
 %PY% -c "import cv2" >nul 2>&1
 if errorlevel 1 (
-    echo  [X] OpenCV — vision/screenshots
+    echo  [X] OpenCV - vision/screenshots
     set MISSING=1
 )
 
 %PY% -c "import torch" >nul 2>&1
 if errorlevel 1 (
-    echo  [X] PyTorch — AI engine (~2GB, may have timed out on slow internet)
+    echo  [X] PyTorch - AI engine (~2GB, may have timed out on slow internet)
     set MISSING=1
 )
 
 %PY% -c "import whisper" >nul 2>&1
 if errorlevel 1 (
-    echo  [X] Whisper — speech recognition (needs PyTorch)
+    echo  [X] Whisper - speech recognition (needs PyTorch)
     set MISSING=1
 )
 
@@ -340,7 +348,7 @@ echo  If that doesn't work:
 echo    - Make sure you have internet
 echo    - Try right-click ^> Run as Administrator
 echo    - If torch keeps timing out (it's a 2GB download), just keep
-echo      running the script — it'll pick up where it left off
+echo      running the script - it'll pick up where it left off
 echo.
 echo  Still stuck? Post a screenshot of this window in the Discord.
 echo.
@@ -364,18 +372,21 @@ if errorlevel 1 (
 )
 
 :: ── PyAudio fallback ────────────────────────────────────────
+:: PyAudioWPatch installs as "pyaudiowpatch" not "pyaudio" - check both
 %PY% -c "import pyaudio" >nul 2>&1
 if not errorlevel 1 goto :pyaudio_ok
-echo  [WARN] PyAudio missing — trying fallback install...
+%PY% -c "import pyaudiowpatch" >nul 2>&1
+if not errorlevel 1 echo  [OK] PyAudioWPatch already installed. & goto :pyaudio_ok
+echo  Installing PyAudioWPatch...
 if not "!USE_UV!"=="1" goto :pyaudio_pip
 "!PYTHON!" -m uv pip install PyAudioWPatch --python %PY% >nul 2>&1
 goto :pyaudio_verify
 :pyaudio_pip
 %PY% -m pip install PyAudioWPatch --quiet >nul 2>&1
 :pyaudio_verify
-%PY% -c "import pyaudio" >nul 2>&1
+%PY% -c "import pyaudiowpatch" >nul 2>&1
 if not errorlevel 1 echo  [OK] PyAudioWPatch installed. & goto :pyaudio_ok
-echo  [WARN] PyAudio still missing. Voice input won't work,
+echo  [WARN] PyAudio install failed. Voice input won't work,
 echo         but everything else will. You can install it later:
 echo         %PY% -m pip install PyAudioWPatch
 echo.
@@ -384,7 +395,7 @@ echo.
 :: ── Copy config if needed ───────────────────────────────────
 if not exist "config.yaml" (
     if exist "config.yaml.example" (
-        echo  No config.yaml found — copying from example...
+        echo  No config.yaml found - copying from example...
         copy config.yaml.example config.yaml >nul
         echo  [OK] config.yaml created.
         echo.
