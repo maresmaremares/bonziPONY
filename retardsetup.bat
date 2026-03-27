@@ -93,7 +93,9 @@ for %%V in (311 310 312) do (
 if defined PYTHON goto :found_python
 
 :: ── Method 3: Check "python" command, verify version ────────
-for /f "tokens=*" %%p in ('python -c "import sys; v=sys.version_info; print(sys.executable) if 10<=v.minor<=12 and v.major==3 else exit(1)" 2^>nul') do (
+:: Note: avoid < and > operators inside for /f commands (batch interprets them
+:: as redirection even inside double quotes on some Windows versions)
+for /f "tokens=*" %%p in ('python -c "import sys; v=sys.version_info; print(sys.executable) if v.major==3 and v.minor in (10,11,12) else exit(1)" 2^>nul') do (
     set "PYTHON=%%p"
 )
 if defined PYTHON goto :found_python
@@ -179,7 +181,7 @@ for /f "tokens=*" %%v in ('"!PYTHON!" --version 2^>^&1') do echo  [OK] Using %%v
 
 :: ── Check if existing venv was made with an incompatible Python ──
 if not exist "venv\Scripts\python.exe" goto :venv_ok
-venv\Scripts\python.exe -c "import sys; exit(0 if 10<=sys.version_info.minor<=12 else 1)" >nul 2>&1
+venv\Scripts\python.exe -c "import sys; exit(0 if sys.version_info.minor in (10,11,12) else 1)" >nul 2>&1
 if not errorlevel 1 goto :venv_ok
 echo  [WARN] Existing venv uses wrong Python version. Rebuilding...
 rmdir /s /q venv >nul 2>&1

@@ -327,7 +327,7 @@ class Transcriber:
         frame_size = int(SAMPLE_RATE * 30 / 1000)  # 30ms frames
 
         try:
-            from stt.mic_lock import _mic_lock
+            from stt.mic_lock import _mic_lock, _PYAUDIO_DEVICE_ERRORS
             with _mic_lock:
                 pa = pyaudio.PyAudio()
                 stream_kwargs = dict(
@@ -336,7 +336,36 @@ class Transcriber:
                 )
                 if self.input_device_index is not None:
                     stream_kwargs["input_device_index"] = self.input_device_index
-                stream = pa.open(**stream_kwargs)
+                try:
+                    stream = pa.open(**stream_kwargs)
+                except OSError as e:
+                    if e.errno not in _PYAUDIO_DEVICE_ERRORS:
+                        raise
+                    logger.warning("PTT: default device failed (%s) — trying fallbacks", e)
+                    stream = None
+                    # Try without explicit device first (drop device_index if set)
+                    kw_base = {k: v for k, v in stream_kwargs.items() if k != "input_device_index"}
+                    try:
+                        stream = pa.open(**kw_base)
+                        logger.info("PTT: opened with default device (no explicit index)")
+                    except OSError:
+                        pass
+                    # Enumerate all input devices
+                    if stream is None:
+                        for i in range(pa.get_device_count()):
+                            try:
+                                info = pa.get_device_info_by_index(i)
+                                if info.get("maxInputChannels", 0) < 1:
+                                    continue
+                                stream = pa.open(**{**kw_base, "input_device_index": i})
+                                logger.info("PTT: using fallback device %d (%s)", i, info.get("name", "?"))
+                                break
+                            except Exception:
+                                continue
+                    if stream is None:
+                        raise OSError(-9999, "No working audio input device for PTT. "
+                                      "Run: python scripts/list_audio_devices.py "
+                                      "and set input_device_index in config.yaml")
 
             try:
                 while not stop_event.is_set():
