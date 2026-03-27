@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -49,6 +50,8 @@ class PonyManager:
         self._menu_builder_factory: Any = None  # set by main.py
         self._screen_monitor: Any = None  # set by main.py for HWND exclusion
         self._shutting_down: bool = False
+        self._convo_in_progress: bool = False   # True while a group convo thread is running
+        self._active_convo: Any = None           # current GroupConversation (for user injection)
 
     @property
     def primary(self) -> Optional["PonyInstance"]:
@@ -313,11 +316,15 @@ class PonyManager:
         """Check if it's time for spontaneous inter-pony banter.
 
         Called from the main tick loop.  Returns True if a chat was started.
+        Group conversations run in a background thread so the main tick loop
+        (PTT, idle checks, etc.) is never blocked.
         """
         if self._shutting_down:
             return False
         if len(self.ponies) < 2:
             return False
+        if self._convo_in_progress:
+            return False  # don't stack conversations
 
         elapsed = time.monotonic() - self._last_inter_chat
         if elapsed < self.chat_interval_s:
@@ -349,13 +356,21 @@ class PonyManager:
             except Exception:
                 pass
 
-        try:
-            from core.group_conversation import GroupConversation
-            convo = GroupConversation(self, max_depth=self.max_chat_depth)
-            convo.start(initiator, trigger="spontaneous", screen_context=screen_context)
-        except Exception as exc:
-            logger.error("Spontaneous chat failed: %s", exc)
+        from core.group_conversation import GroupConversation
+        convo = GroupConversation(self, max_depth=self.max_chat_depth)
 
+        def _run():
+            self._convo_in_progress = True
+            self._active_convo = convo
+            try:
+                convo.start(initiator, trigger="spontaneous", screen_context=screen_context)
+            except Exception as exc:
+                logger.error("Spontaneous chat failed: %s", exc)
+            finally:
+                self._convo_in_progress = False
+                self._active_convo = None
+
+        threading.Thread(target=_run, daemon=True).start()
         return True
 
     def maybe_individual_speech(self) -> bool:
@@ -398,24 +413,37 @@ class PonyManager:
             spoke = True
             self._speak_individual(pony, text)
 
-            # Offer piggyback to others
-            for other in self.ponies:
-                if other is pony or getattr(other, "_destroyed", False):
-                    continue
-                if random.random() > self.piggyback_chance:
-                    continue
-                try:
-                    from core.group_conversation import GroupConversation
-                    convo = GroupConversation(self, max_depth=2)
-                    convo.piggyback(
-                        other,
-                        original_speaker=pony.display_name,
-                        user_text="",
-                        response_text=text,
-                    )
-                except Exception as exc:
-                    logger.debug("Individual piggyback failed for %s: %s",
-                                 other.display_name, exc)
+            # Offer piggyback to others — run in background to avoid blocking PTT
+            if not self._convo_in_progress:
+                _pony_ref = pony
+                _text_ref = text
+                def _run_piggybacks(speaker=_pony_ref, spoken=_text_ref):
+                    self._convo_in_progress = True
+                    try:
+                        for other in list(self.ponies):
+                            if self._convo_in_progress is False:
+                                break  # interrupted
+                            if other is speaker or getattr(other, "_destroyed", False):
+                                continue
+                            if random.random() > self.piggyback_chance:
+                                continue
+                            try:
+                                from core.group_conversation import GroupConversation
+                                convo = GroupConversation(self, max_depth=2)
+                                self._active_convo = convo
+                                convo.piggyback(
+                                    other,
+                                    original_speaker=speaker.display_name,
+                                    user_text="",
+                                    response_text=spoken,
+                                )
+                            except Exception as exc:
+                                logger.debug("Individual piggyback failed for %s: %s",
+                                             other.display_name, exc)
+                    finally:
+                        self._convo_in_progress = False
+                        self._active_convo = None
+                threading.Thread(target=_run_piggybacks, daemon=True).start()
 
             # Only one pony speaks per tick to avoid spam
             break
@@ -450,8 +478,9 @@ class PonyManager:
             "Share a random thought or opinion that has nothing to do with the screen.",
             "Comment on something the user is doing, but be specific and interesting about it.",
             "Say something funny or sarcastic.",
-            "Ask the user or a friend a 'would you rather' or hypothetical question.",
             "Complain about something or express a strong opinion.",
+            "Bring up a random memory, story, or thing that's been on your mind.",
+            "Say something that reveals something about your personality — an interest, a pet peeve, a wish.",
         ]
         angle = random.choice(angles)
 
@@ -508,25 +537,37 @@ class PonyManager:
         user_text: str,
         response_text: str,
     ) -> None:
-        """After a pony responds to the user, offer other ponies a chance to jump in."""
+        """After a pony responds to the user, offer other ponies a chance to jump in.
+
+        Runs in a background thread to avoid blocking PTT/main thread.
+        """
         if self._shutting_down or len(self.ponies) < 2:
             return
+        if self._convo_in_progress:
+            return  # already in a conversation
 
-        for pony in self.ponies:
-            if pony is responder:
-                continue
-            if random.random() > self.piggyback_chance:
-                continue
-
-            # Ask the pony if she wants to chime in
+        def _run():
+            self._convo_in_progress = True
             try:
-                from core.group_conversation import GroupConversation
-                convo = GroupConversation(self, max_depth=2)  # short piggyback
-                convo.piggyback(
-                    pony,
-                    original_speaker=responder.display_name,
-                    user_text=user_text,
-                    response_text=response_text,
-                )
-            except Exception as exc:
-                logger.debug("Piggyback failed for %s: %s", pony.display_name, exc)
+                for pony in list(self.ponies):
+                    if pony is responder:
+                        continue
+                    if random.random() > self.piggyback_chance:
+                        continue
+                    try:
+                        from core.group_conversation import GroupConversation
+                        convo = GroupConversation(self, max_depth=2)
+                        self._active_convo = convo
+                        convo.piggyback(
+                            pony,
+                            original_speaker=responder.display_name,
+                            user_text=user_text,
+                            response_text=response_text,
+                        )
+                    except Exception as exc:
+                        logger.debug("Piggyback failed for %s: %s", pony.display_name, exc)
+            finally:
+                self._convo_in_progress = False
+                self._active_convo = None
+
+        threading.Thread(target=_run, daemon=True).start()

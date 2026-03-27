@@ -80,16 +80,19 @@ _PIGGYBACK_PROMPT_TEMPLATE = (
 _SPONTANEOUS_PROMPT_TEMPLATE = (
     "(You're hanging out on the desktop with {companions}. "
     "{screen_info}\n"
-    "Start a conversation about: {topic_seed}\n"
-    "Keep it short — 1-2 sentences max. Be casual and natural.\n"
+    "{recent_topics_warning}"
+    "Start a conversation — pick any topic you genuinely feel like talking about right now. "
+    "Be specific and in character. Think of something the REAL you would bring up.\n"
+    "EXPLICITLY BANNED openers:\n"
+    "- 'would you rather...' — do NOT use this\n"
+    "- 'what are you working on?' — boring, don't use it\n"
+    "- Generic small talk like 'how are you?' or 'what's up?'\n"
     "RULES:\n"
     "- ONLY reference things from the screen info above, your conversation history, "
     "or things the user has told you. Do NOT invent things you can't see.\n"
     "- Do NOT comment on technical details of window titles (errors, status messages, etc.) "
     "— you're a pony, not IT support.\n"
-    "- If the topic seed doesn't inspire you, pick something else. The point is to be "
-    "interesting, not to force the topic.\n"
-    "{recent_topics_warning}"
+    "Keep it short — 1-2 sentences max. Be casual and natural.\n"
     "Be a real character with range — don't default to your most obvious personality trait.\n"
     "Do NOT include any tags like [CONVO:...] — just speak naturally.)"
 )
@@ -113,6 +116,7 @@ class GroupConversation:
         self._depth = 0
         self._max_depth = max_depth
         self._screen_info = ""  # shared screen context for ALL turns
+        self.interrupted: bool = False  # set True from outside to stop mid-conversation
 
     @classmethod
     def _record_topic(cls, opening_line: str) -> None:
@@ -149,15 +153,11 @@ class GroupConversation:
         # Store screen context for ALL turns in this conversation
         self._screen_info = screen_context or "No screen info available."
 
-        # Pick a random topic seed for variety
-        topic_seed = random.choice(_TOPIC_SEEDS)
-
         recent_warning = self._get_recent_topics_warning()
 
         prompt = _SPONTANEOUS_PROMPT_TEMPLATE.format(
             companions=", ".join(companions),
             screen_info=self._screen_info,
-            topic_seed=topic_seed,
             recent_topics_warning=recent_warning,
         )
 
@@ -224,12 +224,17 @@ class GroupConversation:
         from core.tts_queue import PRIORITY_SPONTANEOUS_CHAT
 
         while self._depth < self._max_depth:
+            if self.interrupted:
+                logger.debug("Group conversation interrupted by PTT")
+                break
             anyone_spoke = False
             # Randomise turn order each round
             others = [p for p in self._manager.ponies if p is not exclude]
             random.shuffle(others)
 
             for pony in others:
+                if self.interrupted:
+                    break
                 if self._depth >= self._max_depth:
                     break
                 if getattr(pony, "_destroyed", False):

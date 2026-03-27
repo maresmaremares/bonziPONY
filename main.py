@@ -635,14 +635,33 @@ def main() -> None:
             pet_window.set_override_animation(anim)
         # Show/hide mic indicator
         pet_window.set_listening(state_name == "LISTEN")
-        # Show thinking bubble while LLM is processing
+        # Show thinking bubble while LLM is processing — on the correct pony (Fix 11)
+        active_bubble = pipeline.active_speech_bubble or speech_bubble
         if state_name == "THINK" and config.desktop_pet.speech_bubble:
-            ax, ay, ah = pet_window.get_anchor_point()
-            speech_bubble.show_thinking(ax, ay)
+            # Show on whatever pony is currently responding
+            try:
+                target_pony = pipeline._active_responder
+                if target_pony and hasattr(target_pony, "pet_window"):
+                    ax, ay, ah = target_pony.pet_window.get_anchor_point()
+                    active_bubble.show_thinking(ax, ay)
+                else:
+                    ax, ay, ah = pet_window.get_anchor_point()
+                    speech_bubble.show_thinking(ax, ay)
+            except Exception:
+                ax, ay, ah = pet_window.get_anchor_point()
+                speech_bubble.show_thinking(ax, ay)
         elif state_name == "IDLE" and config.desktop_pet.speech_bubble:
             # Only clear thinking bubble — speech bubbles have their own auto-hide timer
             if speech_bubble._thinking:
                 speech_bubble.hide_bubble()
+            # Also clear on non-primary ponies if they have a bubble
+            try:
+                for p in pipeline.pony_manager.ponies if pipeline.pony_manager else []:
+                    if not p.is_primary and hasattr(p, "speech_bubble") and p.speech_bubble:
+                        if getattr(p.speech_bubble, "_thinking", False):
+                            p.speech_bubble.hide_bubble()
+            except Exception:
+                pass
 
     def _on_heard_text(text: str) -> None:
         """Show what the STT heard below the pony."""

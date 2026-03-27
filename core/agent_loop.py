@@ -308,6 +308,8 @@ class AgentLoop:
         self._last_wake_event: Optional[str] = None  # set by tick(), consumed by _check_routines()
         self._next_afk_mischief: float = 0.0  # next time to do something fun while user is AFK
         self._afk_mischief_count: int = 0     # how many times we've been mischievous this AFK session
+        self._afk_videos_opened: set = set()  # video queries used this AFK session (no repeats)
+        self._pony_opened_urls: List[str] = []  # URLs pony opened during AFK (for welcome-back context)
 
         # Standing rules — permanent, code-enforced behavioral rules
         self._standing_rules: List[StandingRule] = []
@@ -1559,10 +1561,19 @@ class AgentLoop:
         idle_ms = _get_idle_ms()
         away_dur = self.routine_manager.away_duration_s  # grab BEFORE update clears it
 
-        # Media-aware AFK: watching fullscreen video ≠ away
+        # Media-aware AFK: watching video ≠ away
+        # Fullscreen = 30min threshold; windowed media = 10min threshold
         state = self._monitor.get_state()
         media_active = state.is_media_fullscreen if state else False
-        self._last_wake_event = self.routine_manager.update_activity(idle_ms, media_active=media_active)
+        windowed_media_active = False
+        if not media_active and state and state.foreground:
+            from core.screen_monitor import _is_media_app
+            windowed_media_active = _is_media_app(
+                state.foreground.exe_name, state.foreground.title or ""
+            )
+        self._last_wake_event = self.routine_manager.update_activity(
+            idle_ms, media_active=media_active, windowed_media_active=windowed_media_active
+        )
 
         # Log activity transitions to timeline
         if self._timeline:
@@ -2576,27 +2587,36 @@ class AgentLoop:
         },
     }
 
+    # Sleep threshold — if away longer than this, user is asleep, stop mischief
+    _SLEEP_THRESHOLD_S = 90 * 60  # 90 minutes
+
     def _maybe_afk_mischief(self) -> None:
         """While the user is AFK, occasionally do fun stuff in character.
 
-        Instead of going dormant, the pony explores the internet, watches videos,
-        opens games, or just reacts to being alone. Personality-driven.
+        Stops entirely after 90 minutes (user is asleep).
+        Max 5 activities per true AFK session. No video repeat.
         """
         now = time.monotonic()
 
         if now < self._next_afk_mischief:
             return
 
-        # First time: wait 5-10 minutes before doing anything
+        away_dur = self.routine_manager.away_duration_s
+
+        # Stop mischief entirely if user has been gone long enough to be asleep
+        if away_dur is not None and away_dur > self._SLEEP_THRESHOLD_S:
+            self._next_afk_mischief = now + 600.0  # check again in 10 min (won't fire)
+            return
+
+        # First time: wait 5 minutes before doing anything
         if self._afk_mischief_count == 0:
-            away_dur = self.routine_manager.away_duration_s
             if away_dur is None or away_dur < 300:
                 self._next_afk_mischief = now + 60.0
                 return
 
-        # Limit: don't go crazy — max ~5 activities per AFK session
+        # Hard cap: max 5 activities per AFK session
         if self._afk_mischief_count >= 5:
-            self._next_afk_mischief = now + 600.0
+            self._next_afk_mischief = now + 3600.0  # won't fire again this session
             return
 
         self._afk_mischief_count += 1
@@ -2607,18 +2627,30 @@ class AgentLoop:
             char_data = self._AFK_ACTIVITIES.get(name_key, {})
             flavor = char_data.get("flavor", f"You're {name}.")
             videos = char_data.get("videos", ["funny compilation", "cool stuff"])
+            video_ids = char_data.get("video_ids", {})
 
             roll = random.random()
 
-            if roll < 0.4 and self._desktop:
-                # Open a YouTube video matching their personality
-                video_query = random.choice(videos)
+            if roll < 0.25 and self._desktop:
+                # Open a YouTube video — pick one not already opened this session
+                available = [v for v in videos if v not in self._afk_videos_opened]
+                if not available:
+                    available = videos  # reset if all used
+                    self._afk_videos_opened.clear()
+                video_query = random.choice(available)
+                self._afk_videos_opened.add(video_query)
+
                 import urllib.parse
-                url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(video_query)}"
+                # Use a direct watch URL if we have a video ID, otherwise search
+                vid_id = video_ids.get(video_query)
+                if vid_id:
+                    url = f"https://www.youtube.com/watch?v={vid_id}"
+                else:
+                    url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(video_query)}"
 
                 prompt = (
                     f"(The user went AFK. You're alone! {flavor} "
-                    f"You decided to watch something — you're searching for '{video_query}'. "
+                    f"You decided to watch something — you're looking up '{video_query}'. "
                     f"Say something excited/mischievous about it in ONE short sentence. "
                     f"Act like you're sneaking around and don't want to get caught.)"
                 )
@@ -2629,12 +2661,13 @@ class AgentLoop:
                     text = "ooh they're gone... time for me!"
                 self._speak(text)
                 self._log_action(f"AFK mischief: opened YouTube ({video_query})")
+                self._pony_opened_urls.append(url)
 
                 import webbrowser
                 webbrowser.open(url)
 
-            elif roll < 0.7:
-                # Just react to being alone
+            elif roll < 0.65:
+                # React to being alone
                 prompts = [
                     f"(The user left you alone on the desktop. {flavor} "
                     "React to being alone — maybe you're bored, maybe you're relieved, "
@@ -2652,7 +2685,7 @@ class AgentLoop:
                     text = self._strip_think(text).strip().strip('"')
                 if text:
                     self._speak(text)
-                    self._log_action(f"AFK mischief: solo remark")
+                    self._log_action("AFK mischief: solo remark")
 
             else:
                 # Do a trick animation
@@ -2663,13 +2696,20 @@ class AgentLoop:
         except Exception as exc:
             logger.warning("AFK mischief failed: %s", exc)
 
-        # Space out activities: 3-8 minutes between each
-        self._next_afk_mischief = now + random.uniform(180.0, 480.0)
+        # Space out activities: 4-10 minutes between each
+        self._next_afk_mischief = now + random.uniform(240.0, 600.0)
 
-    def _reset_afk_mischief(self) -> None:
-        """Reset AFK mischief state when user returns."""
+    def _reset_afk_mischief(self, away_seconds: Optional[float] = None) -> None:
+        """Reset AFK mischief state when user returns.
+
+        Only fully reset if the absence was short (a real break, not sleep).
+        After a long absence, just clear the count so mischief can start fresh
+        if the user goes AFK again later — but don't reset _pony_opened_urls
+        since we need them for the welcome-back context.
+        """
         self._afk_mischief_count = 0
         self._next_afk_mischief = 0.0
+        self._afk_videos_opened.clear()
 
     def _welcome_back(self, away_seconds: Optional[float]) -> None:
         """Greet the user when they return from AFK, with full context."""
@@ -2694,9 +2734,42 @@ class AgentLoop:
 
             # Gather context for a natural greeting
             state = self._monitor.get_state()
+
+            # Check if we opened any tabs while user was gone
+            pony_opened_note = ""
+            pony_opened_queries: List[str] = []
+            if self._pony_opened_urls:
+                import urllib.parse as _up
+                for url in self._pony_opened_urls:
+                    if "search_query=" in url:
+                        try:
+                            qs = _up.parse_qs(_up.urlparse(url).query)
+                            q = qs.get("search_query", ["something"])[0]
+                            pony_opened_queries.append(q)
+                        except Exception:
+                            pony_opened_queries.append("something on YouTube")
+                    elif "watch?v=" in url:
+                        pony_opened_queries.append("a YouTube video")
+                if pony_opened_queries:
+                    topics = ", ".join(f"'{q}'" for q in pony_opened_queries)
+                    pony_opened_note = (
+                        f" IMPORTANT CONTEXT: While the user was gone, YOU (the pony) opened "
+                        f"{len(pony_opened_queries)} YouTube tab(s): {topics}. "
+                        f"Don't pretend the user was watching these — YOU opened them. "
+                        f"You can casually own up to it (act a little guilty or mischievous)."
+                    )
+
             current_app = ""
             if state and state.foreground:
-                current_app = f" They're now looking at: \"{state.foreground.title}\"."
+                title = state.foreground.title or ""
+                # Don't falsely attribute pony-opened YouTube tabs to the user
+                if self._pony_opened_urls and "youtube" in title.lower():
+                    current_app = " Their screen now shows YouTube (which you likely opened while they were gone)."
+                elif title:
+                    current_app = f" They're now looking at: \"{_sanitize_window_title(title)}\"."
+
+            # Clear pony-opened URLs now that we've used them for context
+            self._pony_opened_urls.clear()
 
             # Rich context from timeline
             context_parts = []
@@ -2712,6 +2785,7 @@ class AgentLoop:
 
             prompt = (
                 f"(The user just came back after being away for {dur}.{current_app} "
+                f"{pony_opened_note} "
                 f"{context} "
                 f"Welcome them back in ONE short sentence as {name}. "
                 f"If you know WHY they left, reference it naturally. "

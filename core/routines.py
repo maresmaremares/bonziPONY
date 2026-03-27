@@ -27,9 +27,11 @@ _ROUTINES_FILE = Path(__file__).parent.parent / "routines.json"
 _WAKE_STATE_FILE = Path(__file__).parent.parent / "wake_state.json"
 
 # How long the user must be idle before we consider them "asleep/away"
-AWAY_THRESHOLD_MS = 3 * 60 * 1000   # 3 minutes
+AWAY_THRESHOLD_MS = 3 * 60 * 1000        # 3 minutes
 # If watching fullscreen media, allow much longer idle before "away"
-MEDIA_AWAY_THRESHOLD_MS = 30 * 60 * 1000  # 30 minutes (probably fell asleep)
+MEDIA_AWAY_THRESHOLD_MS = 30 * 60 * 1000  # 30 minutes
+# If watching windowed media (YouTube in browser, VLC windowed, etc.)
+WINDOWED_MEDIA_AWAY_THRESHOLD_MS = 10 * 60 * 1000  # 10 minutes
 
 
 @dataclass
@@ -163,18 +165,24 @@ class RoutineManager:
 
     # ── Wake/sleep detection ─────────────────────────────────────────────
 
-    def update_activity(self, idle_ms: int, media_active: bool = False) -> Optional[str]:
+    def update_activity(self, idle_ms: int, media_active: bool = False,
+                        windowed_media_active: bool = False) -> Optional[str]:
         """Call every tick with current idle time.
 
         Returns "wake" if user just woke up, None otherwise.
         Updates internal wake/sleep tracking.
 
-        If media_active is True (user watching fullscreen video), use a much
-        longer idle threshold — they're present, just not touching input.
+        media_active: fullscreen video — 30 min threshold
+        windowed_media_active: windowed YouTube/VLC/etc — 10 min threshold
         """
         import time as _time
 
-        threshold = MEDIA_AWAY_THRESHOLD_MS if media_active else AWAY_THRESHOLD_MS
+        if media_active:
+            threshold = MEDIA_AWAY_THRESHOLD_MS
+        elif windowed_media_active:
+            threshold = WINDOWED_MEDIA_AWAY_THRESHOLD_MS
+        else:
+            threshold = AWAY_THRESHOLD_MS
         is_away = idle_ms > threshold
 
         if self._was_away and not is_away:

@@ -105,6 +105,7 @@ class Pipeline:
         self._recently_spoken: List[str] = []  # echo detection
         self._last_end_conversation: bool = False  # LLM signaled conversation over
         self._last_profile_extraction: float = 0.0  # monotonic timestamp
+        self._active_responder: Any = None  # non-primary pony currently responding (Fix 10/11)
 
         # Optional GUI callbacks
         self._on_state_change = None
@@ -127,6 +128,17 @@ class Pipeline:
         self._on_heard_text = on_heard_text
         self._on_conversation_start = on_conversation_start
         self._on_conversation_end = on_conversation_end
+
+    @property
+    def active_speech_bubble(self):
+        """Return the speech bubble for the currently-responding pony (Fix 11).
+
+        Returns the non-primary pony's speech_bubble when routing is active,
+        otherwise None (caller should fall back to primary pony's bubble).
+        """
+        if self._active_responder and hasattr(self._active_responder, "speech_bubble"):
+            return self._active_responder.speech_bubble
+        return None
 
     def _is_echo(self, heard: str) -> bool:
         """Check if transcribed text is the pony's own TTS output echoing through the mic."""
@@ -489,6 +501,7 @@ class Pipeline:
         Execute one listen→think→speak turn.
         Returns True if Dash successfully spoke, False otherwise.
         """
+        _orig_llm = self.llm  # save for finally-block restore (Fix 10)
         try:
             if play_ack:
                 # Smart ack: check if user is already mid-sentence before interrupting
@@ -524,6 +537,26 @@ class Pipeline:
                     pass
             original_user_text = user_text  # save before injections for heuristic check
             self._remember_topic(user_text)
+
+            # Fix 6: Inject user speech into active group conversation + interrupt it
+            # Fix 10: Route speech to the named pony, swap LLM for this turn
+            if self.pony_manager:
+                if self.pony_manager._active_convo is not None:
+                    try:
+                        self.pony_manager._active_convo.inject_user(original_user_text)
+                        self.pony_manager._active_convo.interrupted = True
+                    except Exception:
+                        pass
+                if len(self.pony_manager.ponies) > 1:
+                    try:
+                        target = self.pony_manager.route_user_speech(original_user_text)
+                        if target and not target.is_primary and hasattr(target, "llm"):
+                            self.llm = target.llm
+                            self._active_responder = target
+                        else:
+                            self._active_responder = None
+                    except Exception:
+                        self._active_responder = None
 
             # Stop keyword detection — clear all directives if user says stop
             if self.agent_loop and self.agent_loop.has_directives:
@@ -822,6 +855,10 @@ class Pipeline:
             self._transition(PipelineState.ERROR)
             logger.exception("Pipeline turn error: %s", exc)
             return False
+        finally:
+            # Always restore primary LLM and clear active responder (Fix 10/11)
+            self.llm = _orig_llm
+            self._active_responder = None
 
     # Phrases that indicate the model broke character and is meta-analyzing
     _CHARACTER_BREAK_PHRASES = (
