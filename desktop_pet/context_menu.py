@@ -945,6 +945,8 @@ class ContextMenuBuilder:
             lambda: self._open_file(self.config_path))
         menu.addAction("Open Log File").triggered.connect(
             lambda: self._open_file(cfg.logging.log_file))
+        menu.addAction("Reset Memory...").triggered.connect(
+            lambda: self._reset_memory(parent))
 
         menu.addSeparator()
 
@@ -1591,6 +1593,48 @@ class ContextMenuBuilder:
             logger.info("CHAOS MODE — %d tabs opened, %d ponies active",
                          len(chaos_urls), len(self.pony_manager.ponies))
         threading.Thread(target=_run_chaos, daemon=True).start()
+
+    # ── Memory reset ─────────────────────────────────────────────────────
+
+    def _reset_memory(self, parent: QWidget) -> None:
+        """Wipe all persistent memory: user profile, events, sessions, and diary."""
+        reply = QMessageBox.warning(
+            parent,
+            "Reset Memory",
+            "This will permanently delete:\n\n"
+            "• User profile (name, interests, facts)\n"
+            "• Events & follow-ups\n"
+            "• Session summaries\n"
+            "• All diary entries\n\n"
+            "This cannot be undone. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        base = Path(__file__).parent.parent
+        memory_dir = base / "memory"
+        diary_dir = base / "diary"
+        deleted = 0
+
+        for d in (memory_dir, diary_dir):
+            if d.is_dir():
+                for f in d.iterdir():
+                    if f.is_file():
+                        try:
+                            f.unlink()
+                            deleted += 1
+                        except Exception as exc:
+                            logger.warning("Failed to delete %s: %s", f, exc)
+
+        QMessageBox.information(
+            parent,
+            "Memory Reset",
+            f"Deleted {deleted} file(s).\n\n"
+            "The pony will start fresh next conversation.",
+        )
+        logger.info("Memory reset — deleted %d files from memory/ and diary/.", deleted)
 
     # ── Directive actions ─────────────────────────────────────────────────
 

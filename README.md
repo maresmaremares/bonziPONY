@@ -121,7 +121,7 @@ That's it. The setup script handles Python, dependencies, everything. A pony app
 **Manual install** (if you prefer):
 
 ```bash
-git clone https://github.com/maresmaresmares/bonziPONY.git
+git clone https://github.com/maresmaremares/bonziPONY.git
 cd bonziPONY
 python -m venv venv
 venv\Scripts\activate

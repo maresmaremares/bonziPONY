@@ -12,8 +12,8 @@ from typing import Optional, Tuple, List
 
 logger = logging.getLogger(__name__)
 
-REPO_URL = "https://github.com/maresmaresmares/bonziPONY.git"
-REPO_API = "https://api.github.com/repos/maresmaresmares/bonziPONY"
+REPO_URL = "https://github.com/maresmaremares/bonziPONY.git"
+REPO_API = "https://api.github.com/repos/maresmaremares/bonziPONY"
 
 # Cache resolved git path — venv on Windows often strips PATH
 _git_exe: Optional[str] = None
