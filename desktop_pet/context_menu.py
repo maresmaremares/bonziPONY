@@ -687,6 +687,7 @@ class ContextMenuBuilder:
         on_vision_llm_change: Optional[Callable[[], None]] = None,
         pony_manager=None,
         pony_instance=None,
+        transcriber=None,
     ) -> None:
         self.config = config
         self.config_path = str(Path(config_path).resolve())
@@ -702,6 +703,7 @@ class ContextMenuBuilder:
         self.on_vision_llm_change = on_vision_llm_change
         self.pony_manager = pony_manager      # PonyManager or None
         self.pony_instance = pony_instance    # which PonyInstance this menu belongs to
+        self.transcriber = transcriber        # for speaker verification enrollment
 
     # ── Main builder ──────────────────────────────────────────────────────
 
@@ -781,15 +783,15 @@ class ContextMenuBuilder:
 
         menu.addSeparator()
 
-        # ── Check Interval submenu ────────────────────────────────────
-        self._radio_submenu(menu, "Check Interval", [
-            ("Hyper (30s)", 30.0),
-            ("Fast (2 min)", 120.0),
-            ("Normal (5 min)", 300.0),
-            ("Relaxed (12 min)", 750.0),
-            ("Chill (30 min)", 1800.0),
-        ], cfg.agent.base_check_interval_s,
-            lambda v: self._set("agent", "base_check_interval_s", v))
+        # ── Activity Level submenu (scales ALL timing) ────────────────
+        self._radio_submenu(menu, "Activity Level", [
+            ("Hyper (30s)", 0.10),
+            ("Fast (2 min)", 0.40),
+            ("Normal (5 min)", 1.00),
+            ("Relaxed (12 min)", 2.50),
+            ("Chill (30 min)", 6.00),
+        ], cfg.agent.activity_multiplier,
+            lambda v: self._set_activity_level(v))
 
         # ── Scale submenu ─────────────────────────────────────────────
         self._radio_submenu(menu, "Scale", [
@@ -862,6 +864,26 @@ class ContextMenuBuilder:
         from llm.prompt import get_character_name
         char_act = menu.addAction(f"Character: {get_character_name()}...")
         char_act.triggered.connect(lambda: self._show_character_picker(parent))
+        edit_personality_act = menu.addAction("Edit Personality...")
+        edit_personality_act.triggered.connect(self._edit_personality)
+        open_presets_act = menu.addAction("Open Presets Folder")
+        open_presets_act.triggered.connect(self._open_presets_folder)
+
+        # ── Voice model (speaker verification) ──────────────────────
+        voice_menu = menu.addMenu("Voice Model")
+        from stt.speaker_id import SpeakerVerifier
+        _verifier = getattr(self._get_transcriber(), "speaker_verifier", None)
+        _enrolled = _verifier.enrolled if _verifier else False
+        train_act = voice_menu.addAction("Train Voice Model..." if not _enrolled else "Re-train Voice Model...")
+        train_act.triggered.connect(lambda: self._train_voice_model(parent))
+        if _enrolled:
+            clear_act = voice_menu.addAction("Clear Voice Model")
+            clear_act.triggered.connect(self._clear_voice_model)
+            status_act = voice_menu.addAction("Status: Enrolled ✓")
+            status_act.setEnabled(False)
+        else:
+            status_act = voice_menu.addAction("Status: Not enrolled")
+            status_act.setEnabled(False)
 
         # ── Relationship submenu ─────────────────────────────────────
         rel_menu = menu.addMenu("Relationship")
@@ -904,17 +926,15 @@ class ContextMenuBuilder:
         audio_menu = menu.addMenu("Audio Devices (restart needed)")
         self._build_audio_submenu(audio_menu)
 
-        # ── Voice Filter ──────────────────────────────────────────────
-        voice_menu = menu.addMenu("Voice Filter")
-        enroll_act = voice_menu.addAction("Enroll My Voice...")
-        enroll_act.triggered.connect(lambda: self._enroll_voice(parent))
-        delete_act = voice_menu.addAction("Delete Voice Profile")
-        delete_act.triggered.connect(self._delete_voice_profile)
-
         # ── Multi-pony ─────────────────────────────────────────────────
         if self.pony_manager is not None:
             menu.addSeparator()
             self._build_multi_pony_menu(menu, parent)
+
+        # ── Presentation Mode (secret) ────────────────────────────────
+        if cfg.presentation_mode:
+            menu.addSeparator()
+            self._build_presentation_menu(menu, parent)
 
         menu.addSeparator()
 
@@ -984,6 +1004,29 @@ class ContextMenuBuilder:
         setattr(obj, key, value)
         _save_yaml_value(f"{section}.{key}", value, self.config_path)
         logger.info("Config: %s.%s = %s", section, key, value)
+
+    def _set_activity_level(self, multiplier: float) -> None:
+        """Scale ALL timing settings from a single activity multiplier."""
+        cfg = self.config.agent
+        cfg.activity_multiplier = multiplier
+        # Scale all timing from "Normal" baselines
+        cfg.base_check_interval_s = max(30.0, 300.0 * multiplier)
+        cfg.self_initiate_interval_s = max(60.0, 300.0 * multiplier)
+        cfg.spontaneous_speech_min_s = max(30.0, 120.0 * multiplier)
+        cfg.spontaneous_speech_max_s = max(60.0, 300.0 * multiplier)
+
+        # Persist all derived values
+        for key in ("activity_multiplier", "base_check_interval_s",
+                     "self_initiate_interval_s", "spontaneous_speech_min_s",
+                     "spontaneous_speech_max_s"):
+            _save_yaml_value(f"agent.{key}", getattr(cfg, key), self.config_path)
+
+        # Scale multi-pony chat interval
+        if self.pony_manager is not None:
+            self.pony_manager.chat_interval_s = max(120.0, 600.0 * multiplier)
+
+        logger.info("Activity level set: multiplier=%.2f, check=%.0fs",
+                     multiplier, cfg.base_check_interval_s)
 
     def _set_screen_vision(self, provider: str) -> None:
         """Switch between API and Moondream screen vision.  Requires restart for Moondream."""
@@ -1457,6 +1500,98 @@ class ContextMenuBuilder:
             folder.mkdir(parents=True, exist_ok=True)
             self._open_file(str(folder))
 
+    # ── Presentation mode ────────────────────────────────────────────────
+
+    def _build_presentation_menu(self, menu: QMenu, parent: QWidget) -> None:
+        """Build the secret presentation/demo menu for showing off features."""
+        pres_menu = menu.addMenu("Presentation")
+
+        # Toggle AFK — force the pony into thinking user is away
+        afk_label = "AFK Mode: ON" if (self.agent_loop and self.agent_loop.is_force_afk) else "AFK Mode: OFF"
+        afk_act = pres_menu.addAction(afk_label)
+        afk_act.triggered.connect(self._toggle_force_afk)
+        afk_act.setEnabled(self.agent_loop is not None)
+
+        pres_menu.addSeparator()
+
+        # Trigger Group Chat — immediate inter-pony banter
+        chat_act = pres_menu.addAction("Trigger Group Chat")
+        chat_act.triggered.connect(self._force_group_chat)
+        chat_act.setEnabled(self.pony_manager is not None and len(self.pony_manager.ponies) >= 2)
+
+        # Spawn Mane Six — fill the desktop with ponies
+        spawn_act = pres_menu.addAction("Spawn Mane Six")
+        spawn_act.triggered.connect(self._spawn_mane_six)
+        spawn_act.setEnabled(self.pony_manager is not None)
+
+        pres_menu.addSeparator()
+
+        # CHAOS MODE — the big red button
+        chaos_act = pres_menu.addAction("DESTROY PC")
+        chaos_act.triggered.connect(self._chaos_mode)
+        chaos_act.setEnabled(self.pony_manager is not None)
+
+    def _toggle_force_afk(self) -> None:
+        """Toggle forced AFK state for presentation mode."""
+        if not self.agent_loop:
+            return
+        new_state = self.agent_loop.toggle_force_afk()
+        logger.info("Presentation: AFK toggled to %s", new_state)
+
+    def _force_group_chat(self) -> None:
+        """Immediately trigger a group conversation."""
+        if not self.pony_manager:
+            return
+        self.pony_manager.force_spontaneous_chat()
+
+    def _spawn_mane_six(self) -> None:
+        """Spawn all mane six ponies that aren't already on screen."""
+        if not self.pony_manager:
+            return
+        mane_six = ["twilight_sparkle", "rainbow_dash", "pinkie_pie",
+                     "rarity", "fluttershy", "applejack"]
+        existing = {p.slug for p in self.pony_manager.ponies}
+        for slug in mane_six:
+            if slug not in existing and len(self.pony_manager.ponies) < self.pony_manager.max_ponies:
+                self.pony_manager.add_pony(slug)
+
+    def _chaos_mode(self) -> None:
+        """DESTROY PC — spawn ponies, open chaotic tabs, start themed group convo."""
+        if not self.pony_manager:
+            return
+        # Spawn ponies on main thread (Qt widgets must be created here)
+        self._spawn_mane_six()
+        # Open chaotic tabs + group convo in background (safe for threads)
+        import threading
+        def _run_chaos():
+            import webbrowser
+            chaos_urls = [
+                "https://www.youtube.com/results?search_query=fire+explosion+compilation",
+                "https://www.youtube.com/results?search_query=bonzibuddy+virus+meme",
+                "https://www.youtube.com/results?search_query=nuclear+explosion+4k",
+                "https://www.youtube.com/results?search_query=windows+xp+destruction",
+                "https://www.youtube.com/results?search_query=dank+memes+compilation",
+                "https://www.youtube.com/results?search_query=mlp+chaos+discord",
+                "https://en.wikipedia.org/wiki/BonziBuddy",
+                "https://www.reddit.com/r/softwaregore",
+            ]
+            for url in chaos_urls:
+                try:
+                    webbrowser.open(url)
+                except Exception:
+                    pass
+                import time
+                time.sleep(0.3)
+            import time
+            time.sleep(1.0)
+            self.pony_manager.force_spontaneous_chat(
+                topic="HEY GIRLS! We're destroying this guy's desktop! Open stuff, cause chaos, "
+                      "talk about what you're doing, coordinate the destruction! GO GO GO!"
+            )
+            logger.info("CHAOS MODE — %d tabs opened, %d ponies active",
+                         len(chaos_urls), len(self.pony_manager.ponies))
+        threading.Thread(target=_run_chaos, daemon=True).start()
+
     # ── Directive actions ─────────────────────────────────────────────────
 
     def _clear_directives(self) -> None:
@@ -1552,103 +1687,155 @@ class ContextMenuBuilder:
             spk_group.addAction(act)
             spk_menu.addAction(act)
 
-    # ── Voice filter ────────────────────────────────────────────────────
+    # ── Voice model (speaker verification) ─────────────────────────────
 
-    def _enroll_voice(self, parent: QWidget) -> None:
-        """Record user's voice and create a voice profile."""
-        from PyQt5.QtWidgets import QMessageBox, QProgressDialog
+    def _get_transcriber(self):
+        """Return the transcriber, if available."""
+        return self.transcriber
+
+    def _train_voice_model(self, parent: QWidget) -> None:
+        """Record 3 short clips and enroll the user's voice."""
         import struct
         import numpy as np
 
         msg = QMessageBox(parent)
-        msg.setWindowTitle("Voice Enrollment")
+        msg.setWindowTitle("Voice Model Training")
         msg.setText(
-            "This will record 8 seconds of your voice.\n\n"
+            "This will record 3 short clips of your voice (~3 seconds each).\n\n"
             "Speak naturally — say anything, just keep talking.\n"
-            "After enrollment, the pony will only respond to YOUR voice\n"
-            "and ignore YouTube, TV, and other people."
+            "After training, the pony will know when YOU are speaking\n"
+            "vs YouTube, TV, or other people."
         )
         msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
         if msg.exec_() != QMessageBox.Ok:
             return
 
-        # Record
+        transcriber = self._get_transcriber()
+        if not transcriber:
+            QMessageBox.warning(parent, "Voice Model", "Transcriber not available.")
+            return
+
+        sample_rate = 16000
+        clip_seconds = 3
+        num_clips = 3
+        clips = []
+
         try:
             import pyaudio
-            sample_rate = 16000
-            frame_size = int(sample_rate * 30 / 1000)
-            record_seconds = 8
+            from stt.mic_lock import mic_lock
 
-            pa = pyaudio.PyAudio()
-            stream_kwargs = dict(
-                format=pyaudio.paInt16, channels=1, rate=sample_rate,
-                input=True, frames_per_buffer=frame_size,
-            )
-            idx = self.config.audio.input_device_index
-            if idx >= 0:
-                stream_kwargs["input_device_index"] = idx
+            for clip_idx in range(num_clips):
+                label = f"Recording clip {clip_idx + 1}/{num_clips}... speak now!"
+                progress = QProgressDialog(label, "Cancel", 0, 100, parent)
+                progress.setWindowTitle("Voice Model Training")
+                progress.setMinimumDuration(0)
+                progress.show()
 
-            progress = QProgressDialog("Recording... speak now!", "Cancel", 0, 100, parent)
-            progress.setWindowTitle("Voice Enrollment")
-            progress.setMinimumDuration(0)
-            progress.show()
+                frame_size = int(sample_rate * 30 / 1000)  # 30ms frames
+                total_frames = int(clip_seconds * sample_rate / frame_size)
 
-            stream = pa.open(**stream_kwargs)
-            frames = []
-            total_frames = int(record_seconds * sample_rate / frame_size)
+                with mic_lock:
+                    pa = pyaudio.PyAudio()
+                    stream_kwargs = dict(
+                        format=pyaudio.paInt16, channels=1, rate=sample_rate,
+                        input=True, frames_per_buffer=frame_size,
+                    )
+                    idx = self.config.audio.input_device_index
+                    if idx >= 0:
+                        stream_kwargs["input_device_index"] = idx
 
-            for i in range(total_frames):
-                if progress.wasCanceled():
+                    stream = pa.open(**stream_kwargs)
+                    frames = []
+
+                    for i in range(total_frames):
+                        if progress.wasCanceled():
+                            stream.stop_stream()
+                            stream.close()
+                            pa.terminate()
+                            return
+                        raw = stream.read(frame_size, exception_on_overflow=False)
+                        frames.append(raw)
+                        progress.setValue(int((i + 1) / total_frames * 100))
+                        QApplication.processEvents()
+
                     stream.stop_stream()
                     stream.close()
                     pa.terminate()
-                    return
-                raw = stream.read(frame_size, exception_on_overflow=False)
-                frames.append(raw)
-                progress.setValue(int((i + 1) / total_frames * 100))
-                QApplication.processEvents()
 
-            stream.stop_stream()
-            stream.close()
-            pa.terminate()
-            progress.close()
+                progress.close()
 
-            # Convert and enroll
-            audio_bytes = b"".join(frames)
-            audio_int16 = struct.unpack(f"{len(audio_bytes) // 2}h", audio_bytes)
-            audio_f32 = np.array(audio_int16, dtype=np.float32) / 32768.0
+                # Convert int16 → float32
+                audio_bytes = b"".join(frames)
+                audio_int16 = struct.unpack(f"{len(audio_bytes) // 2}h", audio_bytes)
+                audio_f32 = np.array(audio_int16, dtype=np.float32) / 32768.0
+                clips.append(audio_f32)
 
-            from stt.voice_filter import VoiceFilter
-            vf = VoiceFilter()
-            success = vf.enroll(audio_f32)
+                # Brief pause between clips
+                if clip_idx < num_clips - 1:
+                    QMessageBox.information(
+                        parent, "Voice Model Training",
+                        f"Clip {clip_idx + 1} recorded! Click OK for the next one.",
+                    )
+
+            # Enroll
+            from stt.speaker_id import SpeakerVerifier
+            verifier = getattr(transcriber, "speaker_verifier", None)
+            if verifier is None:
+                verifier = SpeakerVerifier()
+                transcriber.speaker_verifier = verifier
+
+            quality = verifier.enroll(clips, sr=sample_rate)
 
             result = QMessageBox(parent)
-            result.setWindowTitle("Voice Enrollment")
-            if success:
-                result.setText("Voice profile saved!\nThe pony will now only respond to your voice.")
+            result.setWindowTitle("Voice Model Training")
+            if quality >= 0.85:
+                result.setText(f"Voice model trained successfully!\nQuality: {quality:.0%}")
                 result.setIcon(QMessageBox.Information)
             else:
-                result.setText("Enrollment failed. Try speaking louder or longer.")
+                result.setText(
+                    f"Voice model saved, but quality is low ({quality:.0%}).\n"
+                    "Try again in a quieter environment for better results."
+                )
                 result.setIcon(QMessageBox.Warning)
             result.exec_()
 
         except Exception as exc:
-            logger.warning("Voice enrollment failed: %s", exc)
+            logger.warning("Voice model training failed: %s", exc)
             err = QMessageBox(parent)
-            err.setWindowTitle("Voice Enrollment Error")
-            err.setText(f"Failed: {exc}")
+            err.setWindowTitle("Voice Model Error")
+            err.setText(f"Training failed: {exc}")
             err.setIcon(QMessageBox.Critical)
             err.exec_()
 
+    def _clear_voice_model(self) -> None:
+        """Delete the enrolled voice profile."""
+        transcriber = self._get_transcriber()
+        verifier = getattr(transcriber, "speaker_verifier", None) if transcriber else None
+        if verifier:
+            verifier.clear()
+            logger.info("Voice model cleared via context menu.")
+        else:
+            # Direct cleanup fallback
+            from stt.speaker_id import SpeakerVerifier
+            SpeakerVerifier().clear()
+
+    # ── Personality editing ─────────────────────────────────────────────
+
+    def _edit_personality(self) -> None:
+        """Open the active character's personality preset in the user's editor."""
+        from llm.prompt import ensure_preset_file
+        path = ensure_preset_file()
+        self._open_file(str(path))
+
     @staticmethod
-    def _delete_voice_profile() -> None:
+    def _open_presets_folder() -> None:
+        """Open the presets/ directory in Explorer."""
+        presets_dir = Path(__file__).parent.parent / "presets"
+        presets_dir.mkdir(exist_ok=True)
         try:
-            from stt.voice_filter import VoiceFilter
-            vf = VoiceFilter()
-            vf.delete_profile()
-            logger.info("Voice profile deleted.")
+            os.startfile(str(presets_dir))
         except Exception as exc:
-            logger.warning("Failed to delete voice profile: %s", exc)
+            logger.warning("Failed to open presets folder: %s", exc)
 
     # ── File openers ──────────────────────────────────────────────────────
 

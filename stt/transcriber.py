@@ -94,7 +94,7 @@ class _InterruptableStream:
 
 
 class Transcriber:
-    """Mic → Energy-based endpoint detection → Voice filter → Whisper STT."""
+    """Mic → Energy-based endpoint detection → Whisper STT."""
 
     def __init__(
         self,
@@ -120,9 +120,13 @@ class Transcriber:
         # Lets the GUI transition away from LISTEN state immediately
         self.on_recording_done = None
 
-        # Speaker verification — lazy-loaded, only if profile exists
-        self._voice_filter = None
-        self._voice_filter_checked = False
+        # Speaker verification — set by main.py if enrollment exists
+        self.speaker_verifier = None  # Optional[SpeakerVerifier]
+
+        # Results from the last transcription — read by pipeline after listen()
+        self.last_speaker_confidence: float = 1.0   # 1.0 = assume user (no model)
+        self.last_audio_clip: Optional[np.ndarray] = None  # float32 @ 16 kHz
+
 
     def interrupt_listening(self) -> None:
         """Interrupt active listening — process whatever audio was captured so far.
@@ -162,28 +166,6 @@ class Transcriber:
             self._whisper_model = whisper.load_model(self.model_name)
             logger.info("Whisper model '%s' loaded.", self.model_name)
         return self._whisper_model
-
-    def _get_voice_filter(self):
-        """Lazy-load voice filter. Returns None if resemblyzer not installed."""
-        if not self._voice_filter_checked:
-            self._voice_filter_checked = True
-            try:
-                from stt.voice_filter import VoiceFilter
-                self._voice_filter = VoiceFilter()
-                if self._voice_filter.enrolled:
-                    logger.info("Voice filter active — only user's voice will be transcribed.")
-                else:
-                    logger.info("Voice filter available but no profile enrolled. Run voice enrollment to enable.")
-            except ImportError:
-                logger.info("resemblyzer not installed — voice filter disabled.")
-            except Exception as exc:
-                logger.warning("Voice filter init failed: %s", exc)
-        return self._voice_filter
-
-    @property
-    def voice_filter(self):
-        """Access the voice filter (for enrollment from GUI)."""
-        return self._get_voice_filter()
 
     def listen(self, speech_start_timeout_s: float = 0.0, initial_discard_ms: int = 0) -> Optional[str]:
         """
@@ -258,15 +240,21 @@ class Transcriber:
                 except Exception:
                     pass
 
-            # Get raw audio for voice filter check and Whisper transcription
+            # Get raw audio for Whisper transcription
             audio_data = audio.get_raw_data(convert_rate=SAMPLE_RATE, convert_width=2)
             audio_f32 = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
 
-            # Speaker verification — skip transcription if audio isn't the user
-            vf = self._get_voice_filter()
-            if vf and vf.enrolled and not vf.is_user(audio_f32):
-                logger.info("Voice filter: rejected audio (not the enrolled user).")
-                return None
+            # Speaker verification — run before Whisper (fast: ~5 ms)
+            self.last_audio_clip = audio_f32
+            if self.speaker_verifier:
+                try:
+                    self.last_speaker_confidence = self.speaker_verifier.verify(audio_f32)
+                    logger.debug("Speaker confidence: %.3f", self.last_speaker_confidence)
+                except Exception as exc:
+                    logger.debug("Speaker verification failed: %s", exc)
+                    self.last_speaker_confidence = 1.0
+            else:
+                self.last_speaker_confidence = 1.0
 
             # Transcribe locally with Whisper
             logger.debug("Transcribing %d samples via Whisper (%s)…", len(audio_f32), self.model_name)
@@ -343,13 +331,15 @@ class Transcriber:
                         raise
                     logger.warning("PTT: default device failed (%s) — trying fallbacks", e)
                     stream = None
-                    # Try without explicit device first (drop device_index if set)
                     kw_base = {k: v for k, v in stream_kwargs.items() if k != "input_device_index"}
-                    try:
-                        stream = pa.open(**kw_base)
-                        logger.info("PTT: opened with default device (no explicit index)")
-                    except OSError:
-                        pass
+                    # Only try "no device_index" if we had one set — otherwise the
+                    # initial call already used the default device
+                    if self.input_device_index is not None:
+                        try:
+                            stream = pa.open(**kw_base)
+                            logger.info("PTT: opened with default device (no explicit index)")
+                        except OSError:
+                            pass
                     # Enumerate all input devices
                     if stream is None:
                         for i in range(pa.get_device_count()):
@@ -399,11 +389,17 @@ class Transcriber:
             audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
             audio_f32 = audio_int16.astype(np.float32) / 32768.0
 
-            # Voice filter check
-            vf = self._get_voice_filter()
-            if vf and vf.enrolled and not vf.is_user(audio_f32):
-                logger.info("PTT voice filter: rejected (not enrolled user).")
-                return None
+            # Speaker verification (fast: ~5 ms)
+            self.last_audio_clip = audio_f32
+            if self.speaker_verifier:
+                try:
+                    self.last_speaker_confidence = self.speaker_verifier.verify(audio_f32)
+                    logger.debug("PTT speaker confidence: %.3f", self.last_speaker_confidence)
+                except Exception as exc:
+                    logger.debug("PTT speaker verification failed: %s", exc)
+                    self.last_speaker_confidence = 1.0
+            else:
+                self.last_speaker_confidence = 1.0
 
             # Transcribe with Whisper
             logger.debug("PTT: transcribing %d samples via Whisper...", len(audio_f32))

@@ -111,6 +111,7 @@ class RoutineTag:
     time: Optional[str] = None       # HH:MM for daily/weekly
     day: Optional[str] = None        # lowercase day name for weekly ("monday", etc.)
     hours: Optional[float] = None    # hours for on_sleep / interval
+    exclude_days: Optional[List[str]] = None  # ["saturday", "sunday"] for daily exclusions
 
 
 @dataclass
@@ -257,25 +258,56 @@ def parse_response(raw: str) -> ParsedResponse:
 
             rt = RoutineTag(schedule=schedule, goal=goal, urgency=urgency)
 
-            # Parse optional extra fields
-            if len(parts) >= 4:
-                extra = parts[3].strip()
-                if schedule == "daily":
-                    # Could be HH:MM (possibly split across parts[3] and parts[4])
-                    if len(parts) >= 5:
-                        rt.time = f"{parts[3].strip()}:{parts[4].strip()}"
-                    else:
-                        rt.time = extra
-                elif schedule == "weekly":
-                    # [ROUTINE:weekly:goal:urgency:day:HH:MM]
-                    rt.day = extra.lower()
-                    if len(parts) >= 6:
-                        rt.time = f"{parts[4].strip()}:{parts[5].strip()}"
-                    elif len(parts) >= 5:
-                        rt.time = parts[4].strip()
-                elif schedule in ("on_sleep", "interval"):
+            # Collect all remaining parts for flexible parsing
+            remaining = [p.strip() for p in parts[3:]]
+
+            # Extract exclusion days (!saturday, !sunday) from ANY position
+            exclude_days = []
+            non_exclude = []
+            for p in remaining:
+                # Handle comma-separated exclusions like "!saturday,!sunday"
+                # or mixed like "16:00,!saturday"
+                sub_parts = [s.strip() for s in p.split(",")]
+                for sp in sub_parts:
+                    if sp.startswith("!"):
+                        day_name = sp[1:].strip().lower()
+                        if day_name:
+                            exclude_days.append(day_name)
+                    elif sp:
+                        non_exclude.append(sp)
+            if exclude_days:
+                rt.exclude_days = exclude_days
+
+            # Parse schedule-specific fields from non-exclude parts
+            if schedule == "daily":
+                # Reconstruct time from parts (HH:MM may be split across parts)
+                if len(non_exclude) >= 2:
+                    # Could be ["16", "00"] from HH:MM split
                     try:
-                        rt.hours = float(extra)
+                        int(non_exclude[0])
+                        int(non_exclude[1])
+                        rt.time = f"{non_exclude[0]}:{non_exclude[1]}"
+                    except ValueError:
+                        rt.time = non_exclude[0]
+                elif len(non_exclude) == 1:
+                    rt.time = non_exclude[0]
+            elif schedule == "weekly":
+                # [ROUTINE:weekly:goal:urgency:day:HH:MM]
+                if non_exclude:
+                    rt.day = non_exclude[0].lower()
+                if len(non_exclude) >= 3:
+                    try:
+                        int(non_exclude[1])
+                        int(non_exclude[2])
+                        rt.time = f"{non_exclude[1]}:{non_exclude[2]}"
+                    except ValueError:
+                        rt.time = non_exclude[1]
+                elif len(non_exclude) >= 2:
+                    rt.time = non_exclude[1]
+            elif schedule in ("on_sleep", "interval"):
+                if non_exclude:
+                    try:
+                        rt.hours = float(non_exclude[0])
                     except ValueError:
                         pass
 

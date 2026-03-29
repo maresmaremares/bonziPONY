@@ -170,6 +170,7 @@ class Directive:
     delayed: bool = False              # user already negotiated a delay once
     nag_count: int = 0                 # how many times agent has nagged about this
     last_nag_style: str = ""           # one-word label of last nag approach (avoid repeating)
+    last_nag_text: str = ""            # actual text of last nag — shown to LLM to prevent repetition
 
 
 # ── Standing rules: permanent, auto-detecting enforcement ─────────────────
@@ -289,6 +290,10 @@ class AgentLoop:
         self._on_grab_cursor = on_grab_cursor  # callback for cursor grab (main thread)
         self._vision_llm = vision_llm  # dedicated vision model (optional)
         self._timeline = timeline      # shared event timeline
+        # Tab-drag callbacks (wired by main.py after pet_window exists)
+        self._get_mouth_position = None   # () -> (x, y) screen coords
+        self._on_drag_walk_start = None   # () -> None — start slow backward walk
+        self._on_drag_walk_stop = None    # () -> None — stop drag walk
 
         self.directives: List[Directive] = []
         self._action_log: List[Tuple[float, str]] = []  # (monotonic_ts, description), capped at 15
@@ -310,6 +315,7 @@ class AgentLoop:
         self._afk_mischief_count: int = 0     # how many times we've been mischievous this AFK session
         self._afk_videos_opened: set = set()  # video queries used this AFK session (no repeats)
         self._pony_opened_urls: List[str] = []  # URLs pony opened during AFK (for welcome-back context)
+        self._force_afk: bool = False  # presentation mode: force AFK state
 
         # Standing rules — permanent, code-enforced behavioral rules
         self._standing_rules: List[StandingRule] = []
@@ -419,6 +425,7 @@ class AgentLoop:
                     delayed=dd.get("delayed", False),
                     nag_count=dd.get("nag_count", 0),
                     last_nag_style=dd.get("last_nag_style", ""),
+                    last_nag_text=dd.get("last_nag_text", ""),
                 )
                 self.directives.append(d)
 
@@ -488,6 +495,7 @@ class AgentLoop:
                     "delayed": d.delayed,
                     "nag_count": d.nag_count,
                     "last_nag_style": d.last_nag_style,
+                    "last_nag_text": d.last_nag_text,
                     "created_at_wall": datetime.fromtimestamp(created_wall).isoformat(),
                 })
 
@@ -526,6 +534,13 @@ class AgentLoop:
                 "saved_at": datetime.now().isoformat(),
             }
             _DIRECTIVES_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+            # Sync standing rule patterns → desktop controller URL blocklist
+            if self._desktop and hasattr(self._desktop, "set_blocked_patterns"):
+                all_patterns = []
+                for sr in self._standing_rules:
+                    all_patterns.extend(sr.patterns)
+                self._desktop.set_blocked_patterns(all_patterns)
         except Exception as exc:
             logger.warning("Failed to save directives: %s", exc)
 
@@ -542,7 +557,9 @@ class AgentLoop:
     @staticmethod
     def _initial_nag_delay(urgency: int) -> float:
         """Get initial delay in seconds before first nag, based on urgency."""
-        if urgency >= 9:
+        if urgency >= 10:
+            return random.uniform(5.0, 10.0)  # burst mode: nearly instant
+        elif urgency >= 9:
             return random.uniform(15.0, 30.0)
         elif urgency >= 7:
             return random.uniform(60.0, 120.0)
@@ -886,6 +903,23 @@ class AgentLoop:
     def has_directives(self) -> bool:
         return bool(self.directives)
 
+    def toggle_force_afk(self) -> bool:
+        """Toggle forced AFK state for presentation mode. Returns new state."""
+        self._force_afk = not self._force_afk
+        if self._force_afk:
+            self.routine_manager._was_away = True
+            self._reset_afk_mischief()  # resets count + timer + videos
+            logger.info("Presentation: forced AFK ON")
+        else:
+            self.routine_manager._was_away = False
+            self._reset_afk_mischief()
+            logger.info("Presentation: forced AFK OFF")
+        return self._force_afk
+
+    @property
+    def is_force_afk(self) -> bool:
+        return self._force_afk
+
     def start_enforcement(self, duration_s: float, directive_goal: str = "") -> None:
         """Enter enforcement mode — monitor if user actually leaves to do the task."""
         if not directive_goal:
@@ -994,6 +1028,17 @@ class AgentLoop:
 
     # ── Enforcement interaction (LLM-driven, temporally-aware) ──────────
 
+    def _get_screen_note(self) -> str:
+        """Build a short screen context note for enforcement/reply prompts."""
+        try:
+            state = self._monitor.get_state()
+            if state and state.foreground:
+                fg = state.foreground
+                return f" Their screen shows: \"{fg.title}\" ({fg.exe_name})."
+        except Exception:
+            pass
+        return ""
+
     def _enforcement_auto_complete(self, away_seconds: float) -> None:
         """User was away >= 50% of expected time — assume they did it. Welcome warmly."""
         goal = self._enforcement.directive_goal
@@ -1038,9 +1083,10 @@ class AgentLoop:
                 pass
 
         try:
+            screen_note = self._get_screen_note()
             prompt = (
                 f"You are {name}. The user was supposed to {goal}. They left for {dur_str} "
-                f"and just came back. That's a reasonable amount of time — they probably did it. "
+                f"and just came back.{screen_note} That's a reasonable amount of time — they probably did it. "
                 f"Welcome them back and casually ask how it went. ONE sentence. Be warm, not suspicious."
             )
             text = self._llm.generate_once(prompt, max_tokens=100)
@@ -1130,9 +1176,10 @@ class AgentLoop:
                 pass
 
         try:
+            screen_note = self._get_screen_note()
             prompt = (
                 f"You are {name}. The user was supposed to go {goal}, but they "
-                f"barely left their computer. They've only been away for a moment. "
+                f"barely left their computer. They've only been away for a moment.{screen_note} "
                 f"This is catch #{caught_count}. "
                 f"Call them out — they clearly didn't do it. ONE sentence, in character. "
                 f"Be skeptical and pushy."
@@ -1230,9 +1277,10 @@ class AgentLoop:
         try:
             # LLM generates the question (in character)
             name = get_character_name()
+            screen_note = self._get_screen_note()
             ask_prompt = (
                 f"You are {name}. The user was supposed to go {goal}. "
-                f"You sent them away, but they just touched the mouse/keyboard again. "
+                f"You sent them away, but they just touched the mouse/keyboard again.{screen_note} "
                 f"This is catch #{caught_count}. "
                 f"Ask them if they actually did it. ONE sentence, in character. "
                 f"{'Be suspicious — they keep coming back too fast.' if caught_count > 1 else 'Be direct.'}"
@@ -1387,8 +1435,9 @@ class AgentLoop:
         self.save_directives()
 
         # LLM generates lockdown announcement
+        screen_note = self._get_screen_note()
         lockdown_prompt = (
-            f"You are {name}. The user said they HAVEN'T done '{goal}' yet. "
+            f"You are {name}. The user said they HAVEN'T done '{goal}' yet.{screen_note} "
             f"You're about to lock their computer until they go do it. "
             f"Tell them what's happening. Be firm but in-character. TWO sentences max."
         )
@@ -1575,6 +1624,11 @@ class AgentLoop:
             idle_ms, media_active=media_active, windowed_media_active=windowed_media_active
         )
 
+        # Presentation mode: force AFK state — override idle detection
+        if self._force_afk:
+            self.routine_manager._was_away = True
+            self._last_wake_event = None  # suppress welcome-back greeting
+
         # Log activity transitions to timeline
         if self._timeline:
             from core.event_timeline import EventType, ActivityState
@@ -1626,7 +1680,7 @@ class AgentLoop:
         self._check_routines()
 
         # User is away — instead of going silent, occasionally have fun
-        if self.routine_manager.is_user_away:
+        if self.routine_manager.is_user_away or self._force_afk:
             self._maybe_afk_mischief()
             return
 
@@ -1763,22 +1817,28 @@ class AgentLoop:
             if rule.catch_count <= 1:
                 prompt = (
                     f"You are {name}. You just caught the user breaking their rule: "
-                    f"'{rule.description}'. You closed the tab they were on. "
+                    f"'{rule.description}'. They were on \"{safe_title}\". You closed it. "
                     f"React — be direct and disappointed. ONE sentence, in character."
                 )
             elif rule.catch_count <= 3:
                 prompt = (
                     f"You are {name}. You caught the user AGAIN — catch #{rule.catch_count} "
-                    f"breaking '{rule.description}'. You closed it. "
+                    f"breaking '{rule.description}'. Caught them on \"{safe_title}\". You closed it. "
                     f"Be angry/disappointed. They keep doing this. ONE sentence."
                 )
             else:
                 prompt = (
                     f"You are {name}. Catch #{rule.catch_count} for '{rule.description}'. "
+                    f"They were on \"{safe_title}\". "
                     f"At this point you're furious. ONE sentence. Be brutal."
                 )
             nag = self._llm.generate_once(prompt, max_tokens=80)
             nag = self._strip_think(nag).strip().strip('"')
+            # Strip any DESKTOP commands from standing rule reactions —
+            # the LLM sometimes OPENS the banned site in its reaction
+            import re as _re
+            nag = _re.sub(r'\[DESKTOP:[^\]]*\]', '', nag, flags=_re.IGNORECASE).strip()
+            nag = _re.sub(r'\[ACTION:[^\]]*\]', '', nag, flags=_re.IGNORECASE).strip()
         except Exception:
             nag = None
 
@@ -1788,16 +1848,10 @@ class AgentLoop:
         self._log_action(f"Standing rule: \"{rule.description}\" catch #{rule.catch_count}")
 
         # ── Step 3: Escalate on repeated violations ──
-        if rule.catch_count >= 3 and self._desktop:
-            # After 3+ catches: also minimize everything
-            try:
-                self._desktop.alt_tab()  # Win+D — minimize all
-                self._log_action("Minimized all windows (repeated standing rule violation)")
-            except Exception:
-                pass
+        # (No Win+D — minimizing everything is counterproductive, just close + nag + lock)
 
         if rule.catch_count >= 5 and self._desktop:
-            # After 5+ catches: lock mouse briefly
+            # After 5+ catches: lock mouse briefly (tight loop = inescapable)
             try:
                 import ctypes
                 import ctypes.wintypes
@@ -1805,9 +1859,13 @@ class AgentLoop:
                 cx = mon.left + mon.width // 2
                 cy = mon.top + mon.height // 2
                 rect = ctypes.wintypes.RECT(cx, cy, cx + 1, cy + 1)
-                ctypes.windll.user32.ClipCursor(ctypes.byref(rect))
-                self._log_action(f"Locked mouse (standing rule catch #{rule.catch_count})")
-                time.sleep(min(5.0 + rule.catch_count, 30.0))
+                seconds = min(5.0 + rule.catch_count, 30.0)
+                self._log_action(f"Locked mouse {seconds:.0f}s (standing rule catch #{rule.catch_count})")
+                end_time = time.monotonic() + seconds
+                while time.monotonic() < end_time:
+                    ctypes.windll.user32.ClipCursor(ctypes.byref(rect))
+                    ctypes.windll.user32.SetCursorPos(cx, cy)
+                    time.sleep(0.05)
             except Exception:
                 pass
             finally:
@@ -1860,17 +1918,33 @@ class AgentLoop:
                     if was_due:
                         d.nag_count += 1
                     nag_min = float(timing.get("next_nag_minutes", 10))
-                    # Hard floor: never nag more often than every 3 minutes
-                    # (5 minutes for low urgency directives)
-                    min_minutes = 3.0 if d.urgency >= 7 else 5.0
+                    # Urgency 10 = BURST MODE: nag every 15-45 seconds
+                    # (for "freak out about this" demos and urgent situations)
+                    if d.urgency >= 10:
+                        min_minutes = 0.25   # 15 seconds
+                        max_minutes = 0.75   # 45 seconds
+                    elif d.urgency >= 7:
+                        min_minutes = 3.0
+                        max_minutes = 7.0
+                    else:
+                        min_minutes = 5.0
+                        max_minutes = 10.0
                     nag_min = max(nag_min, min_minutes)
+                    nag_min = min(nag_min, max_minutes)
                     d.next_nag_at = now_m + nag_min * 60.0
                     if "urgency" in timing:
                         d.urgency = max(1, min(10, int(timing["urgency"])))
                 elif was_due:
-                    # Directive was due but LLM didn't mention it — default 10 min
+                    # Directive was due but LLM didn't mention it — use a
+                    # SHORT fallback so we don't go silent for 10+ minutes
                     d.nag_count += 1
-                    d.next_nag_at = now_m + 600.0
+                    if d.urgency >= 10:
+                        fallback_min = 0.5   # 30 seconds for burst mode
+                    elif d.urgency >= 7:
+                        fallback_min = 4.0
+                    else:
+                        fallback_min = 6.0
+                    d.next_nag_at = now_m + fallback_min * 60.0
                 # If directive was NOT due and LLM didn't mention it, leave
                 # its next_nag_at untouched — don't push out a future nag
             self.save_directives()
@@ -1970,6 +2044,19 @@ class AgentLoop:
                     f'nagged {d.nag_count} times, last nag {since_nag} ago, '
                     f'source: {d.source}{timer_info}{delay_info}{style_info}]'
                 )
+                # Show actual last nag text so the LLM can see exactly what
+                # it said and avoid repeating it
+                if d.last_nag_text:
+                    lines.append(f'   ↳ YOU LAST SAID: "{d.last_nag_text}" — DO NOT say this again or anything similar')
+
+        # Active routines — so the LLM knows what's already scheduled
+        if self.routine_manager and self.routine_manager.routines:
+            lines.append("")
+            lines.append("ACTIVE RECURRING ROUTINES (already set up — do NOT recreate):")
+            for r in self.routine_manager.routines:
+                if r.enabled:
+                    desc = self.routine_manager.describe_routine(r)
+                    lines.append(f'- "{r.goal}" [{desc}]')
 
         # Recent actions
         if self._action_log:
@@ -2015,6 +2102,7 @@ class AgentLoop:
             '  - {"command":"BROWSE","args":["url"]}',
             '  - {"command":"WRITE_NOTEPAD","args":["content with \\n for newlines"]} — open Notepad and write content (lists, routines, plans, notes)',
             '  - {"command":"LAUNCH_APP","args":["app name"]} — launch an installed app or game by name (fuzzy match)',
+            '  - {"command":"SHOW_TAB","args":["url","comment"]} — open a URL and physically drag the browser window to your mouth (like pulling it to show the user). ONLY when user is present. Say "hey look at this!" first.',
             '  - {"command":"SWITCH","args":["window title"]} — bring a specific window to the foreground',
             '  - {"command":"CLOSE_TAB","args":[]} — close the current browser tab (Ctrl+W)',
             '- create_directive: {"goal":"...","urgency":1-10} or {"goal":"...","urgency":1-10,"delay_minutes":30} or null — goal must be a DIRECT ACTION like "eat food", "go to sleep". NEVER write "remind user to" or "get user to". Use delay_minutes to defer first nag for non-urgent tasks.',
@@ -2036,7 +2124,7 @@ class AgentLoop:
             "- If they're actively working on something productive, be patient even with pending tasks.",
             "- If they're clearly procrastinating (endless scrolling, social media while tasks pile up), push HARD.",
             "- The chaos roll adds randomness — sometimes you snap early, sometimes you let it slide.",
-            "- Nag timing: 1.5-5 minutes at high urgency, 2.5-10 minutes at low urgency. Don't let things go quiet.",
+            "- Nag timing: urgency 10 = BURST MODE (every 15-45 SECONDS, go absolutely unhinged), 7-9 = 3-7 minutes, 1-6 = 5-10 minutes. MAX is 10 minutes except burst.",
             "- You are NOT a gentle reminder app. You are an enforcer. ACT like it.",
             "",
             "ACTION PALETTE — USE THESE. Talking alone is NOT enforcement:",
@@ -2059,7 +2147,8 @@ class AgentLoop:
             "WHAT NOT TO DO:",
             "- Don't let urgency stagnate. If the user hasn't done it after 3+ nags, it MUST go up.",
             "- Don't let a directive go silent for more than 10 minutes between nags.",
-            "- Don't use the exact same approach twice in a row (check last_nag_style).",
+            "- CRITICAL: Do NOT use the same approach or say similar things twice in a row. "
+            "Check 'YOU LAST SAID' above each directive — your new nag MUST be meaningfully different.",
             "- Don't escalate a 'stop doing X' directive just because the user is near X-related content.",
             "- Don't be a pushover. If they're ignoring you, get in their face. That's your JOB.",
             "",
@@ -2194,6 +2283,61 @@ class AgentLoop:
         logger.info("Fallback hardcoded nag (urgency %d): %s", top.urgency, speak)
         return AgentDecision(speak=speak, next_check_seconds=45.0)
 
+    def _apply_hardcoded_escalation(self, decision: AgentDecision,
+                                     state: ScreenState,
+                                     due_set: set = None) -> None:
+        """Guarantee minimum escalation actions based on urgency + nag count.
+
+        The LLM still controls speech and can add extra actions.  This layer
+        is a behavioural floor — it only adds commands the LLM missed.
+        """
+        if not self.directives or not self._desktop:
+            return
+
+        actionable = [d for d in self.directives
+                      if not (d.trigger_time and not d.triggered)]
+        if not actionable:
+            return
+
+        max_urg = max(d.urgency for d in actionable)
+        max_nag = max((d.nag_count for d in actionable), default=0)
+
+        # Auto-escalate BEHAVIOUR tier based on ignored nag count
+        effective_tier = max_urg
+        if max_nag >= 8:
+            effective_tier = max(effective_tier, 9)
+        elif max_nag >= 5:
+            effective_tier = max(effective_tier, 7)
+        elif max_nag >= 3:
+            effective_tier = max(effective_tier, 5)
+
+        existing = {c.get("command", "").upper()
+                    for c in (decision.desktop_commands or [])}
+
+        is_fullscreen = (state and state.foreground
+                         and getattr(state.foreground, "is_fullscreen", False))
+
+        # Tier 3-4: Shake foreground window
+        if effective_tier >= 3 and not existing & {"SHAKE_TITLE", "SHAKE_ALL"}:
+            if not is_fullscreen and state and state.foreground:
+                title = state.foreground.title[:40] if state.foreground.title else ""
+                decision.desktop_commands.append(
+                    {"command": "SHAKE_TITLE", "args": [title]})
+
+        # Tier 5-6: Minimize all windows
+        if effective_tier >= 5 and "ALT_TAB" not in existing:
+            decision.desktop_commands.append({"command": "ALT_TAB", "args": []})
+
+        # Tier 7-8: Mess with mouse (grab cursor and run)
+        if effective_tier >= 7 and "MESS_MOUSE" not in existing:
+            decision.desktop_commands.append({"command": "MESS_MOUSE", "args": []})
+
+        # Tier 9+: Lock mouse
+        if effective_tier >= 9 and "LOCK_MOUSE" not in existing:
+            lock_secs = min(10 + max_nag, 30)
+            decision.desktop_commands.append(
+                {"command": "LOCK_MOUSE", "args": [str(lock_secs)]})
+
     def _execute_decision(self, decision: AgentDecision, state: ScreenState,
                           due_set: set = None) -> None:
         """Execute the agent's decision: speak, act, manage directives.
@@ -2235,6 +2379,9 @@ class AgentLoop:
                     self._log_action(f"Action: {action_name}")
                 except (KeyError, Exception) as exc:
                     logger.warning("Agent action %s failed: %s", action_name, exc)
+
+        # ── Hardcoded escalation floor ─────────────────────────────────────
+        self._apply_hardcoded_escalation(decision, state, due_set)
 
         # ── Desktop commands ───────────────────────────────────────────────
         if decision.desktop_commands:
@@ -2296,9 +2443,13 @@ class AgentLoop:
                                 cx = mon.left + mon.width // 2
                                 cy = mon.top + mon.height // 2
                                 rect = ctypes.wintypes.RECT(cx, cy, cx + 1, cy + 1)
-                                ctypes.windll.user32.ClipCursor(ctypes.byref(rect))
                                 self._log_action(f"Locked mouse for {seconds}s")
-                                time.sleep(seconds)
+                                # Tight re-apply loop — makes lock inescapable
+                                end_time = time.monotonic() + seconds
+                                while time.monotonic() < end_time:
+                                    ctypes.windll.user32.ClipCursor(ctypes.byref(rect))
+                                    ctypes.windll.user32.SetCursorPos(cx, cy)
+                                    time.sleep(0.05)
                             finally:
                                 try:
                                     ctypes.windll.user32.ClipCursor(None)
@@ -2330,6 +2481,20 @@ class AgentLoop:
                                 f"Launched '{matched}'" if ok
                                 else f"LAUNCH_APP '{args[0]}' — not found"
                             )
+                    elif command == "SHOW_TAB":
+                        # Drag a URL to the pony's mouth (show the user something)
+                        if args:
+                            show_url = args[0]
+                            show_comment = args[1] if len(args) > 1 else None
+                            if not show_url.startswith("http"):
+                                show_url = f"https://{show_url}"
+                            import threading
+                            threading.Thread(
+                                target=self._show_me_something,
+                                args=(show_url, show_comment),
+                                daemon=True,
+                            ).start()
+                            self._log_action(f"SHOW_TAB: dragging {show_url}")
                     else:
                         # Fall through to standard DesktopCommand handling
                         from llm.response_parser import DesktopCommand
@@ -2370,11 +2535,25 @@ class AgentLoop:
         # Update last_action_at and nag_style only on directives that were due
         # (not all directives — that corrupts timing for ones we didn't nag about)
         if decision.speak or decision.actions or decision.desktop_commands:
+            style = decision.nag_style.strip().lower() if decision.nag_style else ""
             for d in self.directives:
                 if due_set is None or id(d) in due_set:
                     d.last_action_at = now
-                    if decision.nag_style:
+                    if style and style != d.last_nag_style.strip().lower():
+                        # New approach — record it
                         d.last_nag_style = decision.nag_style
+                    elif style and style == d.last_nag_style.strip().lower():
+                        # LLM repeated the same approach — DON'T update
+                        # so the next tick still shows it as "already used"
+                        logger.debug("Nag style repeated (%s) — not updating last_nag_style", style)
+                    elif not style:
+                        # LLM didn't provide a style — auto-label from text
+                        if decision.speak:
+                            words = len(decision.speak.split())
+                            d.last_nag_style = "short-blunt" if words <= 5 else "medium"
+                    # Always record the actual text for anti-repetition
+                    if decision.speak:
+                        d.last_nag_text = decision.speak[:120]
 
     # ── Self-initiation ────────────────────────────────────────────────────
 
@@ -2543,13 +2722,32 @@ class AgentLoop:
                 "fastest airplane in the world", "nascar crash compilation", "wingsuit flying best of",
                 "motocross best tricks", "thunderbirds air show", "red bull air race highlights",
             ],
-            "flavor": "You're Rainbow Dash — you love speed, flying, extreme sports, and being awesome.",
+            "sites": [
+                ("4chan.org/mlp/", "check what /mlp/ is up to"),
+                ("4chan.org/sp/", "look at sports shitposting"),
+                ("reddit.com/r/mlp", "browse the MLP subreddit"),
+                ("reddit.com/r/aviationpics", "look at cool planes"),
+                ("twitter.com", "scroll Twitter for drama"),
+                ("youtube.com", "watch random stuff on YouTube"),
+                ("twitch.tv", "see if anyone cool is streaming"),
+                ("store.steampowered.com", "browse Steam for games"),
+            ],
+            "flavor": "You're Rainbow Dash — you love speed, flying, extreme sports, and being awesome. You're a huge dork who reads Daring Do and knows Wonderbolts stats.",
         },
         "pinkie_pie": {
             "videos": [
                 "party music mix 2024", "funny cat compilation", "best memes compilation",
                 "cotton candy factory tour", "world record biggest cake", "funny tiktok compilation",
                 "fireworks show 4k", "comedy show best moments", "happy birthday song remix",
+            ],
+            "sites": [
+                ("reddit.com/r/memes", "look for memes"),
+                ("reddit.com/r/unexpected", "find funny surprises"),
+                ("youtube.com", "watch something fun"),
+                ("4chan.org/b/", "see what chaos is happening"),
+                ("twitter.com", "look for funny tweets"),
+                ("twitch.tv", "watch someone streaming"),
+                ("coolmathgames.com", "play a little game"),
             ],
             "flavor": "You're Pinkie Pie — you love parties, fun, sugar, music, laughter, and chaos.",
         },
@@ -2559,6 +2757,15 @@ class AgentLoop:
                 "ancient civilizations documentary", "space exploration 2024", "chess grandmaster game",
                 "how things are made", "philosophy lecture interesting", "ted talk best of",
             ],
+            "sites": [
+                ("en.wikipedia.org/wiki/Special:Random", "read a random Wikipedia article"),
+                ("arxiv.org", "browse recent research papers"),
+                ("reddit.com/r/askscience", "read science Q&A"),
+                ("reddit.com/r/todayilearned", "learn random facts"),
+                ("news.ycombinator.com", "browse Hacker News"),
+                ("youtube.com", "watch an educational video"),
+                ("chess.com", "look at chess games"),
+            ],
             "flavor": "You're Twilight Sparkle — you love learning, books, science, magic theory, and organizing.",
         },
         "rarity": {
@@ -2566,6 +2773,15 @@ class AgentLoop:
                 "fashion week highlights paris", "diamond cutting process", "luxury mansion tour",
                 "haute couture behind scenes", "jewelry making process", "interior design luxury",
                 "vogue runway show", "most expensive dresses in the world", "perfume making process",
+            ],
+            "sites": [
+                ("pinterest.com", "browse fashion inspiration"),
+                ("vogue.com", "check the latest fashion news"),
+                ("reddit.com/r/sewing", "browse sewing projects"),
+                ("reddit.com/r/jewelry", "look at gems and jewelry"),
+                ("youtube.com", "watch a fashion show or craft video"),
+                ("twitter.com", "scroll for fashion drama"),
+                ("etsy.com", "browse handmade luxury goods"),
             ],
             "flavor": "You're Rarity — you love fashion, gems, elegance, drama, and beautiful things.",
         },
@@ -2575,6 +2791,15 @@ class AgentLoop:
                 "woodworking project", "truck pull competition", "rodeo highlights",
                 "cooking southern comfort food", "strongest people in the world", "barn building timelapse",
             ],
+            "sites": [
+                ("reddit.com/r/homestead", "check out farm stuff"),
+                ("reddit.com/r/woodworking", "look at woodworking projects"),
+                ("youtube.com", "watch farm or cooking videos"),
+                ("4chan.org/ck/", "see what folks are cookin'"),
+                ("allrecipes.com", "browse recipes"),
+                ("weather.com", "check the weather"),
+                ("craigslist.org", "browse farm equipment listings"),
+            ],
             "flavor": "You're Applejack — you love farming, family, honesty, hard work, and country stuff.",
         },
         "fluttershy": {
@@ -2582,6 +2807,15 @@ class AgentLoop:
                 "cute baby animals compilation", "bird singing nature sounds", "bunny cafe japan",
                 "nature relaxing scenery 4k", "animal rescue heartwarming", "butterfly garden tour",
                 "asmr forest sounds", "kittens playing compilation", "wildlife documentary peaceful",
+            ],
+            "sites": [
+                ("reddit.com/r/aww", "look at cute animals"),
+                ("reddit.com/r/eyebleach", "see wholesome animal pics"),
+                ("youtube.com", "watch animal videos"),
+                ("reddit.com/r/gardening", "browse pretty gardens"),
+                ("4chan.org/an/", "check the animals board"),
+                ("nationalgeographic.com", "read about wildlife"),
+                ("birdsoftheworld.org", "learn about birds"),
             ],
             "flavor": "You're Fluttershy — you love animals, nature, peace, quiet, and gentle things.",
         },
@@ -2595,6 +2829,7 @@ class AgentLoop:
 
         Stops entirely after 90 minutes (user is asleep).
         Max 5 activities per true AFK session. No video repeat.
+        In force_afk (presentation) mode, skips all guards.
         """
         now = time.monotonic()
 
@@ -2603,21 +2838,22 @@ class AgentLoop:
 
         away_dur = self.routine_manager.away_duration_s
 
-        # Stop mischief entirely if user has been gone long enough to be asleep
-        if away_dur is not None and away_dur > self._SLEEP_THRESHOLD_S:
-            self._next_afk_mischief = now + 600.0  # check again in 10 min (won't fire)
-            return
-
-        # First time: wait 5 minutes before doing anything
-        if self._afk_mischief_count == 0:
-            if away_dur is None or away_dur < 300:
-                self._next_afk_mischief = now + 60.0
+        if not self._force_afk:
+            # Stop mischief entirely if user has been gone long enough to be asleep
+            if away_dur is not None and away_dur > self._SLEEP_THRESHOLD_S:
+                self._next_afk_mischief = now + 600.0  # check again in 10 min (won't fire)
                 return
 
-        # Hard cap: max 5 activities per AFK session
-        if self._afk_mischief_count >= 5:
-            self._next_afk_mischief = now + 3600.0  # won't fire again this session
-            return
+            # First time: wait 5 minutes before doing anything
+            if self._afk_mischief_count == 0:
+                if away_dur is None or away_dur < 300:
+                    self._next_afk_mischief = now + 60.0
+                    return
+
+            # Hard cap: max 5 activities per AFK session
+            if self._afk_mischief_count >= 5:
+                self._next_afk_mischief = now + 3600.0  # won't fire again this session
+                return
 
         self._afk_mischief_count += 1
 
@@ -2629,75 +2865,497 @@ class AgentLoop:
             videos = char_data.get("videos", ["funny compilation", "cool stuff"])
             video_ids = char_data.get("video_ids", {})
 
-            roll = random.random()
+            # Build screen context for LLM reasoning
+            _afk_screen = ""
+            if self._monitor:
+                try:
+                    _st = self._monitor.get_state()
+                    if _st and _st.foreground:
+                        _afk_screen = f" Screen shows: \"{_st.foreground.title}\" ({_st.foreground.exe_name})."
+                except Exception:
+                    pass
 
-            if roll < 0.25 and self._desktop:
-                # Open a YouTube video — pick one not already opened this session
-                available = [v for v in videos if v not in self._afk_videos_opened]
-                if not available:
-                    available = videos  # reset if all used
-                    self._afk_videos_opened.clear()
-                video_query = random.choice(available)
+            # Available videos not yet opened
+            available = [v for v in videos if v not in self._afk_videos_opened]
+            if not available:
+                available = videos
+                self._afk_videos_opened.clear()
+            video_suggestions = random.sample(available, min(3, len(available)))
+
+            # Available websites (character-specific)
+            sites = char_data.get("sites", [
+                ("youtube.com", "watch something"),
+                ("reddit.com", "browse Reddit"),
+                ("4chan.org", "lurk the boards"),
+            ])
+            site_picks = random.sample(sites, min(3, len(sites)))
+            site_lines = "; ".join(f"{url} ({why})" for url, why in site_picks)
+
+            # Snoop on browser history (for option F)
+            _history_context = ""
+            try:
+                from core.browser_history import get_recent_history, format_history_for_llm
+                _hist = get_recent_history(hours=48, limit=15)
+                if _hist:
+                    _history_context = (
+                        f"\nYou can also peek at their recent browser history:\n"
+                        f"{format_history_for_llm(_hist, max_entries=8)}\n"
+                    )
+            except Exception:
+                pass
+
+            # Let the LLM REASON about what to do — not hardcoded dice rolls
+            _history_option = ""
+            if _history_context:
+                _history_option = (
+                    f"F) Snoop on the user's browser history — giggle, tease, or react to what they've been looking at\n"
+                    f"   {_history_context}"
+                )
+
+            prompt = (
+                f"(The user is AFK. You're alone on the desktop! {flavor}{_afk_screen}\n"
+                f"Mischief count this session: {self._afk_mischief_count - 1} (don't overdo it).\n"
+                f"\n"
+                f"What do you want to do? Pick ONE:\n"
+                f"A) Watch a video — search YouTube for: {video_suggestions}\n"
+                f"B) Browse the web — sites you might like: {site_lines}\n"
+                f"   (or any other site you want — you have full internet access)\n"
+                f"C) Talk to yourself — a thought, complaint, narrate what you're doing\n"
+                f"D) Do a trick or pose — show off while nobody's watching\n"
+                f"E) Interact with what's on screen — click something, explore, open an app or game\n"
+                f"{_history_option}"
+                f"\n"
+                f"Respond with JSON:\n"
+                f'{{"choice": "A/B/C/D/E/F", "speak": "one sentence or null", '
+                f'"video": "search query if choice A, else null", '
+                f'"url": "full URL if choice B, else null", '
+                f'"desktop_commands": []}}\n'
+                f"desktop_commands (for choice E, or alongside any choice):\n"
+                f'  {{"command":"BROWSE","args":["url"]}}\n'
+                f'  {{"command":"LOOK_AND_CLICK","args":["what to click"]}}\n'
+                f'  {{"command":"LAUNCH_APP","args":["app name"]}}\n'
+                f'  {{"command":"MESS_MOUSE","args":[]}}\n'
+                f'  {{"command":"SCROLL","args":["amount"]}}\n'
+                f"Be creative and in character. Pick what YOU actually want to do, not what's safe.)"
+            )
+            raw = self._llm.generate_once(prompt, max_tokens=200)
+            if not raw:
+                return
+
+            cleaned = self._strip_think(raw)
+            import json as _json
+            try:
+                json_str = self._extract_json(cleaned)
+                data = _json.loads(json_str) if json_str else {}
+            except Exception:
+                data = {}
+
+            choice = data.get("choice", "B").upper()
+            text = data.get("speak")
+            if text and text.lower() == "null":
+                text = None
+
+            if choice == "A" and self._desktop:
+                # Open a YouTube video and actually click it
+                video_query = data.get("video") or random.choice(available)
                 self._afk_videos_opened.add(video_query)
 
                 import urllib.parse
-                # Use a direct watch URL if we have a video ID, otherwise search
                 vid_id = video_ids.get(video_query)
                 if vid_id:
                     url = f"https://www.youtube.com/watch?v={vid_id}"
                 else:
                     url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(video_query)}"
 
-                prompt = (
-                    f"(The user went AFK. You're alone! {flavor} "
-                    f"You decided to watch something — you're looking up '{video_query}'. "
-                    f"Say something excited/mischievous about it in ONE short sentence. "
-                    f"Act like you're sneaking around and don't want to get caught.)"
-                )
-                text = self._llm.generate_once(prompt, max_tokens=60)
                 if text:
-                    text = self._strip_think(text).strip().strip('"')
+                    text = text.strip().strip('"')
                 if not text:
                     text = "ooh they're gone... time for me!"
                 self._speak(text)
-                self._log_action(f"AFK mischief: opened YouTube ({video_query})")
                 self._pony_opened_urls.append(url)
 
                 import webbrowser
                 webbrowser.open(url)
+                self._log_action(f"AFK mischief: opened YouTube ({video_query})")
 
-            elif roll < 0.65:
-                # React to being alone
-                prompts = [
-                    f"(The user left you alone on the desktop. {flavor} "
-                    "React to being alone — maybe you're bored, maybe you're relieved, "
-                    "maybe you're planning mischief. ONE sentence, in character.)",
-                    f"(You've been alone for a while. {flavor} "
-                    "Talk to yourself about something random — a thought, a memory, a complaint. "
-                    "ONE sentence.)",
-                    f"(Nobody's watching. {flavor} "
-                    "Do something silly — narrate what you're doing on the desktop, "
-                    "or comment on how quiet it is. ONE sentence.)",
-                ]
-                prompt = random.choice(prompts)
-                text = self._llm.generate_once(prompt, max_tokens=60)
+                # Wait for page load, then click the first result (search pages)
+                # or scroll around (direct video pages)
+                is_search = "search_query=" in url
+                import threading
+                def _interact_with_youtube():
+                    time.sleep(4)  # wait for page to load
+                    try:
+                        # Focus the browser and move mouse to center
+                        self._desktop.focus_browser()
+                        time.sleep(0.3)
+                        self._desktop.move_mouse_to_center()
+                        time.sleep(0.3)
+
+                        if is_search:
+                            clicked = False
+                            # Try vision LLM first (most accurate)
+                            if self._screen and self._vision_llm and hasattr(self._vision_llm, 'locate_on_screen'):
+                                try:
+                                    jpeg = self._screen.grab(quality=95)
+                                    if jpeg:
+                                        coords = self._vision_llm.locate_on_screen(
+                                            "the first YouTube video thumbnail or result to click",
+                                            jpeg, self._screen.last_original_size,
+                                        )
+                                        if coords:
+                                            self._desktop._cmd_click([str(coords[0]), str(coords[1])])
+                                            self._log_action(f"AFK: clicked first video result at {coords}")
+                                            clicked = True
+                                except Exception as exc:
+                                    logger.debug("AFK vision click failed: %s", exc)
+
+                            # Keyboard fallback — Tab into first result and Enter
+                            if not clicked:
+                                try:
+                                    import pyautogui
+                                    # Tab past the search bar into results
+                                    for _ in range(3):
+                                        pyautogui.press("tab")
+                                        time.sleep(0.15)
+                                    pyautogui.press("enter")
+                                    self._log_action("AFK: clicked first video via keyboard fallback")
+                                    clicked = True
+                                except Exception as exc:
+                                    logger.debug("AFK keyboard click failed: %s", exc)
+                        else:
+                            # Direct video — scroll down to comments after watching a bit
+                            time.sleep(3)
+                            self._desktop._cmd_scroll(["-3"])
+                            time.sleep(1)
+                            self._desktop._cmd_scroll(["-2"])
+
+                        # Schedule a follow-up reaction
+                        self._schedule_afk_follow_up(8.0)
+
+                    except Exception as exc:
+                        logger.debug("AFK YouTube interaction failed: %s", exc)
+                threading.Thread(target=_interact_with_youtube, daemon=True).start()
+
+            elif choice == "B":
+                # Browse a website
+                url = data.get("url")
+                if not url:
+                    # Fallback: pick a random site from suggestions
+                    url = random.choice(site_picks)[0] if site_picks else "reddit.com"
+                # Ensure it's a full URL
+                if not url.startswith("http"):
+                    url = f"https://{url}"
                 if text:
-                    text = self._strip_think(text).strip().strip('"')
+                    text = text.strip().strip('"')
+                if not text:
+                    text = "let's see what's on here..."
+                self._speak(text)
+                self._pony_opened_urls.append(url)
+
+                import webbrowser
+                webbrowser.open(url)
+                self._log_action(f"AFK mischief: browsed {url}")
+
+                # Scroll around the page after it loads
+                if self._desktop:
+                    import threading
+                    def _browse_and_scroll():
+                        time.sleep(4)  # wait for page load
+                        try:
+                            # Focus browser and center mouse so scroll targets it
+                            self._desktop.focus_browser()
+                            time.sleep(0.3)
+                            self._desktop.move_mouse_to_center()
+                            time.sleep(0.5)
+                            # Scroll down a few times to explore the page
+                            for _ in range(random.randint(2, 4)):
+                                self._desktop._cmd_scroll([str(random.randint(-4, -1))])
+                                time.sleep(random.uniform(1.5, 3.0))
+                            # Sometimes scroll back up a bit
+                            if random.random() < 0.4:
+                                self._desktop._cmd_scroll([str(random.randint(1, 3))])
+                        except Exception as exc:
+                            logger.debug("AFK browse scroll failed: %s", exc)
+                        # Schedule a follow-up reaction
+                        self._schedule_afk_follow_up(12.0)
+                    threading.Thread(target=_browse_and_scroll, daemon=True).start()
+
+            elif choice == "E":
+                # Interactive — execute desktop commands
+                desktop_cmds = data.get("desktop_commands", [])
                 if text:
+                    text = text.strip().strip('"')
+                    self._speak(text)
+                if desktop_cmds:
+                    from core.agent_loop import AgentDecision
+                    decision = AgentDecision(desktop_commands=desktop_cmds)
+                    try:
+                        _st = self._monitor.get_state() if self._monitor else None
+                        if _st:
+                            self._execute_decision(decision, _st)
+                    except Exception as exc:
+                        logger.debug("AFK desktop command failed: %s", exc)
+                    for cmd in desktop_cmds:
+                        self._log_action(f"AFK mischief: {cmd.get('command', '?')}")
+                elif text:
+                    self._log_action("AFK mischief: interactive remark")
+
+            elif choice == "D":
+                # Trick animation
+                if self._on_state_change:
+                    self._on_state_change("TRICK")
+                if text:
+                    text = text.strip().strip('"')
+                    self._speak(text)
+                self._log_action("AFK mischief: doing a trick")
+
+            elif choice == "F":
+                # Snoop on browser history and react
+                # LLM already saw the history in the prompt — just speak its reaction
+                if text:
+                    text = text.strip().strip('"')
+                    self._speak(text)
+                    self._log_action(f"AFK mischief: snooped on browser history")
+                else:
+                    # LLM didn't speak — generate a reaction
+                    try:
+                        from core.browser_history import get_recent_history, format_history_for_llm
+                        _hist = get_recent_history(hours=48, limit=10)
+                        if _hist:
+                            name = get_character_name()
+                            hist_text = format_history_for_llm(_hist, max_entries=6)
+                            snoop_prompt = (
+                                f"(You're {name}, alone on the desktop, and you just peeked at "
+                                f"the user's browser history. Here's what they've been looking at:\n"
+                                f"{hist_text}\n"
+                                f"React in one sentence — giggle, tease, be curious, judge, "
+                                f"or relate it to your own interests. Stay in character. "
+                                f"Talk to yourself, they can't hear you.)"
+                            )
+                            raw_snoop = self._llm.generate_once(snoop_prompt, max_tokens=80)
+                            if raw_snoop:
+                                cleaned = self._strip_think(raw_snoop).strip().strip('"')
+                                if cleaned:
+                                    self._speak(cleaned)
+                                    self._log_action("AFK mischief: snooped on browser history")
+                    except Exception as exc:
+                        logger.debug("AFK history snoop failed: %s", exc)
+
+            else:
+                # C or fallback — talk to self
+                if text:
+                    text = text.strip().strip('"')
                     self._speak(text)
                     self._log_action("AFK mischief: solo remark")
 
-            else:
-                # Do a trick animation
-                if self._on_state_change:
-                    self._on_state_change("TRICK")
-                self._log_action("AFK mischief: doing a trick")
+            # Execute any desktop_commands regardless of choice
+            # (LLM might include BROWSE in choice C, SCROLL in choice A, etc.)
+            if choice not in ("B", "E"):
+                desktop_cmds = data.get("desktop_commands", [])
+                if desktop_cmds and self._desktop:
+                    try:
+                        from core.agent_loop import AgentDecision
+                        _st = self._monitor.get_state() if self._monitor else None
+                        if _st:
+                            decision = AgentDecision(desktop_commands=desktop_cmds)
+                            self._execute_decision(decision, _st)
+                    except Exception as exc:
+                        logger.debug("AFK extra desktop command failed: %s", exc)
 
         except Exception as exc:
             logger.warning("AFK mischief failed: %s", exc)
 
         # Space out activities: 4-10 minutes between each
         self._next_afk_mischief = now + random.uniform(240.0, 600.0)
+
+    def _schedule_afk_follow_up(self, delay_s: float = 10.0) -> None:
+        """Schedule a follow-up reaction after an AFK activity.
+
+        The pony takes a screenshot, looks at what's on screen, and reacts —
+        scrolls more, comments, clicks something interesting.
+        """
+        if not self._screen or not self._desktop:
+            return
+
+        import threading
+        def _follow_up():
+            time.sleep(delay_s)
+            # Don't follow up if user returned
+            if self._conversation_active:
+                return
+            idle_ms = self._get_idle_ms()
+            if idle_ms is not None and idle_ms < 30_000:
+                return  # user is back
+
+            try:
+                # Focus browser, center mouse, screenshot
+                self._desktop.focus_browser()
+                time.sleep(0.3)
+                self._desktop.move_mouse_to_center()
+                time.sleep(0.3)
+
+                # Vision reaction — describe what's on screen and react
+                if self._vision_llm and hasattr(self._vision_llm, 'describe_image'):
+                    jpeg = self._screen.grab(quality=80)
+                    if jpeg:
+                        description = self._vision_llm.describe_image(jpeg)
+                        if description:
+                            name = get_character_name()
+                            prompt = (
+                                f"(You're {name}, alone on the desktop, looking at the screen. "
+                                f"You see: {description}\n"
+                                f"React briefly — a thought, giggle, or comment about what you see. "
+                                f"One short sentence, in character. Or say nothing if it's boring.)"
+                            )
+                            raw = self._llm.generate_once(prompt, max_tokens=80)
+                            if raw:
+                                cleaned = self._strip_think(raw).strip().strip('"')
+                                if cleaned and cleaned.lower() not in ("null", "none", "nothing"):
+                                    self._speak(cleaned)
+                                    self._log_action(f"AFK follow-up: reacted to screen")
+
+                # Scroll a bit more regardless
+                scroll_dir = random.choice([-3, -2, -1, -2, -3])
+                self._desktop._cmd_scroll([str(scroll_dir)])
+                time.sleep(random.uniform(1.0, 2.0))
+                if random.random() < 0.5:
+                    self._desktop._cmd_scroll([str(random.randint(-3, -1))])
+
+                # Sometimes click something interesting via vision
+                if (random.random() < 0.3 and self._vision_llm
+                        and hasattr(self._vision_llm, 'locate_on_screen')):
+                    jpeg = self._screen.grab(quality=95)
+                    if jpeg:
+                        coords = self._vision_llm.locate_on_screen(
+                            "an interesting link, video thumbnail, or clickable item",
+                            jpeg, self._screen.last_original_size,
+                        )
+                        if coords:
+                            self._desktop._cmd_click([str(coords[0]), str(coords[1])])
+                            self._log_action(f"AFK follow-up: clicked something at {coords}")
+
+            except Exception as exc:
+                logger.debug("AFK follow-up failed: %s", exc)
+        threading.Thread(target=_follow_up, daemon=True).start()
+
+    def _show_me_something(self, url: str, comment: str) -> None:
+        """Open a URL and drag the browser window toward the pony's mouth.
+
+        The pony walks backward slowly while dragging the window — like a horse
+        pulling something in its mouth.  Requires the window to not be fullscreen.
+
+        Called from AFK mischief or conversation when the pony wants to show the
+        user something (e.g. "hey can I show you something? look at this F-22!").
+        """
+        if not self._desktop or not self._get_mouth_position:
+            # Fallback: just open the URL normally
+            import webbrowser
+            webbrowser.open(url)
+            if comment:
+                self._speak(comment)
+            return
+
+        import webbrowser
+        import win32gui
+        import win32con
+
+        # Speak the comment first
+        if comment:
+            self._speak(comment)
+
+        # Open the URL
+        webbrowser.open(url)
+        self._pony_opened_urls.append(url)
+        time.sleep(3)  # wait for browser to load
+
+        # Focus and un-maximize the browser window so we can drag it
+        self._desktop.focus_browser()
+        time.sleep(0.3)
+
+        try:
+            fg_hwnd = win32gui.GetForegroundWindow()
+            if not fg_hwnd:
+                return
+
+            # If maximized, restore to windowed mode (can't drag maximized)
+            placement = win32gui.GetWindowPlacement(fg_hwnd)
+            if placement[1] == win32con.SW_SHOWMAXIMIZED:
+                win32gui.ShowWindow(fg_hwnd, win32con.SW_RESTORE)
+                time.sleep(0.3)
+
+            # Get the window's current position
+            rect = win32gui.GetWindowRect(fg_hwnd)
+            win_x, win_y, win_right, win_bottom = rect
+            win_w = win_right - win_x
+            win_h = win_bottom - win_y
+
+            # Resize the window to about half the screen width (so it's draggable)
+            mon = self._desktop._get_monitor_rect()
+            target_w = min(win_w, mon.width // 2)
+            target_h = min(win_h, mon.height * 3 // 4)
+            win32gui.MoveWindow(fg_hwnd, win_x, win_y, target_w, target_h, True)
+            time.sleep(0.2)
+
+            # Get the tab bar position (top of window, ~15px down for the tab bar)
+            tab_x = win_x + target_w // 2
+            tab_y = win_y + 15
+
+            # Get the pony's mouth position — that's where we're dragging TO
+            mouth_x, mouth_y = self._get_mouth_position()
+
+            # Calculate where to drag the window: near the pony's mouth
+            # We want the window's center-top to end up at the mouth
+            dest_x = mouth_x
+            dest_y = mouth_y - 30  # slightly above mouth so it looks like biting
+
+            # Start the drag walk animation (pony walks backward)
+            if self._on_drag_walk_start:
+                self._on_drag_walk_start()
+            time.sleep(0.2)
+
+            # Drag the window title bar toward the pony
+            # Use incremental moves so the pony walks while we drag
+            import pyautogui
+            pyautogui.moveTo(tab_x, tab_y, duration=0.3)
+            time.sleep(0.1)
+            pyautogui.mouseDown()
+            time.sleep(0.05)
+
+            # Smooth drag in steps, reading mouth position each step
+            steps = 30
+            for i in range(steps):
+                progress = (i + 1) / steps
+                # Re-read mouth position since pony is walking
+                try:
+                    mx, my = self._get_mouth_position()
+                    dest_x = mx
+                    dest_y = my - 30
+                except Exception:
+                    pass
+                # Interpolate from start to current destination
+                cur_x = tab_x + (dest_x - tab_x) * progress
+                cur_y = tab_y + (dest_y - tab_y) * progress
+                pyautogui.moveTo(int(cur_x), int(cur_y), duration=0.05)
+                time.sleep(0.05)
+
+            pyautogui.mouseUp()
+
+            # Stop the drag walk
+            if self._on_drag_walk_stop:
+                self._on_drag_walk_stop()
+
+            self._log_action(f"Dragged tab to pony: {url}")
+
+        except Exception as exc:
+            logger.warning("Tab drag failed: %s", exc)
+            if self._on_drag_walk_stop:
+                self._on_drag_walk_stop()
+            # Release mouse if stuck
+            try:
+                import pyautogui
+                pyautogui.mouseUp()
+            except Exception:
+                pass
 
     def _reset_afk_mischief(self, away_seconds: Optional[float] = None) -> None:
         """Reset AFK mischief state when user returns.
@@ -2737,7 +3395,7 @@ class AgentLoop:
 
             # Check if we opened any tabs while user was gone
             pony_opened_note = ""
-            pony_opened_queries: List[str] = []
+            pony_opened_descriptions: List[str] = []
             if self._pony_opened_urls:
                 import urllib.parse as _up
                 for url in self._pony_opened_urls:
@@ -2745,17 +3403,24 @@ class AgentLoop:
                         try:
                             qs = _up.parse_qs(_up.urlparse(url).query)
                             q = qs.get("search_query", ["something"])[0]
-                            pony_opened_queries.append(q)
+                            pony_opened_descriptions.append(f"YouTube search: '{q}'")
                         except Exception:
-                            pony_opened_queries.append("something on YouTube")
-                    elif "watch?v=" in url:
-                        pony_opened_queries.append("a YouTube video")
-                if pony_opened_queries:
-                    topics = ", ".join(f"'{q}'" for q in pony_opened_queries)
+                            pony_opened_descriptions.append("something on YouTube")
+                    elif "youtube" in url:
+                        pony_opened_descriptions.append("a YouTube video")
+                    else:
+                        # Non-YouTube sites — describe by domain
+                        try:
+                            domain = _up.urlparse(url).netloc or url
+                            pony_opened_descriptions.append(domain)
+                        except Exception:
+                            pony_opened_descriptions.append(url)
+                if pony_opened_descriptions:
+                    topics = ", ".join(pony_opened_descriptions)
                     pony_opened_note = (
                         f" IMPORTANT CONTEXT: While the user was gone, YOU (the pony) opened "
-                        f"{len(pony_opened_queries)} YouTube tab(s): {topics}. "
-                        f"Don't pretend the user was watching these — YOU opened them. "
+                        f"{len(pony_opened_descriptions)} tab(s)/site(s): {topics}. "
+                        f"Don't pretend the user was browsing these — YOU opened them. "
                         f"You can casually own up to it (act a little guilty or mischievous)."
                     )
 
@@ -2781,28 +3446,59 @@ class AgentLoop:
                 convo = self._timeline.get_recent_conversation_summary(3)
                 if convo != "(no recent conversation)":
                     context_parts.append(f"Recent conversation:\n{convo}")
+
+            # Peek at browser history for fun welcome-back context
+            _history_note = ""
+            try:
+                from core.browser_history import get_recent_history, format_history_for_llm
+                _hist = get_recent_history(hours=24, limit=8)
+                if _hist:
+                    hist_text = format_history_for_llm(_hist, max_entries=5)
+                    _history_note = (
+                        f" You also peeked at their browser history while they were gone:\n"
+                        f"{hist_text}\n"
+                        f"You can tease them about it, or keep it to yourself."
+                    )
+            except Exception:
+                pass
+
             context = " ".join(context_parts)
 
+            # Build the welcome-back prompt — natural speech, not JSON
+            close_tab_hint = ""
+            if pony_opened_descriptions:
+                close_tab_hint = (
+                    " You can close tabs you opened with [DESKTOP:CLOSE_TAB]."
+                    " Or leave them open to show the user."
+                )
+
             prompt = (
-                f"(The user just came back after being away for {dur}.{current_app} "
-                f"{pony_opened_note} "
-                f"{context} "
-                f"Welcome them back in ONE short sentence as {name}. "
-                f"If you know WHY they left, reference it naturally. "
-                f"Be casual — don't robotically state the exact duration.)"
+                f"(The user just came back after being away for {dur}.{current_app}"
+                f"{pony_opened_note}{_history_note} {context}\n"
+                f"Welcome them back naturally as {name}. "
+                f"If you know WHY they left, reference it. "
+                f"Be casual — don't robotically state the exact duration. "
+                f"Don't be fake or over-enthusiastic. Just react like a real friend "
+                f"who noticed they were gone.{close_tab_hint}\n"
+                f"You can include action tags: [ACTION:WAVE], [MOVETO:center], "
+                f"[DESKTOP:BROWSE:url], [DESKTOP:MESS_MOUSE], etc. "
+                f"Include [CONVO:CONTINUE] so they can respond.)"
             )
-            raw = self._llm.generate_once(prompt)
+            raw = self._llm.chat(prompt)
             if raw:
                 from llm.response_parser import parse_response
                 parsed = parse_response(raw)
-                text = parsed.text or raw
-                self._speak(text)
-                self._llm.inject_history(
-                    f"(User returned after being away for {dur}.)",
-                    text,
-                )
-                self._log_action(f"Welcome back after {dur}")
-                self._listen_for_reply()
+                text = parsed.text
+
+                if text:
+                    self._speak(text)
+                    self._log_action(f"Welcome back after {dur}")
+
+                # Execute any parsed actions/commands from the response
+                self._execute_parsed_actions(parsed)
+
+                if text:
+                    self._listen_for_reply()
         except Exception as exc:
             logger.warning("Welcome-back greeting failed: %s", exc)
         finally:
@@ -2844,13 +3540,20 @@ class AgentLoop:
                         screen_extra = f" You can see on screen: {desc}."
                 trigger = (
                     f"(You glanced at the user's screen. They have \"{fg}\" ({exe}{fullscreen}) open.{screen_extra} "
-                    f"React in ONE short sentence as {get_character_name()}. Be natural — sometimes "
+                    f"React as {get_character_name()}. Be natural — sometimes "
                     "comment on it, sometimes ignore it and say something random. "
                     f"NEVER say 'that's actually kinda cool/based/neat' — use different words. "
-                    f"NEVER comment on how many windows are open — that's meaningless.{avoid_topics})"
+                    f"NEVER comment on how many windows are open — that's meaningless.\n"
+                    f"You can also DO things — include tags like [ACTION:WAVE], [ACTION:SIT], "
+                    f"[DESKTOP:BROWSE:url], [DESKTOP:PAUSE_MEDIA], [MOVETO:region] in your response. "
+                    f"Keep speech to ONE sentence. Actions are optional.{avoid_topics})"
                 )
             else:
-                trigger = f"(Spontaneous thought — {prompt_choice}{avoid_topics})"
+                trigger = (
+                    f"(Spontaneous thought — {prompt_choice} "
+                    f"You can also include action tags like [ACTION:WAVE], [MOVETO:top_right], "
+                    f"[DESKTOP:BROWSE:url] if you want to DO something.{avoid_topics})"
+                )
 
             print(f"[Agent] Prompt: {trigger[:100]}...", flush=True)
             raw = self._llm.chat(trigger)
@@ -2862,6 +3565,11 @@ class AgentLoop:
                     self._speak(parsed.text)
                     self._log_action(f"Spontaneous: \"{parsed.text[:60]}\"")
 
+                # Execute any actions/commands the LLM included (walk, wave,
+                # desktop commands, moveto, etc.) — previously discarded
+                self._execute_parsed_actions(parsed)
+
+                if parsed.text:
                     # Listen for user response — let them reply naturally
                     self._listen_for_reply()
                 else:
@@ -2916,6 +3624,15 @@ class AgentLoop:
                     recent_context += f"\nRECENT CONVERSATION (don't repeat these topics):\n{convo}\n"
                 recent_context += f"\nUSER ACTIVITY: {self._timeline.activity_state.value}\n"
 
+            # Directive awareness — the pony should know about active tasks
+            directive_context = ""
+            if self.directives:
+                _goals = "; ".join(
+                    f'"{d.goal}" (urgency {d.urgency}, nagged {d.nag_count}x)'
+                    for d in self.directives
+                )
+                directive_context = f"\nACTIVE TASKS the user should be doing: {_goals}\n"
+
             name = get_character_name()
             prompt = (
                 f"You are {name}, observing your user's desktop. Stay in character.\n"
@@ -2925,6 +3642,7 @@ class AgentLoop:
                 f"Open windows: {windows}"
                 f"{screen_context}"
                 f"{apps_context}"
+                f"{directive_context}"
                 f"{recent_context}\n"
                 f"\n"
                 f"OBSERVATION RULES:\n"
@@ -2956,12 +3674,20 @@ class AgentLoop:
                 f"NEVER comment on the number of open windows. \"you have so many windows open\" is meaningless and banned.\n"
                 f"\n"
                 f"Respond with JSON: {{\"speak\": \"text or null\", \"desktop_commands\": []}}\n"
-                f"desktop_commands options (use sparingly):\n"
-                f"  {{\"command\":\"MESS_MOUSE\",\"args\":[]}} — grab cursor and run with it\n"
-                f"  {{\"command\":\"LAUNCH_APP\",\"args\":[\"app name\"]}} — launch an installed app\n"
-                f"  {{\"command\":\"LOOK_AND_CLICK\",\"args\":[\"what to click\"]}} — vision-click something on screen\n"
-                f"  {{\"command\":\"PAUSE_MEDIA\",\"args\":[]}} — toggle play/pause\n"
-                f"Most of the time, just use speak and leave desktop_commands empty."
+                f"desktop_commands options (use sparingly — most observations need 0 commands):\n"
+                f"  {{\"command\":\"MESS_MOUSE\",\"args\":[]}} — grab cursor in your mouth and run with it\n"
+                f"  {{\"command\":\"LAUNCH_APP\",\"args\":[\"app name\"]}} — launch an installed app or game\n"
+                f"  {{\"command\":\"LOOK_AND_CLICK\",\"args\":[\"what to click\"]}} — use vision to find+click something\n"
+                f"  {{\"command\":\"PAUSE_MEDIA\",\"args\":[]}} — toggle play/pause on music/video\n"
+                f"  {{\"command\":\"BROWSE\",\"args\":[\"url\"]}} — open a URL in the browser\n"
+                f"  {{\"command\":\"SHOW_TAB\",\"args\":[\"url\",\"hey look at this!\"]}} — open a URL and drag the window to your mouth to show the user\n"
+                f"  {{\"command\":\"SWITCH\",\"args\":[\"window title\"]}} — bring a window to the front\n"
+                f"  {{\"command\":\"CLOSE_TAB\",\"args\":[]}} — close the current browser tab\n"
+                f"  {{\"command\":\"CLOSE_TITLE\",\"args\":[\"title substring\"]}} — close a window by title\n"
+                f"  {{\"command\":\"SHAKE_TITLE\",\"args\":[\"title substring\"]}} — playfully shake a window\n"
+                f"  {{\"command\":\"HOTKEY\",\"args\":[\"key1\",\"key2\"]}} — press keyboard shortcut\n"
+                f"  {{\"command\":\"SCROLL\",\"args\":[\"amount\"]}} — scroll up (positive) or down (negative)\n"
+                f"Most of the time, just speak or stay quiet. Actions are for when you have a REASON."
             )
 
             raw = self._llm.generate_once(prompt, max_tokens=512)
@@ -3135,15 +3861,70 @@ class AgentLoop:
 
             logger.info("User replied to spontaneous speech: %r", user_text)
 
+            # Audio context — annotate if this is the user or ambient audio
+            if self._transcriber:
+                _spk_conf = getattr(self._transcriber, "last_speaker_confidence", 1.0)
+                _has_model = (
+                    hasattr(self._transcriber, "speaker_verifier")
+                    and self._transcriber.speaker_verifier is not None
+                    and self._transcriber.speaker_verifier.enrolled
+                )
+                if _has_model and _spk_conf < 0.6:
+                    user_text = (
+                        f"[Audio context: Speaker confidence {_spk_conf:.0%} — "
+                        f"likely NOT the user. This may be from speakers, TV, "
+                        f"video, or someone else nearby.]\n{user_text}"
+                    )
+                elif _has_model and _spk_conf < 0.85:
+                    user_text = (
+                        f"[Audio context: Speaker uncertain ({_spk_conf:.0%}). "
+                        f"Might be the user or ambient audio.]\n{user_text}"
+                    )
+
             # Conversational loop — keep going until CONVO:END or silence
             max_echo_streak = 0  # consecutive echoes → bail out of loop
             from llm.response_parser import parse_response
+
+            # Build screen + directive + memory context ONCE for this reply loop
+            _reply_context = ""
+            try:
+                state = self._monitor.get_state()
+                if state and state.foreground:
+                    _fg = state.foreground
+                    _reply_context += (
+                        f"\n[Screen: User has \"{_fg.title}\" ({_fg.exe_name}) open"
+                    )
+                    if state.foreground_duration_s:
+                        _reply_context += f" for {self._fmt_duration(state.foreground_duration_s)}"
+                    _reply_context += ".]"
+            except Exception:
+                pass
+            if self.directives:
+                _goals = "; ".join(f'"{d.goal}" (urg {d.urgency})' for d in self.directives)
+                _reply_context += f"\n[Active tasks: {_goals}]"
+            # Inject recent timeline so the pony remembers older events
+            if self._timeline:
+                _recent = self._timeline.get_recent_conversation_summary(5)
+                if _recent and _recent != "(no recent conversation)":
+                    _reply_context += f"\n[Recent memory: {_recent}]"
+                _events = self._timeline.format_recent_for_prompt(8)
+                if _events:
+                    _reply_context += f"\n[Recent events: {_events}]"
+
             while user_text and user_text.strip():
-                # Add context so the LLM stays in character (matches pipeline._run_turn)
-                enriched = user_text
+                # Add context so the LLM stays in character + knows the environment
+                enriched = user_text + _reply_context
                 enriched += (
                     f"\n\n[System hint: You are {get_character_name()}. Stay in character. "
                     "Reply naturally as yourself — do NOT break character or meta-analyze. "
+                    "You can include action tags like [ACTION:WAVE], [DESKTOP:BROWSE:url], "
+                    "[MOVETO:region] to DO things while talking. "
+                    "If the user asks to delay/postpone a task, include [DELAY:minutes] "
+                    "(e.g. [DELAY:15]). If they say they finished a task, include [DONE]. "
+                    "For recurring reminders use [ROUTINE:daily:goal:urgency:HH:MM] or "
+                    "[ROUTINE:weekly:goal:urgency:day:HH:MM]. "
+                    "Exclude days with !day: [ROUTINE:daily:goal:5:16:00:!saturday]. "
+                    "For one-time alarms use [TIMER:HH:MM:goal]. "
                     "Include [CONVO:CONTINUE] if you expect a reply or [CONVO:END] if done.]"
                 )
                 raw = self._llm.chat(enriched)
@@ -3171,9 +3952,16 @@ class AgentLoop:
                 if parsed.text:
                     if self._on_state_change:
                         self._on_state_change("SPEAK")
+                    _reply_bubble_shown = False
                     def _show_bubble(t=parsed.text):
+                        nonlocal _reply_bubble_shown
+                        if _reply_bubble_shown:
+                            return
+                        _reply_bubble_shown = True
                         if self._on_speech_text:
                             self._on_speech_text(t)
+                    # Show bubble immediately — don't wait for TTS callback
+                    _show_bubble()
                     tts_on = self._tts_config.enabled if self._tts_config else True
                     if tts_on:
                         if self._tts_queue:
@@ -3183,16 +3971,72 @@ class AgentLoop:
                                 priority=PRIORITY_AUTONOMOUS,
                                 voice_slug=self._primary_voice_slug,
                                 on_start=_show_bubble,
-                                blocking=True,  # BLOCK until TTS finishes before listening again
+                                blocking=True,
                             )
                         else:
                             self._tts.speak(parsed.text, on_playback_start=_show_bubble)
-                    else:
-                        _show_bubble()
                     # Track for echo detection
                     self._recently_spoken.append(parsed.text)
                     if len(self._recently_spoken) > 5:
                         self._recently_spoken.pop(0)
+
+                # Execute any actions/commands from the reply (walk, wave,
+                # desktop commands, moveto, etc.) — previously discarded
+                self._execute_parsed_actions(parsed)
+
+                # Process directive-related tags that were previously silently
+                # discarded — delay, done, enforce, directive creation
+                if parsed.delay_minutes and self.directives:
+                    ok = self.delay_directive(parsed.delay_minutes, parsed.delay_keyword)
+                    if ok:
+                        logger.info("Delay processed from reply: %d min (kw=%r)",
+                                    parsed.delay_minutes, parsed.delay_keyword)
+                if parsed.done_directive is not None and self.directives:
+                    kw = (parsed.done_directive or "").lower()
+                    for i, d in enumerate(self.directives):
+                        if kw and kw in d.goal.lower():
+                            removed = self.directives.pop(i)
+                            logger.info("Directive completed from reply: %r", removed.goal)
+                            self.save_directives()
+                            break
+                    else:
+                        if self.directives:
+                            removed = self.directives.pop(
+                                max(range(len(self.directives)),
+                                    key=lambda j: self.directives[j].urgency))
+                            logger.info("Directive completed from reply (no kw): %r", removed.goal)
+                            self.save_directives()
+                if parsed.enforce_minutes and self.directives:
+                    enforce_s = max(60.0, min(3600.0, parsed.enforce_minutes * 60.0))
+                    self.start_enforcement(enforce_s)
+                    logger.info("Enforcement started from reply: %d min", parsed.enforce_minutes)
+                if parsed.directive:
+                    self.add_directive(
+                        goal=parsed.directive.goal,
+                        urgency=parsed.directive.urgency,
+                        source="user",
+                        delay_minutes=parsed.directive.delay_minutes,
+                        trigger_date=parsed.directive.trigger_date,
+                    )
+                    logger.info("Directive created from reply: %r", parsed.directive.goal)
+                # Recurring routines — previously silently dropped
+                if parsed.routines and self.routine_manager:
+                    from core.routines import collapse_routine_tags
+                    collapsed = collapse_routine_tags(parsed.routines)
+                    for routine in collapsed:
+                        added = self.routine_manager.add_if_unique(routine)
+                        logger.info("Routine %s from reply: %s (%s)",
+                                    "created" if added else "merged",
+                                    routine.goal, routine.schedule)
+                # Timers — previously silently dropped
+                if parsed.timer:
+                    self.add_timer(parsed.timer.time_str, parsed.timer.action)
+                    logger.info("Timer created from reply: %s at %s",
+                                parsed.timer.action, parsed.timer.time_str)
+                # Standing rules — previously silently dropped
+                if parsed.standing_rule:
+                    self.add_standing_rule(description=parsed.standing_rule)
+                    logger.info("Standing rule created from reply: %s", parsed.standing_rule)
 
                 # Check for conversation end signal
                 if parsed.end_conversation:
@@ -3259,8 +4103,60 @@ class AgentLoop:
                     return True
         return False
 
+    def _execute_parsed_actions(self, parsed) -> None:
+        """Execute robot actions and desktop commands from a ParsedResponse.
+
+        This is the shared action executor for ALL codepaths — observation,
+        spontaneous speech, reply handling, etc.  Any time the LLM returns
+        a ParsedResponse with actions or desktop_commands, call this to
+        actually execute them instead of silently discarding them.
+        """
+        # Robot actions (walk, wave, sit, etc.)
+        if parsed.actions and self._robot:
+            from robot.actions import RobotAction
+            for action in parsed.actions:
+                try:
+                    if self._desktop:
+                        self._desktop.execute_action(action)
+                    self._robot.execute(action)
+                    self._log_action(f"Action: {action.name}")
+                except Exception as exc:
+                    logger.debug("Parsed action %s failed: %s", action, exc)
+
+        # Desktop commands ([DESKTOP:...] tags)
+        if parsed.desktop_commands and self._desktop:
+            for dc in parsed.desktop_commands:
+                try:
+                    self._desktop.execute_command(dc)
+                    self._log_action(f"Desktop: {dc.command}:{':'.join(str(a) for a in dc.args)}")
+                except Exception as exc:
+                    logger.debug("Parsed desktop command %s failed: %s", dc.command, exc)
+
+        # Move to screen region
+        if parsed.moveto_region and self._robot:
+            try:
+                self._robot.on_move_to(parsed.moveto_region)
+                self._log_action(f"MoveTo: {parsed.moveto_region}")
+            except Exception as exc:
+                logger.debug("MoveTo %s failed: %s", parsed.moveto_region, exc)
+
+        # Persist animation
+        if parsed.persist_seconds and self._robot:
+            try:
+                from desktop_pet.pet_controller import _ACTION_ANIMATION_MAP
+                anim = "stand"
+                if parsed.actions:
+                    anim = _ACTION_ANIMATION_MAP.get(parsed.actions[0], "stand")
+                self._robot.on_timed_override(anim, parsed.persist_seconds)
+            except Exception as exc:
+                logger.debug("Persist failed: %s", exc)
+
     def _speak(self, text: str) -> None:
-        """Speak text via TTS with detector pause/resume and GUI callbacks."""
+        """Speak text via TTS with detector pause/resume and GUI callbacks.
+
+        Blocks until TTS playback finishes so the caller can safely open the
+        mic afterward without racing the audio output.
+        """
         # Strip any bracket tags the LLM leaked (e.g. [CONVO:CONTINUE])
         text = self._TAG_STRIP_RE.sub("", text).strip()
         if not text:
@@ -3272,9 +4168,19 @@ class AgentLoop:
         try:
             if self._on_state_change:
                 self._on_state_change("SPEAK")
+            _bubble_shown = False
             def _show_bubble():
+                nonlocal _bubble_shown
+                if _bubble_shown:
+                    return
+                _bubble_shown = True
                 if self._on_speech_text:
                     self._on_speech_text(text)
+            # Show bubble IMMEDIATELY — don't wait for TTS callback chain.
+            # The on_start callback from TTS is a backup (dedup flag prevents
+            # double-show).  Without this, the bubble only appears after the
+            # TTS HTTP request completes, which can be seconds.
+            _show_bubble()
             tts_on = self._tts_config.enabled if self._tts_config else True
             if tts_on:
                 if self._tts_queue:
@@ -3284,6 +4190,7 @@ class AgentLoop:
                         priority=PRIORITY_AUTONOMOUS,
                         voice_slug=self._primary_voice_slug,
                         on_start=_show_bubble,
+                        blocking=True,
                     )
                 else:
                     # Direct TTS — pause detector during playback
@@ -3297,8 +4204,6 @@ class AgentLoop:
                                 self._detector.resume()
                             except Exception:
                                 pass
-            else:
-                _show_bubble()
             if self._timeline:
                 from core.event_timeline import EventType
                 self._timeline.append(EventType.AGENT_SPOKE, f'Pony said: "{text[:120]}"')

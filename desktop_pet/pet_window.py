@@ -77,6 +77,11 @@ class PetWindow(QWidget):
         # Cursor grab state
         self._grab_running = False
         self._grab_run_timer: Optional[QTimer] = None
+        # Tab drag walk state
+        self._drag_walking = False
+
+        # Pony manager reference for collision avoidance (set externally)
+        self._pony_manager_ref = None
 
         # Setup window
         self._setup_window()
@@ -144,7 +149,8 @@ class PetWindow(QWidget):
 
         # Draw effects behind sprite
         effects = self.effect_renderer.tick(
-            self.x(), self.y(), pixmap.width(), pixmap.height()
+            self.x(), self.y(), pixmap.width(), pixmap.height(),
+            facing_right=self._facing_right,
         )
         for eff_pixmap, ex, ey in effects:
             # Convert effect screen coords to widget-local coords
@@ -263,6 +269,13 @@ class PetWindow(QWidget):
                 self._start_behavior(linked)
                 return
 
+        # ~20% chance to pause briefly between behaviors (less predictable)
+        if random.random() < 0.20:
+            self._dx, self._dy = 0, 0
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(random.randint(1500, 4000), self._pick_and_start_behavior)
+            return
+
         self._pick_and_start_behavior()
 
     def _pick_and_start_behavior(self) -> None:
@@ -309,7 +322,9 @@ class PetWindow(QWidget):
             return r
 
         if movement == MovementType.HORIZONTAL_ONLY:
-            return _snap(speed * h_sign), 0
+            # Slight vertical drift so ponies don't cluster on same y-axis
+            v_drift = random.choice([-0.15, 0, 0, 0, 0.15]) * speed
+            return _snap(speed * h_sign), _snap(v_drift)
         elif movement == MovementType.VERTICAL_ONLY:
             return 0, _snap(speed * v_sign)
         elif movement == MovementType.DIAGONAL_VERTICAL:
@@ -322,9 +337,39 @@ class PetWindow(QWidget):
             return 0, 0
 
     def _move_tick(self) -> None:
-        """Apply dx/dy movement and bounce off screen edges."""
+        """Apply dx/dy movement, bounce off screen edges, avoid other ponies."""
         if self._dx == 0 and self._dy == 0:
             return
+
+        # ~1% chance per tick to perturb vertical direction (less predictable paths)
+        # Only touch dy — changing dx sign without updating facing makes pony walk backwards
+        if random.random() < 0.01 and self._dy != 0:
+            self._dy += random.choice([-1, 1])
+            self._dy = max(-4, min(4, self._dy))
+
+        # Pony-pony collision avoidance
+        if self._pony_manager_ref:
+            try:
+                my_cx = self.x() + self.width() // 2
+                my_cy = self.y() + self.height() // 2
+                for ox, oy in self._pony_manager_ref.get_other_pony_positions(self):
+                    dist_x = my_cx - ox
+                    dist_y = my_cy - oy
+                    dist_sq = dist_x * dist_x + dist_y * dist_y
+                    if dist_sq < 22500:  # within ~150px
+                        # Push away from other pony
+                        if dist_x != 0:
+                            self._dx = abs(self._dx) if dist_x > 0 else -abs(self._dx)
+                        if dist_y != 0:
+                            self._dy = abs(self._dy) if dist_y > 0 else -abs(self._dy)
+                        if dist_x > 0:
+                            self._facing_right = True
+                        elif dist_x < 0:
+                            self._facing_right = False
+                        self._update_facing()
+                        break
+            except Exception:
+                pass
 
         new_x = self.x() + self._dx
         new_y = self.y() + self._dy
@@ -625,6 +670,47 @@ class PetWindow(QWidget):
         if self._grab_run_timer:
             self._grab_run_timer.stop()
             self._grab_run_timer = None
+        self._roaming = True
+        self._pick_and_start_behavior()
+
+    def start_drag_walk(self) -> None:
+        """Start a slow backward walk — pony is 'dragging' something at its mouth.
+
+        The pony walks backward (opposite of facing direction) at a slow pace,
+        using a walk/trot animation.  Used for tab-drag behavior.
+        """
+        self._drag_walking = True
+        self._roaming = True
+        self._override_anim_name = None
+        self._timed_override_until = 0.0
+        self._timed_anim_name = None
+        # Find a walking behavior
+        walk_behavior = None
+        for name in ("walk", "trot", "walk_wings"):
+            if name in self.behavior_manager.behaviors:
+                walk_behavior = self.behavior_manager.behaviors[name]
+                break
+        if walk_behavior:
+            self._current_behavior = walk_behavior
+            self._behavior_start_time = time.monotonic()
+            self._behavior_duration = 999.0
+            self._current_anim, _ = self._load_behavior_anim(walk_behavior)
+            self._frame_index = 0
+            self._last_frame_time = time.monotonic()
+            if self._current_anim and self._current_anim.frames:
+                px = self._current_anim.frames[0]
+                self.setFixedSize(px.width(), px.height())
+        else:
+            self._pick_and_start_behavior()
+            self._behavior_duration = 999.0
+        # Walk BACKWARD (opposite of facing) — slow, like dragging something
+        speed = 2
+        self._dx = -speed if self._facing_right else speed
+        self._dy = 0
+
+    def stop_drag_walk(self) -> None:
+        """Stop the drag walk and return to normal roaming."""
+        self._drag_walking = False
         self._roaming = True
         self._pick_and_start_behavior()
 

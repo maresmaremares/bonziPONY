@@ -24,16 +24,15 @@ _TAG_RE = re.compile(
     re.IGNORECASE,
 )
 
-# ── Conversation topics for variety ─────────────────────────────────────
-# The initiator picks a random topic SEED so conversations don't all start
-# with "hey what are you working on?"  Topics are character-agnostic nudges.
+# ── Conversation topic seeds for variety ─────────────────────────────────
+# The initiator picks a random topic SEED so conversations don't converge
+# on the same boring topics every time.
 _TOPIC_SEEDS = [
     "something funny that happened recently or a joke you want to tell",
     "a random opinion or hot take about something you feel strongly about",
     "a question for one of your friends here — something you've been curious about",
     "a memory or story from Equestria — something nostalgic",
     "something annoying or frustrating that's been on your mind",
-    "a random fun fact or piece of trivia you think is interesting",
     "a compliment or roast of one of the other ponies present",
     "what you'd be doing RIGHT NOW if you could do anything",
     "something about the user — an observation, question, or thought about them",
@@ -42,51 +41,61 @@ _TOPIC_SEEDS = [
     "your honest review of something — a food, a show, an activity",
     "a challenge or dare for one of the other ponies",
     "something weird or random that just popped into your head",
-    "a 'would you rather' or hypothetical question for the group",
     "complain about something — vent a little, you're among friends",
 ]
 
 _TURN_PROMPT_TEMPLATE = (
-    "(Group chat on the desktop. {screen_info}\n"
-    "Here's what just happened:\n"
+    "(You are {name}. {personality_hint}\n"
+    "Group chat on the desktop with your friends. {screen_info}\n"
+    "Original topic: {original_topic}\n\n"
+    "Conversation so far:\n"
     "{log_block}\n\n"
-    "It's your turn. You can respond naturally, or say [PASS] if you have nothing to add.\n"
+    "It's YOUR turn to speak as {name}. Respond in YOUR voice, not anyone else's. "
+    "You can respond naturally, or say [PASS] if you have nothing to add.\n"
     "Keep it short — 1-2 sentences, like real banter between friends.\n"
-    "RULES:\n"
-    "- Do NOT make up things you can't see. The screen info above is ALL you know about "
-    "the user's screen. If it's not listed there, you DON'T know about it.\n"
-    "- Do NOT repeat what another pony already said. If someone already made an observation, "
-    "don't say the same thing differently.\n"
-    "- Do NOT parrot system errors, connection messages, or technical info from window titles. "
-    "You are NOT tech support.\n"
-    "- ADVANCE the conversation — react to what was said, add a NEW thought, or disagree. "
-    "Don't just agree and restate.\n"
-    "- Be yourself — not a caricature. Don't lean into your most stereotypical trait every time.\n"
+    "CRITICAL RULES:\n"
+    "- Address other ponies BY NAME. Respond to THEIR specific points, not just the topic.\n"
+    "- FORBIDDEN OPENERS: Do NOT start with 'oh I remember', 'oh that reminds me', "
+    "'I know right', 'oh yeah', 'that's so true', or any variant. These are BANNED.\n"
+    "- NEVER start with the same words as a previous speaker.\n"
+    "- ZERO REPETITION: Read the conversation above carefully. If someone already made "
+    "a point, you are NOT allowed to say the same thing in different words. Period.\n"
+    "- ADVANCE OR PASS: Either add a genuinely NEW thought, disagree, ask a question, "
+    "crack a joke, tease someone, or say [PASS]. Agreeing + restating = [PASS].\n"
+    "- Stay on the original topic. Don't change the subject randomly.\n"
+    "- Do NOT make up things you can't see. The screen info above is ALL you know.\n"
+    "- Do NOT parrot technical info from window titles. You're a pony, not IT support.\n"
+    "- Be yourself — not a caricature. Don't lean into your most stereotypical trait.\n"
     "{recent_topics_warning}"
     "Do NOT include any tags like [CONVO:...] — just speak naturally.)"
 )
 
 _PIGGYBACK_PROMPT_TEMPLATE = (
-    "({speaker} just responded to the user.\n"
+    "(You are {name}. {speaker} just responded to the user.\n"
     "[User]: \"{user_text}\"\n"
     "[{speaker}]: \"{response_text}\"\n\n"
-    "You overheard this. If you want to jump in with a quick comment, go for it.\n"
+    "You overheard this. If you want to jump in as {name} with a quick comment, go for it.\n"
     "Otherwise say [PASS]. Keep it short — one sentence max.\n"
-    "Don't just agree — add something new, a different angle, or a joke.\n"
-    "Be yourself — not a walking stereotype.\n"
+    "RULES:\n"
+    "- Do NOT agree and restate what {speaker} said. That's just echoing.\n"
+    "- Do NOT start with 'oh I remember', 'oh yeah', 'I know right'. BANNED.\n"
+    "- Add something genuinely NEW — a different take, a joke, a disagreement, a question.\n"
+    "- If you don't have something NEW to add, say [PASS]. Prefer [PASS] over filler.\n"
+    "- Be yourself — not a walking stereotype.\n"
     "Do NOT include any tags like [CONVO:...] — just speak naturally.)"
 )
 
 _SPONTANEOUS_PROMPT_TEMPLATE = (
-    "(You're hanging out on the desktop with {companions}. "
+    "(You are {name}. You're hanging out on the desktop with {companions}. "
     "{screen_info}\n"
     "{recent_topics_warning}"
-    "Start a conversation — pick any topic you genuinely feel like talking about right now. "
-    "Be specific and in character. Think of something the REAL you would bring up.\n"
+    "Start a conversation about: {topic_seed}\n"
+    "Be specific and in character. Think of something the REAL {name} would bring up.\n"
     "EXPLICITLY BANNED openers:\n"
     "- 'would you rather...' — do NOT use this\n"
     "- 'what are you working on?' — boring, don't use it\n"
     "- Generic small talk like 'how are you?' or 'what's up?'\n"
+    "- 'oh I remember...' or 'that reminds me...' — boring and overused\n"
     "RULES:\n"
     "- ONLY reference things from the screen info above, your conversation history, "
     "or things the user has told you. Do NOT invent things you can't see.\n"
@@ -109,13 +118,14 @@ class GroupConversation:
     def __init__(
         self,
         manager: "PonyManager",
-        max_depth: int = 6,
+        max_depth: int = 8,
     ) -> None:
         self._manager = manager
         self._log: list[tuple[str, str]] = []  # (speaker_name, text)
         self._depth = 0
         self._max_depth = max_depth
         self._screen_info = ""  # shared screen context for ALL turns
+        self._original_topic = ""  # stored from opening line for topic reinforcement
         self.interrupted: bool = False  # set True from outside to stop mid-conversation
 
     @classmethod
@@ -139,6 +149,42 @@ class GroupConversation:
             f"find something NEW): {lines}\n"
         )
 
+    def start_with_topic(self, initiator: "PonyInstance", topic: str,
+                         screen_context: str = "") -> None:
+        """Start a conversation with a specific topic override (for presentation/chaos mode)."""
+        from core.tts_queue import PRIORITY_SPONTANEOUS_CHAT
+
+        companions = [p.display_name for p in self._manager.ponies if p is not initiator]
+        if not companions:
+            return
+
+        self._screen_info = screen_context or "No screen info available."
+
+        prompt = (
+            f"(You are {initiator.display_name}. You're on the desktop with {', '.join(companions)}. "
+            f"{self._screen_info}\n"
+            f"{topic}\n"
+            f"Speak naturally and in character. Keep it short — 1-2 sentences.\n"
+            f"Do NOT include any tags like [CONVO:...] — just speak naturally.)"
+        )
+
+        try:
+            opening = initiator.llm.generate_once(prompt, max_tokens=150)
+        except Exception as exc:
+            logger.error("Themed conversation start failed: %s", exc)
+            return
+
+        opening = self._clean_reply(opening)
+        if not opening:
+            return
+
+        self._record_topic(opening)
+        self._original_topic = opening[:80]
+        self._log.append((initiator.display_name, opening))
+        self._depth += 1
+        self._speak(initiator, opening, PRIORITY_SPONTANEOUS_CHAT)
+        self._offer_rounds(exclude=initiator)
+
     def start(self, initiator: "PonyInstance", trigger: str = "spontaneous",
               screen_context: str = "") -> None:
         """Kick off a conversation.  The initiator speaks first, then others
@@ -154,11 +200,14 @@ class GroupConversation:
         self._screen_info = screen_context or "No screen info available."
 
         recent_warning = self._get_recent_topics_warning()
+        topic_seed = random.choice(_TOPIC_SEEDS)
 
         prompt = _SPONTANEOUS_PROMPT_TEMPLATE.format(
+            name=initiator.display_name,
             companions=", ".join(companions),
             screen_info=self._screen_info,
             recent_topics_warning=recent_warning,
+            topic_seed=topic_seed,
         )
 
         try:
@@ -173,6 +222,7 @@ class GroupConversation:
 
         # Track this topic for future diversity
         self._record_topic(opening)
+        self._original_topic = opening[:80]
 
         self._log.append((initiator.display_name, opening))
         self._depth += 1
@@ -197,6 +247,7 @@ class GroupConversation:
             return
 
         prompt = _PIGGYBACK_PROMPT_TEMPLATE.format(
+            name=pony.display_name,
             speaker=original_speaker,
             user_text=user_text,
             response_text=response_text,
@@ -254,11 +305,36 @@ class GroupConversation:
 
     def _offer_turn(self, pony: "PonyInstance") -> Optional[str]:
         """Ask a pony if she wants to respond.  Returns her reply or None."""
-        log_block = "\n".join(f"[{name}]: \"{text}\"" for name, text in self._log[-6:])
+        # Show FULL conversation log so the pony sees everything said
+        log_block = "\n".join(f"[{name}]: \"{text}\"" for name, text in self._log)
 
         recent_warning = self._get_recent_topics_warning()
 
+        # Build a concise "already covered" summary to hammer anti-repetition
+        _others_said = [text for name, text in self._log if name != pony.display_name]
+        if _others_said:
+            # Extract opening words to ban as starters
+            openers = [s.split()[:3] for s in _others_said[-5:] if s.split()]
+            opener_strs = [" ".join(w) for w in openers if w]
+            recent_warning += (
+                "Points already made (do NOT repeat any of these): "
+                + "; ".join(s[:60] for s in _others_said[-5:])
+                + "\n"
+            )
+            if opener_strs:
+                recent_warning += (
+                    "BANNED opening words (others already started with these): "
+                    + ", ".join(f'"{o}"' for o in opener_strs)
+                    + "\n"
+                )
+
+        # Personality hint: extract core traits from preset
+        personality_hint = self._get_personality_hint(pony)
+
         prompt = _TURN_PROMPT_TEMPLATE.format(
+            name=pony.display_name,
+            personality_hint=personality_hint,
+            original_topic=self._original_topic or "(free chat)",
             log_block=log_block,
             screen_info=self._screen_info,
             recent_topics_warning=recent_warning,
@@ -294,6 +370,42 @@ class GroupConversation:
             on_start=_show_bubble,
             skip_tts=not getattr(pony, "has_voice", True),
         )
+
+    # Cache personality hints per slug so we only extract once
+    _personality_cache: dict[str, str] = {}
+
+    @classmethod
+    def _get_personality_hint(cls, pony: "PonyInstance") -> str:
+        """Extract a 2-3 sentence personality summary from the pony's preset."""
+        slug = pony.slug
+        if slug in cls._personality_cache:
+            return cls._personality_cache[slug]
+
+        hint = ""
+        try:
+            from pathlib import Path
+            preset_path = Path(__file__).parent.parent / "presets" / f"{slug}.txt"
+            if preset_path.exists():
+                text = preset_path.read_text(encoding="utf-8")
+                # Look for WHO YOU ARE section
+                for marker in ("== WHO YOU ARE ==", "== CORE IDENTITY ==", "== PERSONALITY =="):
+                    idx = text.find(marker)
+                    if idx >= 0:
+                        # Take next ~300 chars after the header
+                        block = text[idx + len(marker):idx + len(marker) + 400].strip()
+                        # Take first 2-3 sentences
+                        sentences = block.split(". ")[:3]
+                        hint = ". ".join(s.strip() for s in sentences if s.strip())
+                        if hint and not hint.endswith("."):
+                            hint += "."
+                        break
+            if not hint:
+                hint = f"You are {pony.display_name}. Stay in character."
+        except Exception:
+            hint = f"You are {pony.display_name}. Stay in character."
+
+        cls._personality_cache[slug] = hint
+        return hint
 
     @staticmethod
     def _clean_reply(text: str) -> Optional[str]:

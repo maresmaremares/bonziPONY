@@ -1,11 +1,17 @@
-"""Handles rendering visual effects (Sonic Rainboom) as overlay sprites."""
+"""Handles rendering visual effects (Sonic Rainboom, apple trails, mail drops)
+as overlay sprites.
+
+Trail effects (non-follow, dont_repeat=False) spawn new instances periodically
+at the pony's current position as it moves — creating trails of apples,
+letters, sparkles, etc. behind the pony.
+"""
 
 from __future__ import annotations
 
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from PyQt5.QtGui import QPixmap
 
@@ -31,13 +37,29 @@ class ActiveEffect:
     facing_right: bool = True
 
 
+@dataclass
+class _TrailState:
+    """Tracks spawning state for a repeating trail effect."""
+    effect_def: EffectDef
+    behavior_name: str
+    last_spawn_time: float = 0.0
+    spawn_interval: float = 0.0  # derived from delay field
+
+
 class EffectRenderer:
     """Manages active visual effects that overlay the main sprite."""
+
+    # Maximum trail instances per effect (prevents runaway memory on long behaviors)
+    _MAX_TRAIL_INSTANCES = 12
 
     def __init__(self, sprite_manager: SpriteManager, behavior_manager: BehaviorManager) -> None:
         self.sprite_manager = sprite_manager
         self.behavior_manager = behavior_manager
         self.active_effects: List[ActiveEffect] = []
+        # Trail effects: keyed by effect name, tracks periodic re-spawning
+        self._trail_states: Dict[str, _TrailState] = {}
+        # Currently active behavior name (set by trigger_effects, cleared by clear)
+        self._current_behavior: Optional[str] = None
 
     def trigger_effects(
         self,
@@ -49,38 +71,65 @@ class EffectRenderer:
         sprite_h: int,
     ) -> None:
         """Start all effects associated with a behavior."""
+        # Clear trail states from previous behavior
+        if behavior_name != self._current_behavior:
+            self._trail_states.clear()
+        self._current_behavior = behavior_name
+
         effect_defs = self.behavior_manager.get_effects_for(behavior_name)
         if not effect_defs:
             return
 
         now = time.monotonic()
         for edef in effect_defs:
-            # Load the effect animation
-            img_file = edef.right_image if facing_right else edef.left_image
-            anim_key = f"effect_{edef.name}_{'right' if facing_right else 'left'}"
-            anim = self.sprite_manager.load_animation(anim_key, img_file)
-            if not anim.frames:
-                continue
+            self._spawn_effect(edef, facing_right, sprite_x, sprite_y, sprite_w, sprite_h, now)
 
-            # Calculate initial position based on placement
-            ex, ey = self._calc_position(
-                edef, facing_right, sprite_x, sprite_y, sprite_w, sprite_h, anim
-            )
+            # Set up trail spawning for repeating, non-follow effects
+            # These are the "drop items behind me as I move" effects
+            if not edef.follow and not edef.dont_repeat:
+                interval = max(edef.delay, 0.4)  # at least 0.4s between spawns
+                self._trail_states[edef.name] = _TrailState(
+                    effect_def=edef,
+                    behavior_name=behavior_name,
+                    last_spawn_time=now,
+                    spawn_interval=interval,
+                )
 
-            effect = ActiveEffect(
-                effect_def=edef,
-                animation=anim,
-                frame_index=0,
-                x=ex,
-                y=ey,
-                start_time=now + edef.delay,
-                last_frame_time=now + edef.delay,
-                origin_x=sprite_x + sprite_w // 2,
-                origin_y=sprite_y + sprite_h // 2,
-                facing_right=facing_right,
-            )
-            self.active_effects.append(effect)
-            logger.debug("Triggered effect '%s' for behavior '%s'", edef.name, behavior_name)
+    def _spawn_effect(
+        self,
+        edef: EffectDef,
+        facing_right: bool,
+        sprite_x: int,
+        sprite_y: int,
+        sprite_w: int,
+        sprite_h: int,
+        now: float,
+    ) -> None:
+        """Spawn a single effect instance at the given sprite position."""
+        img_file = edef.right_image if facing_right else edef.left_image
+        anim_key = f"effect_{edef.name}_{'right' if facing_right else 'left'}"
+        anim = self.sprite_manager.load_animation(anim_key, img_file)
+        if not anim.frames:
+            return
+
+        ex, ey = self._calc_position(
+            edef, facing_right, sprite_x, sprite_y, sprite_w, sprite_h, anim
+        )
+
+        effect = ActiveEffect(
+            effect_def=edef,
+            animation=anim,
+            frame_index=0,
+            x=ex,
+            y=ey,
+            start_time=now,
+            last_frame_time=now,
+            origin_x=sprite_x + sprite_w // 2,
+            origin_y=sprite_y + sprite_h // 2,
+            facing_right=facing_right,
+        )
+        self.active_effects.append(effect)
+        logger.debug("Spawned effect '%s' at (%d, %d)", edef.name, ex, ey)
 
     def tick(
         self,
@@ -88,9 +137,30 @@ class EffectRenderer:
         sprite_y: int,
         sprite_w: int,
         sprite_h: int,
+        facing_right: bool = True,
     ) -> List[Tuple[QPixmap, int, int]]:
-        """Update effects and return list of (pixmap, x, y) to render."""
+        """Update effects and return list of (pixmap, x, y) to render.
+
+        Also handles periodic re-spawning of trail effects at the pony's
+        current position.
+        """
         now = time.monotonic()
+
+        # ── Trail re-spawning ──────────────────────────────────────────────
+        for trail in self._trail_states.values():
+            if now - trail.last_spawn_time >= trail.spawn_interval:
+                # Count existing instances of this effect
+                count = sum(
+                    1 for e in self.active_effects if e.effect_def.name == trail.effect_def.name
+                )
+                if count < self._MAX_TRAIL_INSTANCES:
+                    self._spawn_effect(
+                        trail.effect_def, facing_right,
+                        sprite_x, sprite_y, sprite_w, sprite_h, now,
+                    )
+                    trail.last_spawn_time = now
+
+        # ── Update active effects ──────────────────────────────────────────
         results: List[Tuple[QPixmap, int, int]] = []
         still_active: List[ActiveEffect] = []
 
@@ -136,8 +206,50 @@ class EffectRenderer:
         return results
 
     def clear(self) -> None:
-        """Remove all active effects."""
+        """Remove all active effects and trail states."""
         self.active_effects.clear()
+        self._trail_states.clear()
+        self._current_behavior = None
+
+    @staticmethod
+    def _parse_anchor(placement: str, sprite_x: int, sprite_y: int,
+                      sprite_w: int, sprite_h: int) -> Tuple[int, int]:
+        """Parse a placement string (may be compound like 'Bottom_Right')
+        and return the anchor point on the sprite."""
+        p = placement.lower().replace("-", "_")
+
+        # Compound placements (e.g. "bottom_right", "top_left")
+        if "_" in p:
+            parts = p.split("_")
+            # Figure out x and y components
+            ax = sprite_x + sprite_w // 2  # default center
+            ay = sprite_y + sprite_h // 2
+            for part in parts:
+                if part == "left":
+                    ax = sprite_x
+                elif part == "right":
+                    ax = sprite_x + sprite_w
+                elif part == "top":
+                    ay = sprite_y
+                elif part == "bottom":
+                    ay = sprite_y + sprite_h
+                elif part == "center":
+                    pass  # keep default
+            return ax, ay
+
+        # Simple placements
+        if p == "center":
+            return sprite_x + sprite_w // 2, sprite_y + sprite_h // 2
+        elif p == "right":
+            return sprite_x + sprite_w, sprite_y + sprite_h // 2
+        elif p == "left":
+            return sprite_x, sprite_y + sprite_h // 2
+        elif p == "top":
+            return sprite_x + sprite_w // 2, sprite_y
+        elif p == "bottom":
+            return sprite_x + sprite_w // 2, sprite_y + sprite_h
+        else:
+            return sprite_x + sprite_w // 2, sprite_y + sprite_h // 2
 
     def _calc_position(
         self,
@@ -149,7 +261,10 @@ class EffectRenderer:
         sprite_h: int,
         anim: SpriteAnimation,
     ) -> Tuple[int, int]:
-        """Calculate effect position based on placement and centering rules."""
+        """Calculate effect position based on placement and centering rules.
+
+        Supports compound placements like 'Bottom_Right', 'Top_Left', etc.
+        """
         if not anim.frames:
             return sprite_x, sprite_y
 
@@ -159,44 +274,16 @@ class EffectRenderer:
         placement = edef.right_placement if facing_right else edef.left_placement
         centering = edef.right_centering if facing_right else edef.left_centering
 
-        # Placement: where on the sprite the effect anchors
-        if placement == "Center":
-            anchor_x = sprite_x + sprite_w // 2
-            anchor_y = sprite_y + sprite_h // 2
-        elif placement == "Right":
-            anchor_x = sprite_x + sprite_w
-            anchor_y = sprite_y + sprite_h // 2
-        elif placement == "Left":
-            anchor_x = sprite_x
-            anchor_y = sprite_y + sprite_h // 2
-        elif placement == "Top":
-            anchor_x = sprite_x + sprite_w // 2
-            anchor_y = sprite_y
-        elif placement == "Bottom":
-            anchor_x = sprite_x + sprite_w // 2
-            anchor_y = sprite_y + sprite_h
-        else:
-            anchor_x = sprite_x + sprite_w // 2
-            anchor_y = sprite_y + sprite_h // 2
+        # Get anchor point on the sprite
+        anchor_x, anchor_y = self._parse_anchor(
+            placement, sprite_x, sprite_y, sprite_w, sprite_h
+        )
 
-        # Centering: which part of the effect aligns to the anchor
-        if centering == "Center":
-            ex = anchor_x - eff_w // 2
-            ey = anchor_y - eff_h // 2
-        elif centering == "Right":
-            ex = anchor_x - eff_w
-            ey = anchor_y - eff_h // 2
-        elif centering == "Left":
-            ex = anchor_x
-            ey = anchor_y - eff_h // 2
-        elif centering == "Top":
-            ex = anchor_x - eff_w // 2
-            ey = anchor_y
-        elif centering == "Bottom":
-            ex = anchor_x - eff_w // 2
-            ey = anchor_y - eff_h
-        else:
-            ex = anchor_x - eff_w // 2
-            ey = anchor_y - eff_h // 2
+        # Offset the effect so the correct part aligns to the anchor
+        offset_x, offset_y = self._parse_anchor(
+            centering, 0, 0, eff_w, eff_h
+        )
+        ex = anchor_x - offset_x
+        ey = anchor_y - offset_y
 
         return ex, ey

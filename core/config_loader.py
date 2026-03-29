@@ -32,7 +32,7 @@ class AudioConfig:
 
 @dataclass
 class WhisperConfig:
-    model: str = "base"
+    model: str = "tiny"
     language: str = "en"
 
 
@@ -114,7 +114,8 @@ class AgentConfig:
     enabled: bool = True
     self_initiate: bool = True
     max_directives: int = 3
-    base_check_interval_s: float = 120.0
+    activity_multiplier: float = 1.0          # scales ALL timing (0.1 = hyper, 6.0 = chill)
+    base_check_interval_s: float = 300.0
     min_check_interval_s: float = 30.0
     self_initiate_interval_s: float = 300.0
     spontaneous_speech_min_s: float = 120.0   # minimum seconds between random check-ins
@@ -184,6 +185,7 @@ class AppConfig:
     tts: TTSConfig = None
     vision_llm: VisionLLMConfig = None
     multi_pony: MultiPonyConfig = None
+    presentation_mode: bool = False        # secret: unlocks demo/presentation menu
 
     def __post_init__(self):
         if self.desktop_pet is None:
@@ -255,6 +257,7 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
     tts_raw = raw.get("tts", {})
     vlm_raw = raw.get("vision_llm", {})
     mp_raw = raw.get("multi_pony", {})
+    presentation_mode = raw.get("presentation_mode", False)
 
     # ── Env var fallbacks for secrets (config.yaml wins, env is backup) ─────
     llm_api_key = llm_raw.get("api_key", "") or os.environ.get("BONZI_LLM_API_KEY", "")
@@ -278,7 +281,7 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
             ptt_key=audio_raw.get("ptt_key", "f6"),
         ),
         whisper=WhisperConfig(
-            model=whisper_raw.get("model", "base"),
+            model=whisper_raw.get("model", "tiny"),
             language=whisper_raw.get("language", "en"),
         ),
         llm=LLMConfig(
@@ -374,4 +377,5 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
             piggyback_chance=mp_raw.get("piggyback_chance", 0.30),
             secondary_ponies=mp_raw.get("secondary_ponies", []),
         ),
+        presentation_mode=bool(presentation_mode),
     )

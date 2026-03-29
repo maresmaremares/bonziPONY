@@ -27,7 +27,7 @@ _ACTION_ANIMATION_MAP = {
     RobotAction.SIT: "sleep",
     RobotAction.STAND: "stand",
     RobotAction.WAVE: "salute",
-    RobotAction.SHAKE: "beep",
+    RobotAction.SHAKE: "dizzy",
     RobotAction.SPIN: "dizzy",
     # Desktop control actions
     RobotAction.CLOSE_WINDOW: "salute",
@@ -64,6 +64,8 @@ class PetController(QObject):
     move_to = pyqtSignal(str)               # screen region name
     grab_run_start = pyqtSignal()           # start grab-cursor run animation
     grab_run_stop = pyqtSignal()            # stop grab-cursor run animation
+    drag_walk_start = pyqtSignal()          # start slow backward walk (for tab drag)
+    drag_walk_stop = pyqtSignal()           # stop drag walk, return to normal
     countdown_start = pyqtSignal(int)       # start countdown timer (seconds)
     countdown_stop = pyqtSignal()           # hide countdown timer
 

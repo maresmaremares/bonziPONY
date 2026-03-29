@@ -198,12 +198,16 @@ class TTSQueue:
             if not self._running or not item.text.strip():
                 continue
 
+            # Set current_item BEFORE breathing pause so is_speaking=True
+            # from the moment the item is dequeued.  Without this, callers
+            # that poll is_speaking/pending_count (e.g. _listen_for_reply)
+            # see both as False during the gap and skip the wait.
+            self._current_item = item
+
             # Breathing pause between utterances
             elapsed = time.monotonic() - last_spoke
             if last_spoke > 0 and elapsed < self._pause:
                 time.sleep(self._pause - elapsed)
-
-            self._current_item = item
 
             if item.skip_tts:
                 # No voice available — just show bubble, pause, move on

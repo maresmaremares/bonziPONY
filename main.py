@@ -155,6 +155,16 @@ def main() -> None:
         input_device_index=config.audio.input_device_index,
     )
 
+    # ── Speaker verification (voice model) ────────────────────────────────
+    # Auto-loads saved profile from disk if one exists.
+    from stt.speaker_id import SpeakerVerifier
+    speaker_verifier = SpeakerVerifier()
+    transcriber.speaker_verifier = speaker_verifier
+    if speaker_verifier.enrolled:
+        logger.info("Voice model loaded — speaker verification active.")
+    else:
+        logger.info("No voice model enrolled — speaker verification inactive.")
+
     llm_provider = get_provider(config)
 
     # ── Dedicated vision LLM (optional — uses separate, cheaper model) ────
@@ -387,6 +397,7 @@ def main() -> None:
         piggyback_chance=mp_cfg.piggyback_chance,
     )
     pony_manager.register_primary(primary_pony)
+    pet_window._pony_manager_ref = pony_manager  # collision avoidance
     if screen_monitor:
         pony_manager._screen_monitor = screen_monitor
 
@@ -429,6 +440,7 @@ def main() -> None:
 
     def _on_scale_change(new_scale: float) -> None:
         nonlocal sprite_manager, effect_renderer
+        # Primary pony
         new_sm = SpriteManager(pony_dir, scale=new_scale)
         new_sm.build_sprite_map(behavior_manager)
         new_sm.preload_all()
@@ -437,6 +449,23 @@ def main() -> None:
         effect_renderer = EffectRenderer(new_sm, behavior_manager)
         pet_window.effect_renderer = effect_renderer
         pet_window._pick_and_start_behavior()
+
+        # Secondary ponies — rebuild their sprites too
+        for pony in pony_manager.ponies:
+            if pony.is_primary:
+                continue
+            try:
+                sm = SpriteManager(pony.pony_dir, scale=new_scale)
+                sm.build_sprite_map(pony.behavior_manager)
+                sm.preload_all()
+                pony.sprite_manager = sm
+                pony.pet_window.sprite_manager = sm
+                er = EffectRenderer(sm, pony.behavior_manager)
+                pony.effect_renderer = er
+                pony.pet_window.effect_renderer = er
+                pony.pet_window._pick_and_start_behavior()
+            except Exception as exc:
+                logger.warning("Failed to rescale %s: %s", pony.display_name, exc)
 
     def _on_character_change(preset_name: str) -> None:
         nonlocal pony_dir, sprite_manager, behavior_manager, effect_renderer
@@ -584,6 +613,7 @@ def main() -> None:
         on_vision_llm_change=_on_vision_llm_change,
         pony_manager=pony_manager,
         pony_instance=primary_pony,
+        transcriber=transcriber,
     )
     pet_window.set_menu_builder(menu_builder)
 
@@ -739,12 +769,18 @@ def main() -> None:
     pet_controller.move_to.connect(_on_move_to, Qt.QueuedConnection)
     pet_controller.grab_run_start.connect(pet_window.start_grab_run, Qt.QueuedConnection)
     pet_controller.grab_run_stop.connect(pet_window.stop_grab_run, Qt.QueuedConnection)
+    pet_controller.drag_walk_start.connect(pet_window.start_drag_walk, Qt.QueuedConnection)
+    pet_controller.drag_walk_stop.connect(pet_window.stop_drag_walk, Qt.QueuedConnection)
     pet_controller.countdown_start.connect(countdown.start_countdown, Qt.QueuedConnection)
     pet_controller.countdown_stop.connect(countdown.stop_countdown, Qt.QueuedConnection)
 
     # Wire cursor grab callback to agent loop (defined after both exist)
+    # Also wire mouth position callback for tab-drag behavior
     if agent_loop:
         agent_loop._on_grab_cursor = _on_grab_cursor
+        agent_loop._get_mouth_position = pet_window.get_mouth_position
+        agent_loop._on_drag_walk_start = lambda: pet_controller.drag_walk_start.emit()
+        agent_loop._on_drag_walk_stop = lambda: pet_controller.drag_walk_stop.emit()
 
     # ── Double-click activation ──────────────────────────────────────────────
 
@@ -973,19 +1009,6 @@ def main() -> None:
 
                 # Wake word or double-click — run full conversation
                 detector.pause()
-
-                # Voice verification on wake word — reject if not the user's voice
-                if keyword_index is not None and not activation_event.is_set():
-                    try:
-                        vf = pipeline.transcriber.voice_filter
-                        wake_audio = detector.get_wake_audio()
-                        if vf and vf.enrolled and wake_audio is not None and not vf.is_user(wake_audio):
-                            logger.info("Wake word rejected by voice filter — not the user's voice.")
-                            if not _shutdown_requested.is_set():
-                                detector.resume()
-                            continue
-                    except Exception as exc:
-                        logger.debug("Wake word voice verification skipped: %s", exc)
 
                 try:
                     pipeline.run_conversation()

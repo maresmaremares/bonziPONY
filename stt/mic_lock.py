@@ -60,7 +60,16 @@ def _open_microphone_with_fallback(**kwargs):
     """
     def _try(**kw):
         m = sr.Microphone(**kw)
-        s = m.__enter__()
+        try:
+            s = m.__enter__()
+        except Exception:
+            # __enter__ failed — terminate the orphaned PyAudio instance
+            if hasattr(m, "audio") and m.audio is not None:
+                try:
+                    m.audio.terminate()
+                except Exception:
+                    pass
+            raise
         return m, s
 
     # ── Attempt 1: exactly as requested ──────────────────────────

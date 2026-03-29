@@ -70,8 +70,7 @@ main.py                          Entry point, wires everything together
 ├── wake_word/
 │   └── detector.py              Whisper-based keyword spotting with per-character phrases
 ├── stt/
-│   ├── transcriber.py           Speech-to-text (Whisper, local)
-│   └── voice_filter.py          Speaker verification (resemblyzer)
+│   └── transcriber.py           Speech-to-text (Whisper, local)
 ├── tts/
 │   ├── elevenlabs_tts.py        ElevenLabs TTS → raw PCM → sounddevice playback
 │   └── openai_compatible_tts.py OpenAI-compatible TTS endpoint (local voice models)
@@ -236,16 +235,6 @@ A pony sprite appears on your desktop and starts trotting around.
 - It can open apps, type text, click, and browse URLs
 - All controlled by the LLM through structured tags — you don't configure this, it just does it when contextually appropriate
 - Safety: `desktop_control.allowed_apps` and `desktop_control.blocked_hotkeys` in config.yaml
-
-### Optional: voice enrollment
-
-If other people are around and you want the pony to only respond to your voice:
-
-```bash
-python scripts/enroll_voice.py
-```
-
-Follow the prompts — it records a few seconds of your voice and saves an embedding to `voice_profile/`. After enrollment, wake words from other speakers are rejected.
 
 ### Optional: using a local LLM (no API key)
 
@@ -480,7 +469,6 @@ openai-whisper       # Local STT
 **Optional:**
 ```
 python-dotenv        # .env file support
-resemblyzer          # Speaker verification
 scipy                # Signal processing
 librosa              # Audio features
 ```

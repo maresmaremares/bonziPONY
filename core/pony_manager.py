@@ -33,7 +33,7 @@ class PonyManager:
         tts_queue: "TTSQueue",
         max_ponies: int = 3,
         chat_interval_s: float = 600.0,
-        max_chat_depth: int = 6,
+        max_chat_depth: int = 8,
         piggyback_chance: float = 0.30,
     ) -> None:
         self.config = config
@@ -57,6 +57,23 @@ class PonyManager:
     def primary(self) -> Optional["PonyInstance"]:
         """The first pony (main companion)."""
         return self.ponies[0] if self.ponies else None
+
+    def get_other_pony_positions(self, exclude) -> list[tuple[int, int]]:
+        """Return center positions of all ponies except *exclude* (a PetWindow).
+
+        Used for collision avoidance in movement ticks.
+        """
+        positions = []
+        for p in self.ponies:
+            pw = getattr(p, "pet_window", None)
+            if pw is None or pw is exclude:
+                continue
+            try:
+                positions.append((pw.x() + pw.width() // 2,
+                                  pw.y() + pw.height() // 2))
+            except Exception:
+                pass
+        return positions
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
@@ -113,6 +130,10 @@ class PonyManager:
                 self._screen_monitor.exclude_hwnd(hwnd)
             except Exception:
                 pass
+
+        # Wire collision avoidance
+        if instance.pet_window:
+            instance.pet_window._pony_manager_ref = self
 
         # Show the window
         instance.pet_window.show()
@@ -359,13 +380,65 @@ class PonyManager:
         from core.group_conversation import GroupConversation
         convo = GroupConversation(self, max_depth=self.max_chat_depth)
 
+        self._convo_in_progress = True
+        self._active_convo = convo
+
         def _run():
-            self._convo_in_progress = True
-            self._active_convo = convo
             try:
                 convo.start(initiator, trigger="spontaneous", screen_context=screen_context)
             except Exception as exc:
                 logger.error("Spontaneous chat failed: %s", exc)
+            finally:
+                self._convo_in_progress = False
+                self._active_convo = None
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+
+    def force_spontaneous_chat(self, topic: str = None) -> bool:
+        """Immediately trigger a group chat, bypassing cooldown/random checks.
+
+        Used by presentation mode. If topic is given, it overrides the random
+        topic seed in the conversation.
+        """
+        if len(self.ponies) < 2:
+            logger.warning("Need at least 2 ponies for group chat.")
+            return False
+        if self._convo_in_progress:
+            logger.info("Group conversation already in progress.")
+            return False
+
+        self._last_inter_chat = time.monotonic()
+        initiator = random.choice(self.ponies)
+        logger.info("Presentation: forced group chat by %s", initiator.display_name)
+
+        screen_context = ""
+        if self._screen_monitor:
+            try:
+                state = self._screen_monitor.get_state()
+                if state and state.foreground:
+                    screen_context = self._summarize_screen_for_chat(
+                        state.foreground.exe_name or "",
+                        state.foreground.title or "",
+                        state.open_windows[:8],
+                    )
+            except Exception:
+                pass
+
+        from core.group_conversation import GroupConversation
+        convo = GroupConversation(self, max_depth=self.max_chat_depth)
+
+        self._convo_in_progress = True
+        self._active_convo = convo
+
+        def _run():
+            try:
+                if topic:
+                    convo.start_with_topic(initiator, topic=topic, screen_context=screen_context)
+                else:
+                    convo.start(initiator, trigger="presentation", screen_context=screen_context)
+            except Exception as exc:
+                logger.error("Forced group chat failed: %s", exc)
             finally:
                 self._convo_in_progress = False
                 self._active_convo = None
@@ -417,11 +490,12 @@ class PonyManager:
             if not self._convo_in_progress:
                 _pony_ref = pony
                 _text_ref = text
+                self._convo_in_progress = True
+
                 def _run_piggybacks(speaker=_pony_ref, spoken=_text_ref):
-                    self._convo_in_progress = True
                     try:
                         for other in list(self.ponies):
-                            if self._convo_in_progress is False:
+                            if not self._convo_in_progress:
                                 break  # interrupted
                             if other is speaker or getattr(other, "_destroyed", False):
                                 continue
@@ -487,12 +561,14 @@ class PonyManager:
         recent_warning = GroupConversation._get_recent_topics_warning()
 
         prompt = (
-            f"(You're on the desktop with {companion_str}. {screen_info}"
+            f"(You are {pony.display_name}. You're on the desktop with {companion_str}. {screen_info}"
             f"{angle} Keep it to one sentence.\n"
             f"RULES: Only reference things you actually know. "
             f"Do NOT invent scenery, events, or errors. "
             f"Do NOT parrot technical info from window titles. "
             f"Do NOT comment on the number of open windows.\n"
+            f"BANNED OPENERS: 'oh I remember', 'that reminds me', 'you know what'. "
+            f"Just say the thing directly.\n"
             f"{recent_warning}"
             f"Be yourself — not a caricature.\n"
             f"Say [PASS] if you have nothing worth saying right now.\n"
@@ -546,12 +622,15 @@ class PonyManager:
         if self._convo_in_progress:
             return  # already in a conversation
 
+        self._convo_in_progress = True
+
         def _run():
-            self._convo_in_progress = True
             try:
                 for pony in list(self.ponies):
                     if pony is responder:
                         continue
+                    if not self._convo_in_progress:
+                        break  # interrupted
                     if random.random() > self.piggyback_chance:
                         continue
                     try:

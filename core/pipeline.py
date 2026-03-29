@@ -161,21 +161,32 @@ class Pipeline:
                     return True
         return False
 
-    def _speak_with_queue(self, text: str, show_bubble_cb, priority: int = 0) -> None:
+    def _speak_with_queue(
+        self, text: str, show_bubble_cb, priority: int = 0,
+        responder=None, blocking: bool | None = None,
+    ) -> None:
         """Speak through TTSQueue if available, else direct TTS.
 
         This ensures voice switching works correctly in multi-pony mode.
-        User-response speech (priority 0) blocks until playback finishes so
-        the pipeline doesn't start listening while the pony is still talking.
+        When *blocking* is None (default), blocks for user-response priority.
+        Pass ``blocking=True`` explicitly to block for any priority level.
+        When *responder* is a non-primary PonyInstance, uses their voice slug.
         """
-        if self.tts_queue:
+        voice_slug = self.primary_voice_slug
+        if responder and hasattr(responder, "slug"):
+            voice_slug = responder.slug
+
+        if blocking is None:
             from core.tts_queue import PRIORITY_USER_RESPONSE
+            blocking = (priority == PRIORITY_USER_RESPONSE)
+
+        if self.tts_queue:
             self.tts_queue.enqueue(
                 text,
                 priority=priority,
-                voice_slug=self.primary_voice_slug,
+                voice_slug=voice_slug,
                 on_start=show_bubble_cb,
-                blocking=(priority == PRIORITY_USER_RESPONSE),
+                blocking=blocking,
             )
         elif self.config.tts.enabled:
             self.tts.speak(text, on_playback_start=show_bubble_cb)
@@ -202,89 +213,75 @@ class Pipeline:
         if self.agent_loop:
             self.agent_loop.set_conversation_active(True)
 
-        self._last_end_conversation = False
-        spoke = self._run_turn(play_ack=True)
-        if not spoke and not self._last_end_conversation:
-            if self.agent_loop:
-                self.agent_loop.set_conversation_active(False)
-            if self._on_conversation_end:
-                try:
-                    self._on_conversation_end()
-                except Exception:
-                    pass
-            self._transition(PipelineState.IDLE)
-            return
+        try:
+            self._last_end_conversation = False
+            spoke = self._run_turn(play_ack=True)
+            if not spoke and not self._last_end_conversation:
+                return
 
-        # If LLM signaled end on first turn (e.g. user said "goodnight")
-        if self._last_end_conversation:
-            logger.info("LLM signaled end of conversation after first turn.")
-            print("[Conversation ended naturally]")
-            if self.agent_loop:
-                self.agent_loop.set_conversation_active(False)
-            if self._on_conversation_end:
-                try:
-                    self._on_conversation_end()
-                except Exception:
-                    pass
-            self._transition(PipelineState.IDLE)
-            return
-
-        cfg = self.config.conversation
-        # Minimum 15s conversation window — lower values make multi-turn
-        # conversations nearly impossible (user can't respond in time)
-        convo_timeout = max(cfg.timeout_s, 15.0)
-        deadline = time.monotonic() + convo_timeout
-        just_spoke = True  # TTS just played; first follow-up listen needs echo drain
-
-        print("\n[Conversation mode — just keep talking, no wake word needed]")
-
-        while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            wait = min(cfg.listen_timeout_s, remaining)
-            if wait <= 0:
-                break
-
-            print(f"\n[Listening... {remaining:.0f}s remaining]", flush=True)
-            self._transition(PipelineState.LISTEN)
-
-            discard_ms = 800 if just_spoke else 0
-            user_text = self.transcriber.listen(speech_start_timeout_s=wait, initial_discard_ms=discard_ms)
-            just_spoke = False
-
-            if not user_text or not user_text.strip():
-                logger.debug("No follow-up speech — ending conversation.")
-                break
-
-            # Filter Whisper hallucinations (ambient noise transcribed as garbage)
-            from stt.transcriber import _is_whisper_hallucination
-            if _is_whisper_hallucination(user_text):
-                logger.debug("Filtered hallucination in follow-up: %r", user_text)
-                continue
-
-            # Filter echo — pony hearing its own TTS through the mic
-            if self._is_echo(user_text):
-                logger.info("Filtered echo in conversation: %r", user_text)
-                continue
-
-            spoke = self._run_turn(play_ack=False, user_text=user_text)
+            # If LLM signaled end on first turn (e.g. user said "goodnight")
             if self._last_end_conversation:
-                logger.info("LLM signaled end of conversation.")
+                logger.info("LLM signaled end of conversation after first turn.")
                 print("[Conversation ended naturally]")
-                break
-            if spoke:
-                deadline = time.monotonic() + convo_timeout
-                just_spoke = True
+                return
 
-        print("[Conversation ended — say the wake word to start again]")
-        self._extract_user_profile()
-        if self.agent_loop:
-            self.agent_loop.set_conversation_active(False)
-        if self._on_conversation_end:
-            try:
-                self._on_conversation_end()
-            except Exception:
-                pass
-        self._transition(PipelineState.IDLE)
+            cfg = self.config.conversation
+            # Minimum 15s conversation window — lower values make multi-turn
+            # conversations nearly impossible (user can't respond in time)
+            convo_timeout = max(cfg.timeout_s, 15.0)
+            deadline = time.monotonic() + convo_timeout
+            just_spoke = True  # TTS just played; first follow-up listen needs echo drain
+
+            print("\n[Conversation mode — just keep talking, no wake word needed]")
+
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                wait = min(cfg.listen_timeout_s, remaining)
+                if wait <= 0:
+                    break
+
+                print(f"\n[Listening... {remaining:.0f}s remaining]", flush=True)
+                self._transition(PipelineState.LISTEN)
+
+                discard_ms = 800 if just_spoke else 0
+                user_text = self.transcriber.listen(speech_start_timeout_s=wait, initial_discard_ms=discard_ms)
+                just_spoke = False
+
+                if not user_text or not user_text.strip():
+                    logger.debug("No follow-up speech — ending conversation.")
+                    break
+
+                # Filter Whisper hallucinations (ambient noise transcribed as garbage)
+                from stt.transcriber import _is_whisper_hallucination
+                if _is_whisper_hallucination(user_text):
+                    logger.debug("Filtered hallucination in follow-up: %r", user_text)
+                    continue
+
+                # Filter echo — pony hearing its own TTS through the mic
+                if self._is_echo(user_text):
+                    logger.info("Filtered echo in conversation: %r", user_text)
+                    continue
+
+                spoke = self._run_turn(play_ack=False, user_text=user_text)
+                if self._last_end_conversation:
+                    logger.info("LLM signaled end of conversation.")
+                    print("[Conversation ended naturally]")
+                    break
+                if spoke:
+                    deadline = time.monotonic() + convo_timeout
+                    just_spoke = True
+
+            print("[Conversation ended — say the wake word to start again]")
+            self._extract_user_profile()
+        finally:
+            if self.agent_loop:
+                self.agent_loop.set_conversation_active(False)
+            if self._on_conversation_end:
+                try:
+                    self._on_conversation_end()
+                except Exception:
+                    pass
+            self._transition(PipelineState.IDLE)
 
     def run_conversation_with_text(self, text: str) -> None:
         """Like run_conversation but with pre-supplied text for the first turn.
@@ -301,79 +298,65 @@ class Pipeline:
         if self.agent_loop:
             self.agent_loop.set_conversation_active(True)
 
-        self._last_end_conversation = False
-        if self._on_heard_text:
-            try:
-                self._on_heard_text(text)
-            except Exception:
-                pass
-        spoke = self._run_turn(play_ack=False, user_text=text)
-        if not spoke and not self._last_end_conversation:
-            if self.agent_loop:
-                self.agent_loop.set_conversation_active(False)
-            if self._on_conversation_end:
+        try:
+            self._last_end_conversation = False
+            if self._on_heard_text:
                 try:
-                    self._on_conversation_end()
+                    self._on_heard_text(text)
                 except Exception:
                     pass
-            self._transition(PipelineState.IDLE)
-            return
+            spoke = self._run_turn(play_ack=False, user_text=text)
+            if not spoke and not self._last_end_conversation:
+                return
 
-        if self._last_end_conversation:
-            if self.agent_loop:
-                self.agent_loop.set_conversation_active(False)
-            if self._on_conversation_end:
-                try:
-                    self._on_conversation_end()
-                except Exception:
-                    pass
-            self._transition(PipelineState.IDLE)
-            return
-
-        # Enter follow-up conversation loop (same as run_conversation)
-        cfg = self.config.conversation
-        convo_timeout = max(cfg.timeout_s, 15.0)
-        deadline = time.monotonic() + convo_timeout
-        just_spoke = True
-
-        while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            wait = min(cfg.listen_timeout_s, remaining)
-            if wait <= 0:
-                break
-
-            self._transition(PipelineState.LISTEN)
-            discard_ms = 800 if just_spoke else 0
-            user_text = self.transcriber.listen(speech_start_timeout_s=wait, initial_discard_ms=discard_ms)
-            just_spoke = False
-
-            if not user_text or not user_text.strip():
-                break
-
-            from stt.transcriber import _is_whisper_hallucination
-            if _is_whisper_hallucination(user_text):
-                continue
-
-            if self._is_echo(user_text):
-                logger.info("Filtered echo in PTT conversation: %r", user_text)
-                continue
-
-            spoke = self._run_turn(play_ack=False, user_text=user_text)
             if self._last_end_conversation:
-                break
-            if spoke:
-                deadline = time.monotonic() + convo_timeout
-                just_spoke = True
+                return
 
-        self._extract_user_profile()
-        if self.agent_loop:
-            self.agent_loop.set_conversation_active(False)
-        if self._on_conversation_end:
-            try:
-                self._on_conversation_end()
-            except Exception:
-                pass
-        self._transition(PipelineState.IDLE)
+            # Enter follow-up conversation loop (same as run_conversation)
+            cfg = self.config.conversation
+            convo_timeout = max(cfg.timeout_s, 15.0)
+            deadline = time.monotonic() + convo_timeout
+            just_spoke = True
+
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                wait = min(cfg.listen_timeout_s, remaining)
+                if wait <= 0:
+                    break
+
+                self._transition(PipelineState.LISTEN)
+                discard_ms = 800 if just_spoke else 0
+                user_text = self.transcriber.listen(speech_start_timeout_s=wait, initial_discard_ms=discard_ms)
+                just_spoke = False
+
+                if not user_text or not user_text.strip():
+                    break
+
+                from stt.transcriber import _is_whisper_hallucination
+                if _is_whisper_hallucination(user_text):
+                    continue
+
+                if self._is_echo(user_text):
+                    logger.info("Filtered echo in PTT conversation: %r", user_text)
+                    continue
+
+                spoke = self._run_turn(play_ack=False, user_text=user_text)
+                if self._last_end_conversation:
+                    break
+                if spoke:
+                    deadline = time.monotonic() + convo_timeout
+                    just_spoke = True
+
+            self._extract_user_profile()
+        finally:
+            if self.agent_loop:
+                self.agent_loop.set_conversation_active(False)
+            if self._on_conversation_end:
+                try:
+                    self._on_conversation_end()
+                except Exception:
+                    pass
+            self._transition(PipelineState.IDLE)
 
     def run_text_conversation(self, text: str) -> None:
         """Handle a typed message — skips STT, goes straight to LLM."""
@@ -416,6 +399,11 @@ class Pipeline:
             else:
                 trigger = f"(Spontaneous thought — {random.choice(_unrelated_prompts())})"
 
+            # Inject screen context so the pony knows what's happening
+            screen_note = self._inject_screen_state("")
+            if screen_note.strip():
+                trigger += f"\n{screen_note.strip()}"
+
             logger.debug("Spontaneous trigger: %r", trigger)
 
             # Use chat() so the exchange lands in history — Dash will remember it
@@ -440,9 +428,32 @@ class Pipeline:
                             self._on_speech_text(parsed.text)
                         except Exception:
                             pass
-                from core.tts_queue import PRIORITY_AUTONOMOUS
-                self._speak_with_queue(parsed.text, _show_bubble, priority=PRIORITY_AUTONOMOUS)
+                # Show bubble immediately — don't wait for TTS callback chain
                 _show_bubble()
+                from core.tts_queue import PRIORITY_AUTONOMOUS
+                self._speak_with_queue(parsed.text, _show_bubble, priority=PRIORITY_AUTONOMOUS, blocking=True)
+
+            # Execute actions/commands from the response (previously discarded)
+            if parsed.actions:
+                for action in parsed.actions:
+                    try:
+                        if self.desktop_controller:
+                            self.desktop_controller.execute_action(action)
+                        if self.robot:
+                            self.robot.execute(action)
+                    except Exception as exc:
+                        logger.debug("Spontaneous action %s failed: %s", action, exc)
+            if parsed.desktop_commands and self.desktop_controller:
+                for dc in parsed.desktop_commands:
+                    try:
+                        self.desktop_controller.execute_command(dc)
+                    except Exception as exc:
+                        logger.debug("Spontaneous desktop cmd %s failed: %s", dc.command, exc)
+            if parsed.moveto_region and self.robot:
+                try:
+                    self.robot.on_move_to(parsed.moveto_region)
+                except Exception:
+                    pass
 
         except Exception as exc:
             logger.warning("Spontaneous speech failed: %s", exc)
@@ -553,6 +564,31 @@ class Pipeline:
                         if target and not target.is_primary and hasattr(target, "llm"):
                             self.llm = target.llm
                             self._active_responder = target
+                            # Inject recent conversation context so the addressed
+                            # pony knows what was discussed (their LLM history is
+                            # likely empty — without this they hallucinate)
+                            primary = self.pony_manager.primary
+                            if primary and hasattr(primary, "llm"):
+                                _ph = getattr(primary.llm, "_history", [])
+                                if _ph:
+                                    _ctx = []
+                                    for _m in _ph[-6:]:
+                                        _role = _m.get("role", "")
+                                        _c = _m.get("content", "")
+                                        if _role == "user":
+                                            _c = _c.split("[System hint:")[0].split("[IMPORTANT:")[0].strip()
+                                            if _c:
+                                                _ctx.append(f"[User]: {_c[:200]}")
+                                        elif _role == "assistant":
+                                            _c = re.sub(r'\[(?:CONVO|DIRECTIVE|TIMER|DONE|ENFORCE|DELAY|MOVETO|PERSIST|RULE)\s*(?::[^\]]*?)?\]', '', _c).strip()
+                                            if _c:
+                                                _ctx.append(f"[{primary.display_name}]: {_c[:200]}")
+                                    if _ctx:
+                                        user_text = (
+                                            f"[Context — recent conversation before you were addressed:]\n"
+                                            + "\n".join(_ctx[-4:])
+                                            + f"\n\n{user_text}"
+                                        )
                         else:
                             self._active_responder = None
                     except Exception:
@@ -564,6 +600,9 @@ class Pipeline:
                 if any(kw in user_text.lower() for kw in _STOP_KW):
                     self.agent_loop.clear_directives()
                     user_text = f"[System: User told you to stop. All your active directives have been cleared.]\n\n{user_text}"
+
+            # Audio context — tell LLM whether this is the user or ambient audio
+            user_text = self._build_audio_context(user_text)
 
             # ALWAYS inject win32gui screen context (free)
             user_text = self._inject_screen_state(user_text)
@@ -581,9 +620,17 @@ class Pipeline:
                     "or [DIRECTIVE:goal:urgency:next week] or [DIRECTIVE:goal:urgency:2026-03-30]\n"
                     "- SPECIFIC TIME → [TIMER:HH:MM:goal]\n"
                     "- RECURRING (daily/weekly/etc.) → [ROUTINE:...]\n"
-                    "  'twice a week' = TWO [ROUTINE:weekly:goal:urgency:day:HH:MM] tags with different days.\n"
-                    "  'every monday and tuesday' = TWO [ROUTINE:weekly:...] tags.\n"
-                    "  'every day' = [ROUTINE:daily:goal:urgency:HH:MM].\n"
+                    "  FORMATS:\n"
+                    "  [ROUTINE:daily:goal:urgency:HH:MM] — every day at time\n"
+                    "  [ROUTINE:daily:goal:urgency:HH:MM:!saturday] — every day EXCEPT saturday\n"
+                    "  [ROUTINE:daily:goal:urgency:HH:MM:!saturday,!sunday] — exclude multiple days\n"
+                    "  [ROUTINE:weekly:goal:urgency:day:HH:MM] — one specific day per week\n"
+                    "  COMBINING:\n"
+                    "  'every day at 4 except friday at 3' = [ROUTINE:daily:goal:5:16:00:!friday] AND [ROUTINE:weekly:goal:5:friday:15:00]\n"
+                    "  'tuesday at 3, wednesday at 4' = [ROUTINE:weekly:goal:5:tuesday:15:00] AND [ROUTINE:weekly:goal:5:wednesday:16:00]\n"
+                    "  'every day except saturday' = [ROUTINE:daily:goal:5:16:00:!saturday]\n"
+                    "  'every weekday' = [ROUTINE:daily:goal:5:09:00:!saturday,!sunday]\n"
+                    "  USE MULTIPLE [ROUTINE:...] TAGS in one response for complex schedules.\n"
                     "- PERMANENTLY BLOCKED (quit porn, stop buying skins, stay off reddit) → [RULE:description]\n"
                     "- Just MENTIONING (plans, stories) → NO TAG, just talk about it.\n"
                     "Goal must be a DIRECT ACTION like 'eat food', 'shower' — NEVER 'remind user to' or 'get user to'."
@@ -669,6 +716,7 @@ class Pipeline:
                     _RA.CLOSE_WINDOW, _RA.MINIMIZE_WINDOW, _RA.MAXIMIZE_WINDOW,
                     _RA.SNAP_WINDOW_LEFT, _RA.SNAP_WINDOW_RIGHT,
                     _RA.VOLUME_UP, _RA.VOLUME_DOWN, _RA.VOLUME_MUTE,
+                    _RA.SHAKE,
                 }
                 for action in parsed.actions:
                     try:
@@ -709,22 +757,16 @@ class Pipeline:
                 self.agent_loop.add_standing_rule(description=parsed.standing_rule)
 
             # Create recurring routines from conversation if LLM used [ROUTINE:...] tags
+            # Uses collapse_routine_tags to merge multiple tags with the same goal
+            # (e.g. two weekly tags → one routine with day_times)
             if parsed.routines and self.agent_loop:
-                import uuid
-                from core.routines import Routine
-                for rt in parsed.routines:
-                    routine = Routine(
-                        id=str(uuid.uuid4())[:8],
-                        goal=rt.goal,
-                        urgency=rt.urgency,
-                        schedule=rt.schedule,
-                        time=rt.time,
-                        day=rt.day if rt.schedule == "weekly" else None,
-                        interval_hours=rt.hours if rt.schedule == "interval" else None,
-                        sleep_offset_hours=rt.hours if rt.schedule == "on_sleep" and rt.hours else 8.0,
-                    )
-                    self.agent_loop.routine_manager.add(routine)
-                    logger.info("Routine created from conversation: %s (%s)", rt.goal, rt.schedule)
+                from core.routines import collapse_routine_tags
+                collapsed = collapse_routine_tags(parsed.routines)
+                for routine in collapsed:
+                    added = self.agent_loop.routine_manager.add_if_unique(routine)
+                    logger.info("Routine %s from conversation: %s (%s)",
+                                "created" if added else "merged",
+                                routine.goal, routine.schedule)
 
             # Mark directive as completed if LLM used [DONE] or [DONE:keyword]
             if parsed.done_directive is not None and self.agent_loop and self.agent_loop.has_directives:
@@ -815,18 +857,31 @@ class Pipeline:
             self._transition(PipelineState.SPEAK)
             if parsed.text:
                 _bubble_shown = False
+                _target = self._active_responder  # may be None (primary)
+
                 def _show_bubble():
                     nonlocal _bubble_shown
                     if _bubble_shown:
                         return
                     _bubble_shown = True
-                    if self._on_speech_text:
+                    # Route bubble to the correct pony's pet_controller
+                    if _target and hasattr(_target, "pet_controller"):
+                        try:
+                            _target.pet_controller.speech_text.emit(parsed.text)
+                        except Exception:
+                            pass
+                    elif self._on_speech_text:
                         try:
                             self._on_speech_text(parsed.text)
                         except Exception:
                             pass
-                self._speak_with_queue(parsed.text, _show_bubble)
-                # Always ensure bubble was shown (fallback if TTS failed/skipped callback)
+
+                # Show bubble IMMEDIATELY — don't wait for TTS HTTP request.
+                # The on_start callback from TTS is a backup (dedup flag prevents
+                # double-show).  Without this, bubble only appears after TTS starts.
+                _show_bubble()
+                self._speak_with_queue(parsed.text, _show_bubble, responder=_target)
+                # Fallback in case neither immediate nor TTS callback fired
                 _show_bubble()
                 # Track for echo detection
                 self._recently_spoken.append(parsed.text)
@@ -839,8 +894,9 @@ class Pipeline:
                 # Offer piggyback to other ponies after user response
                 if self.pony_manager and len(self.pony_manager.ponies) > 1:
                     try:
+                        _responder = _target or self.pony_manager.primary
                         self.pony_manager.offer_piggyback(
-                            self.pony_manager.primary,
+                            _responder,
                             original_user_text or "",
                             parsed.text,
                         )
@@ -1039,6 +1095,96 @@ class Pipeline:
         except Exception:
             return user_text
 
+    # ── VC/call app detection (for audio context) ─────────────────────────
+
+    _VC_EXES = {
+        "discord.exe", "teams.exe", "zoom.exe", "slack.exe", "skype.exe",
+        "telegram.exe", "facetime", "webex.exe", "googlemeetelectron.exe",
+    }
+    _VC_TITLE_KEYWORDS = [
+        "discord", "zoom meeting", "microsoft teams", "slack huddle",
+        "skype", "google meet", "facetime", "webex",
+    ]
+
+    def _build_audio_context(self, user_text: str) -> str:
+        """Inject audio context so the LLM understands WHAT it's hearing.
+
+        Combines speaker verification confidence with screen state to tell
+        the LLM whether the transcription is the user talking directly,
+        ambient audio from speakers/TV, or a mix.  The LLM gets EVERYTHING —
+        nothing is thrown away — but it knows the source.
+        """
+        parts = []
+
+        # Speaker confidence from transcriber
+        confidence = getattr(self.transcriber, "last_speaker_confidence", 1.0)
+        has_voice_model = (
+            hasattr(self.transcriber, "speaker_verifier")
+            and self.transcriber.speaker_verifier is not None
+            and self.transcriber.speaker_verifier.enrolled
+        )
+
+        # Detect media / VC from screen state
+        media_playing = False
+        vc_active = False
+        media_name = ""
+        vc_name = ""
+        if self.screen_monitor:
+            try:
+                state = self.screen_monitor.get_state()
+                if state:
+                    for w in state.open_windows[:20]:
+                        title_lower = (w.title or "").lower()
+                        exe_lower = (w.exe_name or "").lower()
+                        # Check media
+                        if not media_playing:
+                            from core.screen_monitor import _is_media_app
+                            if _is_media_app(w.exe_name, w.title or ""):
+                                media_playing = True
+                                media_name = w.title or w.exe_name or "media"
+                        # Check VC
+                        if not vc_active:
+                            if exe_lower in self._VC_EXES:
+                                vc_active = True
+                                vc_name = w.title or w.exe_name or "voice call"
+                            elif any(kw in title_lower for kw in self._VC_TITLE_KEYWORDS):
+                                vc_active = True
+                                vc_name = w.title or "voice call"
+            except Exception:
+                pass
+
+        # Build the context annotation
+        if has_voice_model:
+            if confidence >= 0.85:
+                parts.append(f"Speaker: user (confidence {confidence:.0%})")
+            elif confidence >= 0.6:
+                parts.append(
+                    f"Speaker: UNCERTAIN — might be the user or ambient audio "
+                    f"(confidence {confidence:.0%}). Read the text carefully "
+                    f"and use context to judge."
+                )
+            else:
+                parts.append(
+                    f"Speaker: likely NOT the user (confidence {confidence:.0%}). "
+                    f"This transcription is probably from speakers, TV, video, "
+                    f"or someone else nearby. Do NOT respond as if the user "
+                    f"said this — but you can reference it if relevant."
+                )
+
+        if media_playing:
+            parts.append(f"Media playing: \"{media_name[:80]}\"")
+        if vc_active:
+            parts.append(
+                f"Voice call active: \"{vc_name[:80]}\" — "
+                f"some of this transcription may be from the other person on the call"
+            )
+
+        if not parts:
+            return user_text  # nothing to annotate
+
+        annotation = "[Audio context: " + ". ".join(parts) + ".]"
+        return f"{annotation}\n\n{user_text}"
+
     _SCREEN_KEYWORDS = ("screen", "what do you see", "look", "what's that", "what is that", "what's on")
     _CAMERA_KEYWORDS = ("on camera", "webcam", "camera", "how do i look", "what do i look",
                         "see me", "look at me", "do i look", "am i wearing")
@@ -1198,9 +1344,10 @@ class Pipeline:
                             self._on_speech_text(parsed.text)
                         except Exception:
                             pass
-                from core.tts_queue import PRIORITY_AUTONOMOUS
-                self._speak_with_queue(parsed.text, _show_bubble, priority=PRIORITY_AUTONOMOUS)
+                # Show bubble immediately — don't wait for TTS callback chain
                 _show_bubble()
+                from core.tts_queue import PRIORITY_AUTONOMOUS
+                self._speak_with_queue(parsed.text, _show_bubble, priority=PRIORITY_AUTONOMOUS, blocking=True)
 
         except Exception as exc:
             logger.warning("Screen commentary failed: %s", exc)

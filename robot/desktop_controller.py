@@ -24,6 +24,7 @@ _WINDOW_ACTIONS = {
     RobotAction.MAXIMIZE_WINDOW,
     RobotAction.SNAP_WINDOW_LEFT,
     RobotAction.SNAP_WINDOW_RIGHT,
+    RobotAction.SHAKE,
 }
 
 _VOLUME_ACTIONS = {
@@ -84,7 +85,13 @@ class DesktopController:
             hk.lower().replace(":", "+") for hk in (config.blocked_hotkeys or [])
         ) | _BLOCKED_HOTKEYS
 
+        self._blocked_url_patterns: list[str] = []  # standing rule patterns
+
         logger.info("DesktopController ready (pet_hwnd=%d).", pet_hwnd)
+
+    def set_blocked_patterns(self, patterns: list[str]) -> None:
+        """Update the URL blocklist from standing rules."""
+        self._blocked_url_patterns = [p.lower() for p in patterns]
 
     def _get_monitor_rect(self, hwnd: int = 0):
         """Get work-area MonitorRect for the given window (or pet window if 0)."""
@@ -258,6 +265,10 @@ class DesktopController:
                 logger.info("Snapping window right HWND=%d", hwnd)
                 win32gui.MoveWindow(hwnd, mon.left + mon.width // 2, mon.top, mon.width // 2, mon.height, True)
 
+            elif action == RobotAction.SHAKE:
+                logger.info("Shaking foreground window HWND=%d", hwnd)
+                self.shake_window(hwnd)
+
         except Exception as exc:
             logger.warning("Window action %s failed: %s", action, exc)
 
@@ -429,6 +440,19 @@ class DesktopController:
                 self._cmd_close_tab()
             elif command == "SWITCH":
                 self._cmd_switch(cmd.args)
+            elif command == "DRAG":
+                self._cmd_drag(cmd.args)
+            elif command in ("CLOSE_WINDOW", "CLOSE_WIN"):
+                self._cmd_close(cmd.args)
+            elif command in ("MINIMIZE", "MINIMIZE_WINDOW"):
+                hwnd = self._get_foreground_hwnd()
+                if hwnd and not self._is_pet_window(hwnd):
+                    try:
+                        import win32gui, win32con
+                        win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+                        logger.info("Minimized foreground window.")
+                    except Exception as exc:
+                        logger.warning("Minimize failed: %s", exc)
             else:
                 logger.warning("Unknown desktop command: %s", command)
         except Exception as exc:
@@ -452,6 +476,50 @@ class DesktopController:
 
         logger.info("Click at (%d, %d)", x, y)
         self._pyautogui.click(x, y)
+
+    def _cmd_drag(self, args: list[str]) -> None:
+        """Click-and-drag from (x1, y1) to (x2, y2).
+
+        [DESKTOP:DRAG:x1:y1:x2:y2] or [DESKTOP:DRAG:x1:y1:x2:y2:duration]
+        Used for dragging browser tabs, windows, etc.
+        """
+        if not self._config.click_enabled:
+            logger.info("Drag disabled (click_enabled=False).")
+            return
+        if len(args) < 4:
+            logger.warning("DRAG requires x1, y1, x2, y2 args.")
+            return
+
+        from core.monitor_utils import get_virtual_desktop_rect
+        virt = get_virtual_desktop_rect()
+
+        x1, y1 = int(args[0]), int(args[1])
+        x2, y2 = int(args[2]), int(args[3])
+        duration = float(args[4]) if len(args) > 4 else 1.0
+        duration = max(0.2, min(duration, 10.0))
+
+        # Bounds check
+        x1 = max(virt.left, min(x1, virt.right - 1))
+        y1 = max(virt.top, min(y1, virt.bottom - 1))
+        x2 = max(virt.left, min(x2, virt.right - 1))
+        y2 = max(virt.top, min(y2, virt.bottom - 1))
+
+        logger.info("Drag from (%d,%d) to (%d,%d) over %.1fs", x1, y1, x2, y2, duration)
+        self._pyautogui.moveTo(x1, y1, duration=0.2)
+        import time as _time
+        _time.sleep(0.1)
+        self._pyautogui.mouseDown(x1, y1)
+        _time.sleep(0.05)
+        self._pyautogui.moveTo(x2, y2, duration=duration)
+        self._pyautogui.mouseUp()
+
+    def drag_to_position(self, from_x: int, from_y: int, to_x: int, to_y: int,
+                         duration: float = 1.5) -> None:
+        """High-level drag: click at (from_x, from_y) and drag to (to_x, to_y).
+
+        Called by agent loop for tab-drag behavior.
+        """
+        self._cmd_drag([str(from_x), str(from_y), str(to_x), str(to_y), str(duration)])
 
     def _cmd_type(self, args: list[str]) -> None:
         if not self._config.type_enabled:
@@ -554,6 +622,32 @@ class DesktopController:
         except Exception as exc:
             logger.warning("Failed to open %s: %s", app_name, exc)
 
+    # ── Site shortcuts and search URL construction ───────────────────────
+    _SITE_SHORTCUTS: dict[str, str] = {
+        "youtube": "youtube.com", "yt": "youtube.com",
+        "google": "google.com",
+        "reddit": "reddit.com",
+        "twitter": "twitter.com", "x": "twitter.com",
+        "twitch": "twitch.tv",
+        "4chan": "4chan.org",
+        "github": "github.com",
+        "wikipedia": "wikipedia.org",
+        "steam": "store.steampowered.com",
+        "discord": "discord.com",
+        "instagram": "instagram.com",
+        "tiktok": "tiktok.com",
+        "facebook": "facebook.com",
+        "spotify": "open.spotify.com",
+    }
+
+    # Patterns that trigger site-specific search URLs
+    _SEARCH_SITES: dict[str, str] = {
+        "youtube": "https://www.youtube.com/results?search_query={q}",
+        "yt": "https://www.youtube.com/results?search_query={q}",
+        "google": "https://www.google.com/search?q={q}",
+        "reddit": "https://www.reddit.com/search/?q={q}",
+    }
+
     def _cmd_browse(self, args: list[str]) -> None:
         if not args:
             logger.warning("BROWSE requires a URL or site name.")
@@ -561,13 +655,38 @@ class DesktopController:
 
         raw = ":".join(args).strip()  # Rejoin in case URL contained colons
 
-        # Figure out the URL
+        # Check against standing rule blocklist before doing anything
+        if self._blocked_url_patterns:
+            raw_lower = raw.lower()
+            for pattern in self._blocked_url_patterns:
+                if pattern in raw_lower:
+                    logger.warning("Blocked BROWSE — matches standing rule: %s", pattern)
+                    return
+
+        import urllib.parse
+
+        # 1. Full URL with scheme — use as-is
         if "://" in raw:
             url = raw
+        # 2. Has a dot — treat as domain/path, just add https://
         elif "." in raw:
             url = f"https://{raw}"
         else:
-            url = f"https://www.{raw}.com"
+            # 3. No dots, no scheme — check for "site searchterms" pattern
+            parts = raw.split(None, 1)
+            site_key = parts[0].lower() if parts else raw.lower()
+
+            if len(parts) == 2 and site_key in self._SEARCH_SITES:
+                # "youtube cat videos" → YouTube search
+                query = urllib.parse.quote_plus(parts[1])
+                url = self._SEARCH_SITES[site_key].format(q=query)
+            elif site_key in self._SITE_SHORTCUTS:
+                # Bare "youtube" or "reddit" → open the site
+                url = f"https://www.{self._SITE_SHORTCUTS[site_key]}"
+            else:
+                # Unknown bare text → Google search
+                query = urllib.parse.quote_plus(raw)
+                url = f"https://www.google.com/search?q={query}"
 
         # Only allow http/https schemes — block javascript:, file:, data:, vbscript: etc.
         url_lower = url.lower().strip()
@@ -723,6 +842,71 @@ class DesktopController:
             logger.info("SWITCH: brought %r to foreground (HWND=%d)", title, hwnd)
         except Exception as exc:
             logger.warning("SWITCH failed: %s", exc)
+
+    # ── Browser focus helpers (used by AFK mischief) ─────────────────────────
+
+    _BROWSER_EXE_NAMES = {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "vivaldi.exe"}
+
+    def focus_browser(self) -> bool:
+        """Find the topmost browser window and bring it to the foreground.
+
+        Returns True if a browser window was found and focused.
+        """
+        try:
+            import win32gui
+            import win32con
+            import win32process
+            import ctypes
+        except ImportError:
+            return False
+
+        found = [None]
+
+        def _callback(hwnd: int, _extra) -> bool:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                h = ctypes.windll.kernel32.OpenProcess(0x0410, False, pid)  # PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+                if h:
+                    buf = ctypes.create_unicode_buffer(260)
+                    size = ctypes.c_ulong(260)
+                    ctypes.windll.kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+                    ctypes.windll.kernel32.CloseHandle(h)
+                    exe = buf.value.rsplit("\\", 1)[-1].lower()
+                    if exe in self._BROWSER_EXE_NAMES:
+                        found[0] = hwnd
+                        return False
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumWindows(_callback, None)
+        except Exception:
+            pass
+
+        if found[0]:
+            try:
+                hwnd = found[0]
+                if win32gui.IsIconic(hwnd):
+                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                win32gui.SetForegroundWindow(hwnd)
+                logger.debug("Focused browser window (HWND=%d)", hwnd)
+                return True
+            except Exception as exc:
+                logger.debug("Failed to focus browser: %s", exc)
+        return False
+
+    def move_mouse_to_center(self) -> None:
+        """Move the mouse cursor to the center of the primary monitor."""
+        try:
+            mon = self._get_monitor_rect()
+            cx = mon.left + mon.width // 2
+            cy = mon.top + mon.height // 2
+            self._pyautogui.moveTo(cx, cy, duration=0.3)
+        except Exception as exc:
+            logger.debug("move_mouse_to_center failed: %s", exc)
 
     # ── Advanced actions (called by agent loop) ──────────────────────────────
 
