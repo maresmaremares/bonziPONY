@@ -289,6 +289,59 @@ class DesktopController:
 
     # ── Targeted window actions (by title) ─────────────────────────────────
 
+    def _is_browser_hwnd(self, hwnd: int) -> bool:
+        """Return True if *hwnd* belongs to a known browser process."""
+        try:
+            import win32process
+            import ctypes
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            h = ctypes.windll.kernel32.OpenProcess(0x0410, False, pid)
+            if h:
+                buf = ctypes.create_unicode_buffer(260)
+                size = ctypes.c_ulong(260)
+                ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                    h, 0, buf, ctypes.byref(size))
+                ctypes.windll.kernel32.CloseHandle(h)
+                exe = buf.value.rsplit("\\", 1)[-1].lower()
+                return exe in self._BROWSER_EXE_NAMES
+        except Exception:
+            pass
+        return False
+
+    def close_tab_by_title(self, title_substring: str) -> bool:
+        """Focus the window matching *title_substring* and send Ctrl+W to close
+        only the browser tab (not the whole browser).  Falls back to WM_CLOSE
+        for non-browser windows.  Returns True if the window was found."""
+        hwnd = self._find_window_by_title(title_substring)
+        if hwnd is None:
+            logger.info("No window found matching %r to close tab.", title_substring)
+            return False
+        if self._is_pet_window(hwnd):
+            logger.info("Skipping close_tab — matched window is pet window.")
+            return False
+        if self._is_own_console(hwnd):
+            logger.info("Skipping close_tab — matched window is our console.")
+            return False
+
+        if self._is_browser_hwnd(hwnd):
+            try:
+                import win32gui
+                import win32con
+                if win32gui.IsIconic(hwnd):
+                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                win32gui.SetForegroundWindow(hwnd)
+                import time
+                time.sleep(0.15)  # let the OS finish the focus switch
+                self._pyautogui.hotkey("ctrl", "w")
+                logger.info("Closed browser TAB matching %r (HWND=%d)", title_substring, hwnd)
+                return True
+            except Exception as exc:
+                logger.warning("close_tab_by_title (Ctrl+W) failed: %s", exc)
+                return False
+        else:
+            # Non-browser window — WM_CLOSE is fine
+            return self.close_window_by_title(title_substring)
+
     def close_window_by_title(self, title_substring: str) -> bool:
         """Close the first window whose title contains the substring. Returns True if found."""
         hwnd = self._find_window_by_title(title_substring)
@@ -611,16 +664,34 @@ class DesktopController:
             logger.warning("OPEN requires app name arg.")
             return
 
-        app_name = args[0].lower().strip()
-        if app_name not in self._allowed_apps:
-            logger.warning("App not in allowlist: %s (allowed: %s)", app_name, self._allowed_apps)
-            return
+        app_name = args[0].strip()
+        app_lower = app_name.lower()
 
-        logger.info("Opening app: %s", app_name)
+        # ── 1. Try the scanned app database (fuzzy match) ──
+        if DesktopController._installed_apps:
+            ok, matched = self.launch_app(app_name)
+            if ok:
+                logger.info("OPEN: launched '%s' via app scan.", matched)
+                return
+
+        # ── 2. Fallback: bare executable name (allowlist-gated) ──
+        if app_lower in self._allowed_apps:
+            logger.info("Opening app (Popen fallback): %s", app_lower)
+            try:
+                subprocess.Popen([app_lower])
+                return
+            except Exception as exc:
+                logger.warning("Popen fallback failed for %s: %s", app_lower, exc)
+
+        # ── 3. Last resort: Windows Start Menu search via shell ──
         try:
-            subprocess.Popen([app_name])
-        except Exception as exc:
-            logger.warning("Failed to open %s: %s", app_name, exc)
+            os.startfile(app_name)
+            logger.info("OPEN: os.startfile('%s') succeeded.", app_name)
+            return
+        except OSError:
+            pass
+
+        logger.warning("OPEN: could not find or launch '%s'.", app_name)
 
     # ── Site shortcuts and search URL construction ───────────────────────
     _SITE_SHORTCUTS: dict[str, str] = {

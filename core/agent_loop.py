@@ -1792,22 +1792,23 @@ class AgentLoop:
                 f'Standing rule triggered: "{rule.description}" — '
                 f'caught: "{matched_title[:60]}" (#{rule.catch_count})')
 
-        # ── Step 1: Close the offending window/tab ──
+        # ── Step 1: Close the offending tab/window ──
         closed = False
         if self._desktop and rule.response in ("close_and_nag", "lockdown"):
             try:
-                # Try closing by exact title match first
-                closed = self._desktop.close_window_by_title(matched_title)
+                # Use close_tab_by_title so browsers only lose the
+                # offending tab, not every tab (Ctrl+W vs WM_CLOSE).
+                closed = self._desktop.close_tab_by_title(matched_title)
                 if not closed:
                     # Try partial match
                     for w in state.open_windows:
                         if w.title == matched_title:
-                            closed = self._desktop.close_window_by_title(w.title[:40])
+                            closed = self._desktop.close_tab_by_title(w.title[:40])
                             break
                 if closed:
-                    self._log_action(f"Closed window: \"{matched_title[:50]}\"")
+                    self._log_action(f"Closed tab/window: \"{matched_title[:50]}\"")
             except Exception as exc:
-                logger.warning("Failed to close window for standing rule: %s", exc)
+                logger.warning("Failed to close tab/window for standing rule: %s", exc)
 
         # ── Step 2: Speak — LLM-generated reaction ──
         name = get_character_name()
@@ -2394,8 +2395,8 @@ class AgentLoop:
                         continue
                     elif command == "CLOSE_TITLE":
                         if args:
-                            ok = self._desktop.close_window_by_title(args[0])
-                            self._log_action(f"Close window titled \"{args[0]}\" — {'found' if ok else 'not found'}")
+                            ok = self._desktop.close_tab_by_title(args[0])
+                            self._log_action(f"Close tab/window titled \"{args[0]}\" — {'found' if ok else 'not found'}")
                     elif command == "MINIMIZE_TITLE":
                         if args:
                             ok = self._desktop.minimize_window_by_title(args[0])
