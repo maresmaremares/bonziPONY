@@ -13,7 +13,8 @@ pvrecorder>=1.2.0
 
 # ── Speech-to-text (STT) ─────────────────────────────────────
 SpeechRecognition>=3.10.0       # Google Web Speech API + mic input
-PyAudioWPatch>=0.2.12          # prebuilt fork — avoids needing C++ build tools
+PyAudioWPatch>=0.2.12 ; sys_platform == "win32"   # prebuilt fork (Windows-only) — avoids C++ build tools
+pyaudio>=0.2.13       ; sys_platform != "win32"   # standard PyAudio on Linux/macOS (needs portaudio19-dev)
 openai-whisper>=20230314
 webrtcvad-wheels>=2.0.11        # prebuilt — avoids needing C++ build tools
 
@@ -36,12 +37,17 @@ mss>=9.0.0
 # ── CLIP watch mode (optional — scene understanding + OCR) ───
 transformers>=4.30.0
 torch>=2.0.0
-winocr>=0.0.6                   # Windows-only OCR
+winocr>=0.0.6        ; sys_platform == "win32"   # Windows built-in OCR
+pytesseract>=0.3.10  ; sys_platform != "win32"   # OCR backend on Linux/macOS (needs tesseract binary)
 
 # ── Desktop automation ────────────────────────────────────────
 pyautogui>=0.9.54
-pygetwindow>=0.0.9
-pywin32>=306                    # win32gui, win32con, etc.
+pygetwindow>=0.0.9   ; sys_platform == "win32"
+pywin32>=306         ; sys_platform == "win32"   # win32gui, win32con, etc.
+python-xlib>=0.33    ; sys_platform == "linux"   # X11 fallback for window/idle queries
+pyperclip>=1.8       ; sys_platform != "win32"   # cross-platform clipboard (uses xclip/xsel)
+screeninfo>=0.8      ; sys_platform != "win32"   # multi-monitor enumeration
+psutil>=5.9                                       # cross-platform process tree
 
 # ── Input / hotkeys ──────────────────────────────────────────
 pynput>=1.7.0                  # global hotkey detection (push-to-talk, no admin needed)

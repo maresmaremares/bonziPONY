@@ -733,8 +733,8 @@ def main() -> None:
         """Pony grabs the cursor and runs around with it for `duration` seconds.
         Called from pipeline thread — blocks like mess_with_mouse does.
         Uses signals for animation start/stop (Qt thread safety)."""
-        import ctypes
         import time as _time
+        from core.platform_compat import set_cursor_pos
 
         # Signal main thread to start grab-run animation
         pet_controller.grab_run_start.emit()
@@ -744,7 +744,7 @@ def main() -> None:
         while _time.monotonic() < end_time:
             try:
                 mx, my = pet_window.get_mouth_position()
-                ctypes.windll.user32.SetCursorPos(mx, my)
+                set_cursor_pos(mx, my)
             except Exception:
                 pass
             _time.sleep(0.016)  # ~60fps

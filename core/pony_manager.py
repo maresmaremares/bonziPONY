@@ -214,12 +214,11 @@ class PonyManager:
             return self.ponies[0]
 
         try:
-            import ctypes
-            from ctypes import wintypes
-
-            pt = wintypes.POINT()
-            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-            cx, cy = pt.x, pt.y
+            from core.platform_compat import get_cursor_pos
+            pos = get_cursor_pos()
+            if pos is None:
+                raise RuntimeError("cursor unavailable")
+            cx, cy = pos
         except Exception:
             # Can't get cursor — return primary
             return self.ponies[0]

@@ -47,7 +47,7 @@ main.py                          Entry point, wires everything together
 │   ├── pipeline.py              State machine: IDLE → ACKNOWLEDGE → LISTEN → THINK → SPEAK
 │   ├── agent_loop.py            Autonomous behavior engine (directives, enforcement, screen monitoring)
 │   ├── routines.py              Recurring reminder scheduler
-│   ├── screen_monitor.py        Win32 window tracking (free, no API calls)
+│   ├── screen_monitor.py        Cross-platform window tracking (free, no API calls)
 │   ├── memory.py                Session summaries persisted across restarts
 │   ├── user_profile.py          Persistent user profile + event tracking
 │   ├── config_loader.py         YAML → typed dataclasses + env var overrides
@@ -100,7 +100,7 @@ That's it. The setup script handles Python, dependencies, everything. A pony app
 
 ### Requirements
 
-- Windows 10/11
+- Windows 10/11, **or** a Debian-based Linux (Ubuntu / Mint / Pop / Zorin) on **X11** (Wayland not supported)
 - **Python 3.10, 3.11, or 3.12** (3.11 recommended — [direct download](https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe))
   - **Python 3.13+ does NOT work** — PyQt5 and PyTorch don't have packages for it yet
   - The setup script will download Python 3.11 automatically if you don't have a compatible version
@@ -116,15 +116,30 @@ That's it. The setup script handles Python, dependencies, everything. A pony app
 
 ### Step 1: Install
 
-**Easiest way** — just double-click `retardsetup.bat`. It handles everything: downloads the right Python if you don't have it, creates a virtual environment, installs all dependencies, and launches the pony. You're done.
+**Windows — easiest way:** double-click `retardsetup.bat`. It handles everything: downloads the right Python if you don't have it, creates a virtual environment, installs all dependencies, and launches the pony. You're done.
 
-**Manual install** (if you prefer):
+**Linux — easiest way:** open a terminal in the project folder and run `bash retardsetup.sh`. It installs the system packages it needs (asks for your password once), creates a venv, installs the Python deps, and launches the pony. Re-running is safe.
+
+**Manual install — Windows:**
 
 ```bash
 git clone https://github.com/maresmaremares/bonziPONY.git
 cd bonziPONY
 python -m venv venv
 venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+**Manual install — Linux:**
+
+```bash
+sudo apt install python3-venv python3-dev portaudio19-dev libasound2-dev \
+    libxcb-cursor0 libxkbcommon-x11-0 libgl1 \
+    wmctrl xdotool xprintidle xclip xdg-utils tesseract-ocr ffmpeg git
+git clone https://github.com/maresmaremares/bonziPONY.git
+cd bonziPONY
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -460,7 +475,7 @@ opencv-python>=4.8   # Image processing
 mss>=9.0             # Screenshot capture
 pyautogui            # Desktop automation
 pygetwindow          # Window management
-pywin32>=306         # Win32 API
+pywin32>=306         # Win32 API (Windows)
 PyYAML>=6.0          # Config parsing
 numpy>=1.24          # Numerical ops
 openai-whisper       # Local STT
@@ -475,4 +490,12 @@ librosa              # Audio features
 
 ## Platform
 
-Windows only. Depends on `pywin32` for window manipulation, `win32gui` for idle time detection, and Win32 APIs for desktop control and screen monitoring.
+**Windows 10/11** is the primary target — uses `pywin32`, `win32gui`, and `winocr` directly via the Win32 API.
+
+**Linux (X11)** is also supported. Window management goes through `wmctrl` + `xdotool`, idle detection through `xprintidle` (with a `python-xlib` fallback), OCR through `tesseract`, and the clipboard through `pyperclip`. Tested on Linux Mint 22 / Cinnamon. Should work on Ubuntu, Pop!_OS, Zorin, Debian, and similar EWMH-compliant X11 desktops (GNOME-on-X11, KDE/Plasma-on-X11, XFCE, MATE).
+
+**Wayland is not supported.** Stay-on-top, global hotkeys, and tools like `wmctrl`/`xdotool` either don't work or work unreliably under Wayland. Log out and pick the X11/Xorg session at the login screen if you're on a Wayland-default distro.
+
+**macOS is not supported.** The cross-platform abstraction layer in `core/platform_compat.py` leaves room for a darwin backend, but no Mac-specific code paths exist yet.
+
+The platform dispatch lives in `core/platform_compat.py` — every Windows-specific call (window manipulation, idle detection, clipboard, OCR, file/URL launch, monitor enumeration) is wrapped behind a function that picks the right backend at runtime.

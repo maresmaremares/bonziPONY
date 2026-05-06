@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -33,9 +32,10 @@ def write_entry(text: str, open_in_notepad: bool = False) -> Path:
 
     if open_in_notepad:
         try:
-            subprocess.Popen(["notepad.exe", str(diary_file)])
+            from core.platform_compat import open_in_text_editor
+            open_in_text_editor(diary_file)
         except Exception as exc:
-            logger.warning("Failed to open diary in notepad: %s", exc)
+            logger.warning("Failed to open diary in editor: %s", exc)
 
     return diary_file
 

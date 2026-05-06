@@ -1,14 +1,19 @@
-"""Local screen monitoring via win32gui — zero API cost, runs every few seconds."""
+"""Local screen monitoring — zero API cost, polls every few seconds.
+
+Uses ``core.platform_compat`` so the same poll loop works on Windows
+(via win32gui) and Linux (via wmctrl/xdotool/python-xlib).
+"""
 
 from __future__ import annotations
 
-import ctypes
 import logging
-import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
+
+from core import platform_compat
+from core.platform_compat import WindowInfo as _CompatWindowInfo
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +23,7 @@ class WindowInfo:
     hwnd: int
     title: str
     class_name: str
-    exe_name: Optional[str] = None   # e.g. "chrome.exe", "Minecraft.exe"
+    exe_name: Optional[str] = None   # e.g. "chrome.exe", "firefox", "Minecraft.exe"
     is_fullscreen: bool = False       # taking up the whole monitor
 
 
@@ -34,11 +39,14 @@ class ScreenState:
 
 # ── Media app detection ──────────────────────────────────────────────────
 
+# Both Windows .exe names and Linux process names. Lowercased; ".exe" is
+# stripped before comparison so "vlc" matches "vlc.exe" on Windows.
 _MEDIA_EXES = {
-    "vlc.exe", "mpv.exe", "mpc-hc64.exe", "mpc-hc.exe", "mpc-be64.exe",
-    "potplayer.exe", "potplayer64.exe", "potplayermini64.exe",
-    "wmplayer.exe", "smplayer.exe", "plex.exe", "plexmediaplayer.exe",
-    "kodi.exe", "stremio.exe", "jellyfinmediaplayer.exe",
+    "vlc", "mpv", "mpc-hc64", "mpc-hc", "mpc-be64",
+    "potplayer", "potplayer64", "potplayermini64",
+    "wmplayer", "smplayer", "plex", "plexmediaplayer",
+    "kodi", "stremio", "jellyfinmediaplayer",
+    "totem", "celluloid", "parole", "rhythmbox",  # Linux media players
 }
 
 _MEDIA_TITLE_KEYWORDS = [
@@ -51,60 +59,31 @@ _MEDIA_TITLE_KEYWORDS = [
 
 def _is_media_app(exe_name: Optional[str], title: str) -> bool:
     """Check if a window is a media/video application."""
-    if exe_name and exe_name.lower() in _MEDIA_EXES:
-        return True
-    title_lower = title.lower()
+    if exe_name:
+        normalized = exe_name.lower()
+        if normalized.endswith(".exe"):
+            normalized = normalized[:-4]
+        if normalized in _MEDIA_EXES:
+            return True
+    title_lower = (title or "").lower()
     return any(kw in title_lower for kw in _MEDIA_TITLE_KEYWORDS)
 
 
-# ── Win32 helpers for getting process exe name ────────────────────────────
-
-def _get_exe_name(hwnd: int) -> Optional[str]:
-    """Get the executable name for a window handle using ctypes (no extra deps)."""
-    try:
-        # Get PID from hwnd
-        pid = ctypes.c_ulong()
-        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value == 0:
-            return None
-
-        # Open process with PROCESS_QUERY_LIMITED_INFORMATION (0x1000)
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid.value)
-        if not handle:
-            return None
-
-        try:
-            # QueryFullProcessImageNameW
-            buf = ctypes.create_unicode_buffer(512)
-            size = ctypes.c_ulong(512)
-            ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
-                handle, 0, buf, ctypes.byref(size)
-            )
-            if ok and buf.value:
-                return os.path.basename(buf.value)
-        finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
-    except Exception:
-        pass
-    return None
-
-
-def _is_fullscreen(hwnd: int) -> bool:
+def _is_window_fullscreen(hwnd: int) -> bool:
     """Check if window covers the full monitor it's on."""
     try:
-        import win32gui
-        from core.monitor_utils import get_monitor_screen_rect_for_hwnd
-        rect = win32gui.GetWindowRect(hwnd)
-        mon = get_monitor_screen_rect_for_hwnd(hwnd)
-        # Window covers the full monitor (or larger, for borderless)
-        return (rect[0] <= mon.left and rect[1] <= mon.top
-                and rect[2] >= mon.right and rect[3] >= mon.bottom)
+        rect = platform_compat.window_get_rect(hwnd)
+        if rect is None:
+            return False
+        mon = platform_compat.get_monitor_screen_rect_for_hwnd(hwnd)
+        return (rect.left <= mon.left and rect.top <= mon.top
+                and rect.right >= mon.right and rect.bottom >= mon.bottom)
     except Exception:
         return False
 
 
 class ScreenMonitor:
-    """Tracks open windows, foreground app, and changes using win32gui.
+    """Tracks open windows, foreground app, and changes.
 
     Runs on a daemon thread, polling every ``poll_interval`` seconds.
     Call ``get_state()`` from any thread to get a snapshot.
@@ -121,9 +100,6 @@ class ScreenMonitor:
 
         # Window tracking
         self._known_windows: Dict[int, str] = {}  # hwnd → title
-
-        # Exe name cache (PID lookups are slow, cache per hwnd)
-        self._exe_cache: Dict[int, Optional[str]] = {}
 
         # Change log
         self._changes: List[str] = []
@@ -172,7 +148,6 @@ class ScreenMonitor:
     def get_state(self) -> ScreenState:
         """Return a thread-safe snapshot of the current screen state."""
         with self._lock:
-            # Update foreground duration live
             now = time.monotonic()
             fg_dur = (now - self._fg_since) if self._fg_hwnd else 0.0
             return ScreenState(
@@ -194,62 +169,43 @@ class ScreenMonitor:
                 logger.debug("ScreenMonitor poll error: %s", exc)
             time.sleep(self._poll_interval)
 
-    def _get_cached_exe(self, hwnd: int) -> Optional[str]:
-        """Get exe name with caching."""
-        if hwnd not in self._exe_cache:
-            self._exe_cache[hwnd] = _get_exe_name(hwnd)
-        return self._exe_cache.get(hwnd)
+    @staticmethod
+    def _to_local(info: _CompatWindowInfo, fullscreen: bool) -> WindowInfo:
+        return WindowInfo(
+            hwnd=info.hwnd, title=info.title, class_name=info.class_name,
+            exe_name=info.exe_name, is_fullscreen=fullscreen,
+        )
 
     def _poll_once(self) -> None:
-        try:
-            import win32gui
-        except ImportError:
-            logger.debug("win32gui not available — screen monitor disabled.")
+        compat_windows = platform_compat.enumerate_windows(skip_hwnds=self._excluded_hwnds)
+        if not compat_windows and not platform_compat.IS_WINDOWS and not platform_compat.IS_LINUX:
+            # No backend available — disable monitor permanently
+            logger.debug("No window enumeration backend available; ScreenMonitor stopping.")
             self._running = False
             return
 
         now = time.monotonic()
-
-        # ── Enumerate visible windows ─────────────────────────────────────
-        current_windows: Dict[int, WindowInfo] = {}
-
-        def _enum_callback(hwnd: int, _extra) -> None:
-            if not win32gui.IsWindowVisible(hwnd):
-                return
-            if hwnd == self._pet_hwnd or hwnd in self._excluded_hwnds:
-                return
-            title = win32gui.GetWindowText(hwnd)
-            if not title or not title.strip():
-                return
-            try:
-                class_name = win32gui.GetClassName(hwnd)
-            except Exception:
-                class_name = ""
-
-            exe = self._get_cached_exe(hwnd)
-            fullscreen = _is_fullscreen(hwnd) if hwnd == self._fg_hwnd else False
-
-            current_windows[hwnd] = WindowInfo(
-                hwnd=hwnd, title=title, class_name=class_name,
-                exe_name=exe, is_fullscreen=fullscreen,
-            )
-
-        try:
-            win32gui.EnumWindows(_enum_callback, None)
-        except Exception as exc:
-            logger.debug("EnumWindows failed: %s", exc)
-            return
+        current_windows: Dict[int, WindowInfo] = {
+            info.hwnd: self._to_local(info, fullscreen=False)
+            for info in compat_windows
+        }
 
         # ── Detect foreground change ──────────────────────────────────────
-        try:
-            fg_hwnd = win32gui.GetForegroundWindow()
-        except Exception:
+        fg_compat = platform_compat.get_active_window()
+        fg_hwnd = fg_compat.hwnd if fg_compat else 0
+        if fg_hwnd in self._excluded_hwnds:
             fg_hwnd = 0
+            fg_compat = None
 
         fg_info = current_windows.get(fg_hwnd)
-        # Update fullscreen status for new foreground
+        if fg_info is None and fg_compat is not None:
+            # Foreground window may not appear in enumerate_windows (e.g. has no
+            # visible title) — synthesize an entry for it.
+            fg_info = self._to_local(fg_compat, fullscreen=False)
+            current_windows[fg_hwnd] = fg_info
+
         if fg_info:
-            fg_info.is_fullscreen = _is_fullscreen(fg_hwnd)
+            fg_info.is_fullscreen = _is_window_fullscreen(fg_hwnd)
 
         with self._lock:
             # Foreground switch detection
@@ -259,7 +215,9 @@ class ScreenMonitor:
                 new_exe = fg_info.exe_name if fg_info else None
                 elapsed = self.__fmt_duration(now - self._fg_since) if self._fg_hwnd else "just now"
                 exe_note = f" [{new_exe}]" if new_exe else ""
-                self._add_change(f"Switched from \"{old_title}\" to \"{new_title}\"{exe_note} (was active {elapsed})")
+                self._add_change(
+                    f'Switched from "{old_title}" to "{new_title}"{exe_note} (was active {elapsed})'
+                )
                 self._fg_hwnd = fg_hwnd
                 self._fg_since = now
 
@@ -267,14 +225,12 @@ class ScreenMonitor:
             for hwnd, info in current_windows.items():
                 if hwnd not in self._known_windows:
                     exe_note = f" [{info.exe_name}]" if info.exe_name else ""
-                    self._add_change(f"Window opened: \"{info.title}\"{exe_note}")
+                    self._add_change(f'Window opened: "{info.title}"{exe_note}')
 
             # Detect closed windows
             for hwnd, title in list(self._known_windows.items()):
                 if hwnd not in current_windows:
-                    self._add_change(f"Window closed: \"{title}\"")
-                    # Clean up exe cache
-                    self._exe_cache.pop(hwnd, None)
+                    self._add_change(f'Window closed: "{title}"')
 
             # Update known windows
             self._known_windows = {h: info.title for h, info in current_windows.items()}

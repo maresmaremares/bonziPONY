@@ -117,18 +117,12 @@ class PetWindow(QWidget):
         self._topmost_counter = 290  # fires on first tick cycle
 
     def _ensure_topmost(self) -> None:
-        """Use Win32 SetWindowPos to force HWND_TOPMOST."""
+        """Reinforce stay-on-top. On Windows uses HWND_TOPMOST via SetWindowPos
+        (Qt's WindowStaysOnTopHint loses against browsers). On Linux this is a
+        no-op — EWMH-compliant compositors honor the Qt hint."""
         try:
-            import ctypes
-            hwnd = int(self.winId())
-            SWP_NOMOVE = 0x0002
-            SWP_NOSIZE = 0x0001
-            SWP_NOACTIVATE = 0x0010
-            HWND_TOPMOST = -1
-            ctypes.windll.user32.SetWindowPos(
-                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            )
+            from core.platform_compat import ensure_window_topmost
+            ensure_window_topmost(int(self.winId()))
         except Exception:
             pass
 

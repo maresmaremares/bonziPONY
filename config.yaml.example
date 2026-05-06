@@ -83,7 +83,7 @@ watch_mode:
   capture_interval: 2.5                 # seconds between screen captures
   scene_change_threshold: 0.85          # CLIP similarity threshold for scene change detection
   clip_model: "openai/clip-vit-base-patch32"
-  ocr_engine: "winocr"                  # "winocr" (Windows built-in) or "pytesseract"
+  ocr_engine: "auto"                    # "auto" (winocr on Windows, pytesseract elsewhere), "winocr", or "pytesseract"
   subtitle_region_pct: 0.20             # bottom 20% of screen for subtitle OCR
   use_gpu: false                        # use CUDA for CLIP if available
 

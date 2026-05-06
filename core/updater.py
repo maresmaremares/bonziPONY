@@ -15,38 +15,10 @@ logger = logging.getLogger(__name__)
 REPO_URL = "https://github.com/maresmaremares/bonziPONY.git"
 REPO_API = "https://api.github.com/repos/maresmaremares/bonziPONY"
 
-# Cache resolved git path — venv on Windows often strips PATH
-_git_exe: Optional[str] = None
-
-
 def _find_git() -> Optional[str]:
     """Find the git executable, checking PATH and common Windows install locations."""
-    global _git_exe
-    if _git_exe:
-        return _git_exe
-
-    # Try PATH first
-    found = shutil.which("git")
-    if found:
-        _git_exe = found
-        return found
-
-    # Common Windows install locations
-    if sys.platform == "win32":
-        candidates = [
-            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "cmd", "git.exe"),
-            os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "cmd", "git.exe"),
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Git", "cmd", "git.exe"),
-            r"C:\Program Files\Git\cmd\git.exe",
-            r"C:\Program Files (x86)\Git\cmd\git.exe",
-        ]
-        for c in candidates:
-            if c and os.path.isfile(c):
-                _git_exe = c
-                logger.info("Found git at: %s", c)
-                return c
-
-    return None
+    from core.platform_compat import find_git_executable
+    return find_git_executable()
 
 
 def _git(*args: str, cwd: Optional[str] = None) -> Tuple[int, str]:

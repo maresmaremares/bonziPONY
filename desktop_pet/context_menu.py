@@ -1873,29 +1873,25 @@ class ContextMenuBuilder:
 
     @staticmethod
     def _open_presets_folder() -> None:
-        """Open the presets/ directory in Explorer."""
+        """Open the presets/ directory in the OS file manager."""
+        from core.platform_compat import open_path
         presets_dir = Path(__file__).parent.parent / "presets"
         presets_dir.mkdir(exist_ok=True)
-        try:
-            os.startfile(str(presets_dir))
-        except Exception as exc:
-            logger.warning("Failed to open presets folder: %s", exc)
+        if not open_path(presets_dir):
+            logger.warning("Failed to open presets folder: %s", presets_dir)
 
     # ── File openers ──────────────────────────────────────────────────────
 
     @staticmethod
     def _open_file(path: str) -> None:
+        from core.platform_compat import open_path, open_in_text_editor
         p = Path(path)
         if not p.exists():
             p.parent.mkdir(parents=True, exist_ok=True)
             p.touch()
-        try:
-            os.startfile(str(p))
-        except Exception:
-            try:
-                subprocess.Popen(["notepad", str(p)])
-            except Exception as exc:
-                logger.warning("Failed to open %s: %s", path, exc)
+        if not open_path(p):
+            if not open_in_text_editor(p):
+                logger.warning("Failed to open %s", path)
 
     # ── Restart ───────────────────────────────────────────────────────────
 

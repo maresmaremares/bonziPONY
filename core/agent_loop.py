@@ -7,7 +7,6 @@ something interesting happens or a directive needs attention.
 
 from __future__ import annotations
 
-import ctypes
 import json
 import logging
 import random
@@ -16,6 +15,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+from core.platform_compat import get_idle_ms as _get_idle_ms
 
 if TYPE_CHECKING:
     from core.config_loader import AgentConfig
@@ -61,32 +62,8 @@ def _sanitize_window_title(title: str) -> str:
     return title
 
 
-# ── Windows idle time detection (for enforcement mode) ────────────────────
-
-class _LASTINPUTINFO(ctypes.Structure):
-    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
-
-# Set proper return types for Windows API (defaults to c_int which overflows after ~24.8 days)
-try:
-    ctypes.windll.user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
-    ctypes.windll.user32.GetLastInputInfo.restype = ctypes.c_bool
-    ctypes.windll.kernel32.GetTickCount.restype = ctypes.c_uint
-except Exception:
-    pass
-
-
-def _get_idle_ms() -> int:
-    """Returns milliseconds since last user input (mouse/keyboard)."""
-    try:
-        lii = _LASTINPUTINFO()
-        lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
-        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
-            return 0
-        now = ctypes.windll.kernel32.GetTickCount()
-        # Handle tick count wrap-around (every ~49.7 days) with unsigned math
-        return (now - lii.dwTime) & 0xFFFFFFFF
-    except Exception:
-        return 0
+# Idle-time detection lives in core.platform_compat (imported above).
+# It returns milliseconds since last mouse/keyboard activity.
 
 # ── Spontaneous prompts — mix of casual remarks and genuine engagement ───
 _IDLE_PROMPTS = [
@@ -1455,23 +1432,27 @@ class AgentLoop:
         logger.info("ENFORCEMENT LOCKDOWN for %r", goal)
         print(f"[ENFORCEMENT LOCKDOWN] Locking computer until user goes to {goal}")
 
-        # At urgency 10 — permanent mouse lock (ClipCursor to a tiny box)
+        # At urgency 10 — permanent mouse lock (Windows ClipCursor to a tiny box).
+        # Linux has no direct equivalent; mess_with_mouse continues to harass.
         urgency_10 = any(d.urgency >= 10 and d.goal == goal for d in self.directives)
         cursor_locked = False
         if urgency_10 and self._desktop:
-            try:
-                import ctypes
-                import ctypes.wintypes
-                # Lock cursor to a 1x1 box at center of the pony's monitor
-                mon = self._desktop._get_monitor_rect()
-                cx = mon.left + mon.width // 2
-                cy = mon.top + mon.height // 2
-                rect = ctypes.wintypes.RECT(cx, cy, cx + 1, cy + 1)
-                ctypes.windll.user32.ClipCursor(ctypes.byref(rect))
-                cursor_locked = True
-                logger.info("Cursor LOCKED at (%d,%d) — urgency 10", cx, cy)
-            except Exception as exc:
-                logger.warning("ClipCursor failed: %s", exc)
+            from core import platform_compat
+            if platform_compat.IS_WINDOWS:
+                try:
+                    import ctypes
+                    import ctypes.wintypes
+                    mon = self._desktop._get_monitor_rect()
+                    cx = mon.left + mon.width // 2
+                    cy = mon.top + mon.height // 2
+                    rect = ctypes.wintypes.RECT(cx, cy, cx + 1, cy + 1)
+                    ctypes.windll.user32.ClipCursor(ctypes.byref(rect))
+                    cursor_locked = True
+                    logger.info("Cursor LOCKED at (%d,%d) — urgency 10", cx, cy)
+                except Exception as exc:
+                    logger.warning("ClipCursor failed: %s", exc)
+            else:
+                logger.info("Cursor lock skipped (not supported on this platform)")
 
         lockdown_round = 0
         try:
@@ -1578,6 +1559,7 @@ class AgentLoop:
             # ALWAYS release cursor lock when exiting lockdown
             if cursor_locked:
                 try:
+                    import ctypes  # Windows-only path: cursor_locked is True only there
                     ctypes.windll.user32.ClipCursor(None)
                     logger.info("Cursor lock released.")
                 except Exception:
@@ -1854,26 +1836,15 @@ class AgentLoop:
         if rule.catch_count >= 5 and self._desktop:
             # After 5+ catches: lock mouse briefly (tight loop = inescapable)
             try:
-                import ctypes
-                import ctypes.wintypes
+                from core.platform_compat import lock_cursor_to_point
                 mon = self._desktop._get_monitor_rect()
                 cx = mon.left + mon.width // 2
                 cy = mon.top + mon.height // 2
-                rect = ctypes.wintypes.RECT(cx, cy, cx + 1, cy + 1)
                 seconds = min(5.0 + rule.catch_count, 30.0)
                 self._log_action(f"Locked mouse {seconds:.0f}s (standing rule catch #{rule.catch_count})")
-                end_time = time.monotonic() + seconds
-                while time.monotonic() < end_time:
-                    ctypes.windll.user32.ClipCursor(ctypes.byref(rect))
-                    ctypes.windll.user32.SetCursorPos(cx, cy)
-                    time.sleep(0.05)
+                lock_cursor_to_point(cx, cy, seconds)
             except Exception:
                 pass
-            finally:
-                try:
-                    ctypes.windll.user32.ClipCursor(None)
-                except Exception:
-                    pass
 
         if rule.catch_count >= 7 and self._on_grab_cursor:
             # After 7+ catches: grab cursor and run with it
@@ -2438,24 +2409,14 @@ class AgentLoop:
                         if max_urg >= 8:
                             seconds = min(int(args[0]) if args else 10, 30)
                             try:
-                                import ctypes
-                                import ctypes.wintypes
+                                from core.platform_compat import lock_cursor_to_point
                                 mon = self._desktop._get_monitor_rect()
                                 cx = mon.left + mon.width // 2
                                 cy = mon.top + mon.height // 2
-                                rect = ctypes.wintypes.RECT(cx, cy, cx + 1, cy + 1)
                                 self._log_action(f"Locked mouse for {seconds}s")
-                                # Tight re-apply loop — makes lock inescapable
-                                end_time = time.monotonic() + seconds
-                                while time.monotonic() < end_time:
-                                    ctypes.windll.user32.ClipCursor(ctypes.byref(rect))
-                                    ctypes.windll.user32.SetCursorPos(cx, cy)
-                                    time.sleep(0.05)
-                            finally:
-                                try:
-                                    ctypes.windll.user32.ClipCursor(None)
-                                except Exception:
-                                    pass
+                                lock_cursor_to_point(cx, cy, seconds)
+                            except Exception as exc:
+                                logger.debug("LOCK_MOUSE failed: %s", exc)
                         else:
                             self._log_action("LOCK_MOUSE skipped — urgency too low")
                     elif command == "LOOK_AND_CLICK":
@@ -3257,8 +3218,7 @@ class AgentLoop:
             return
 
         import webbrowser
-        import win32gui
-        import win32con
+        from core import platform_compat
 
         # Speak the comment first
         if comment:
@@ -3274,27 +3234,28 @@ class AgentLoop:
         time.sleep(0.3)
 
         try:
-            fg_hwnd = win32gui.GetForegroundWindow()
+            fg = platform_compat.get_active_window()
+            fg_hwnd = fg.hwnd if fg else 0
             if not fg_hwnd:
                 return
 
             # If maximized, restore to windowed mode (can't drag maximized)
-            placement = win32gui.GetWindowPlacement(fg_hwnd)
-            if placement[1] == win32con.SW_SHOWMAXIMIZED:
-                win32gui.ShowWindow(fg_hwnd, win32con.SW_RESTORE)
+            if platform_compat.window_is_maximized(fg_hwnd):
+                platform_compat.window_restore(fg_hwnd)
                 time.sleep(0.3)
 
             # Get the window's current position
-            rect = win32gui.GetWindowRect(fg_hwnd)
-            win_x, win_y, win_right, win_bottom = rect
-            win_w = win_right - win_x
-            win_h = win_bottom - win_y
+            rect = platform_compat.window_get_rect(fg_hwnd)
+            if rect is None:
+                return
+            win_x, win_y = rect.left, rect.top
+            win_w, win_h = rect.width, rect.height
 
             # Resize the window to about half the screen width (so it's draggable)
             mon = self._desktop._get_monitor_rect()
             target_w = min(win_w, mon.width // 2)
             target_h = min(win_h, mon.height * 3 // 4)
-            win32gui.MoveWindow(fg_hwnd, win_x, win_y, target_w, target_h, True)
+            platform_compat.window_move(fg_hwnd, win_x, win_y, target_w, target_h)
             time.sleep(0.2)
 
             # Get the tab bar position (top of window, ~15px down for the tab bar)

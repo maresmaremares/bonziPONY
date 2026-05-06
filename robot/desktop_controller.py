@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import subprocess
+import sys
 import time
 import webbrowser
 from typing import TYPE_CHECKING
@@ -13,6 +15,7 @@ if TYPE_CHECKING:
     from core.config_loader import DesktopControlConfig
     from llm.response_parser import DesktopCommand
 
+from core import platform_compat
 from robot.actions import RobotAction
 
 logger = logging.getLogger(__name__)
@@ -104,105 +107,36 @@ class DesktopController:
             return MonitorRect(0, 0, w, h, w, h)
 
     def _get_foreground_hwnd(self) -> int:
-        """Return the HWND of the foreground window (Windows only)."""
-        try:
-            import win32gui
-            return win32gui.GetForegroundWindow()
-        except ImportError:
-            logger.warning("win32gui not available — window actions disabled.")
+        """Return the foreground window's identifier (HWND on Windows, X11 ID on Linux)."""
+        info = platform_compat.get_active_window()
+        if info is None:
             return 0
+        return int(info.hwnd)
 
     def _is_pet_window(self, hwnd: int) -> bool:
         """Check if the given HWND is the pet window itself."""
         return self._pet_hwnd != 0 and hwnd == self._pet_hwnd
 
-    # Cache of ancestor PIDs — computed once, never changes
-    _ancestor_pids: set | None = None
-
     @staticmethod
     def _get_ancestor_pids() -> set:
         """Get PIDs of all ancestor processes (parent, grandparent, etc.)."""
-        if DesktopController._ancestor_pids is not None:
-            return DesktopController._ancestor_pids
-        pids = {os.getpid()}
-        try:
-            import ctypes
-            import ctypes.wintypes
-
-            # Snapshot all processes to build parent chain
-            TH32CS_SNAPPROCESS = 0x00000002
-
-            class PROCESSENTRY32(ctypes.Structure):
-                _fields_ = [
-                    ("dwSize", ctypes.wintypes.DWORD),
-                    ("cntUsage", ctypes.wintypes.DWORD),
-                    ("th32ProcessID", ctypes.wintypes.DWORD),
-                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-                    ("th32ModuleID", ctypes.wintypes.DWORD),
-                    ("cntThreads", ctypes.wintypes.DWORD),
-                    ("th32ParentProcessID", ctypes.wintypes.DWORD),
-                    ("pcPriClassBase", ctypes.c_long),
-                    ("dwFlags", ctypes.wintypes.DWORD),
-                    ("szExeFile", ctypes.c_char * 260),
-                ]
-
-            kernel32 = ctypes.windll.kernel32
-            snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-            if snap == -1:
-                DesktopController._ancestor_pids = pids
-                return pids
-
-            # Build PID → parent PID map
-            pid_parent = {}
-            pe = PROCESSENTRY32()
-            pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
-            if kernel32.Process32First(snap, ctypes.byref(pe)):
-                while True:
-                    pid_parent[pe.th32ProcessID] = pe.th32ParentProcessID
-                    if not kernel32.Process32Next(snap, ctypes.byref(pe)):
-                        break
-            kernel32.CloseHandle(snap)
-
-            # Walk up the parent chain
-            current = os.getpid()
-            for _ in range(20):  # safety limit
-                parent = pid_parent.get(current)
-                if parent is None or parent == 0 or parent == current:
-                    break
-                pids.add(parent)
-                current = parent
-
-        except Exception as exc:
-            logger.debug("Failed to get ancestor PIDs: %s", exc)
-
-        DesktopController._ancestor_pids = pids
-        return pids
+        return platform_compat.get_ancestor_pids()
 
     @staticmethod
     def _is_own_console(hwnd: int) -> bool:
-        """Check if the window is the console or terminal hosting our process.
-
-        Checks:
-        1. GetConsoleWindow() — handles legacy conhost.exe
-        2. Window's owning process is in our ancestor PID chain — handles
-           Windows Terminal, cmd.exe, powershell.exe, VS Code terminal, etc.
-        """
-        try:
-            import ctypes
-            # Check 1: GetConsoleWindow (catches conhost.exe pseudo-console)
-            console_hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-            if console_hwnd and hwnd == console_hwnd:
-                return True
-
-            # Check 2: window's process is one of our ancestors
-            import ctypes.wintypes
-            pid = ctypes.wintypes.DWORD()
-            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if pid.value in DesktopController._get_ancestor_pids():
-                return True
-        except Exception:
-            pass
-        return False
+        """Check if the window is the console or terminal hosting our process."""
+        if not hwnd:
+            return False
+        # Windows-specific extra check: GetConsoleWindow catches legacy conhost.exe
+        if platform_compat.IS_WINDOWS:
+            try:
+                import ctypes
+                console_hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+                if console_hwnd and hwnd == console_hwnd:
+                    return True
+            except Exception:
+                pass
+        return platform_compat.is_own_console_window(int(hwnd))
 
     def _enforce_cooldown(self) -> None:
         """Wait if we're within cooldown period of last command."""
@@ -223,13 +157,6 @@ class DesktopController:
             logger.debug("DesktopController ignoring non-desktop action: %s", action)
 
     def _execute_window_action(self, action: RobotAction) -> None:
-        try:
-            import win32gui
-            import win32con
-        except ImportError:
-            logger.warning("pywin32 not installed — window actions unavailable.")
-            return
-
         self._enforce_cooldown()
         hwnd = self._get_foreground_hwnd()
         if hwnd == 0:
@@ -245,25 +172,25 @@ class DesktopController:
         try:
             if action == RobotAction.CLOSE_WINDOW:
                 logger.info("Closing window HWND=%d", hwnd)
-                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                platform_compat.window_close(hwnd)
 
             elif action == RobotAction.MINIMIZE_WINDOW:
                 logger.info("Minimizing window HWND=%d", hwnd)
-                win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+                platform_compat.window_minimize(hwnd)
 
             elif action == RobotAction.MAXIMIZE_WINDOW:
                 logger.info("Maximizing window HWND=%d", hwnd)
-                win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+                platform_compat.window_maximize(hwnd)
 
             elif action == RobotAction.SNAP_WINDOW_LEFT:
                 mon = self._get_monitor_rect(hwnd)
                 logger.info("Snapping window left HWND=%d", hwnd)
-                win32gui.MoveWindow(hwnd, mon.left, mon.top, mon.width // 2, mon.height, True)
+                platform_compat.window_move(hwnd, mon.left, mon.top, mon.width // 2, mon.height)
 
             elif action == RobotAction.SNAP_WINDOW_RIGHT:
                 mon = self._get_monitor_rect(hwnd)
                 logger.info("Snapping window right HWND=%d", hwnd)
-                win32gui.MoveWindow(hwnd, mon.left + mon.width // 2, mon.top, mon.width // 2, mon.height, True)
+                platform_compat.window_move(hwnd, mon.left + mon.width // 2, mon.top, mon.width // 2, mon.height)
 
             elif action == RobotAction.SHAKE:
                 logger.info("Shaking foreground window HWND=%d", hwnd)
@@ -291,22 +218,14 @@ class DesktopController:
 
     def _is_browser_hwnd(self, hwnd: int) -> bool:
         """Return True if *hwnd* belongs to a known browser process."""
-        try:
-            import win32process
-            import ctypes
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            h = ctypes.windll.kernel32.OpenProcess(0x0410, False, pid)
-            if h:
-                buf = ctypes.create_unicode_buffer(260)
-                size = ctypes.c_ulong(260)
-                ctypes.windll.kernel32.QueryFullProcessImageNameW(
-                    h, 0, buf, ctypes.byref(size))
-                ctypes.windll.kernel32.CloseHandle(h)
-                exe = buf.value.rsplit("\\", 1)[-1].lower()
-                return exe in self._BROWSER_EXE_NAMES
-        except Exception:
-            pass
-        return False
+        exe = platform_compat.window_get_exe(hwnd)
+        if not exe:
+            return False
+        normalized = exe.lower()
+        # Strip .exe (Windows) so the same set covers Linux process names too
+        if normalized.endswith(".exe"):
+            normalized = normalized[:-4]
+        return normalized in self._BROWSER_BASENAMES or exe.lower() in self._BROWSER_EXE_NAMES
 
     def close_tab_by_title(self, title_substring: str) -> bool:
         """Focus the window matching *title_substring* and send Ctrl+W to close
@@ -325,12 +244,9 @@ class DesktopController:
 
         if self._is_browser_hwnd(hwnd):
             try:
-                import win32gui
-                import win32con
-                if win32gui.IsIconic(hwnd):
-                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                win32gui.SetForegroundWindow(hwnd)
-                import time
+                if not platform_compat.window_focus(hwnd):
+                    logger.warning("close_tab: failed to focus HWND=%d", hwnd)
+                    return False
                 time.sleep(0.15)  # let the OS finish the focus switch
                 self._pyautogui.hotkey("ctrl", "w")
                 logger.info("Closed browser TAB matching %r (HWND=%d)", title_substring, hwnd)
@@ -355,11 +271,8 @@ class DesktopController:
             logger.info("Skipping close — matched window is our own console.")
             return False
         try:
-            import win32gui
-            import win32con
             logger.info("Closing window %r (HWND=%d)", title_substring, hwnd)
-            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-            return True
+            return platform_compat.window_close(hwnd)
         except Exception as exc:
             logger.warning("close_window_by_title failed: %s", exc)
             return False
@@ -377,91 +290,52 @@ class DesktopController:
             logger.info("Skipping minimize — matched window is our own console.")
             return False
         try:
-            import win32gui
-            import win32con
             logger.info("Minimizing window %r (HWND=%d)", title_substring, hwnd)
-            win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
-            return True
+            return platform_compat.window_minimize(hwnd)
         except Exception as exc:
             logger.warning("minimize_window_by_title failed: %s", exc)
             return False
 
     def minimize_all_windows(self) -> int:
         """Minimize every visible window except the pet. Returns count minimized."""
-        try:
-            import win32gui
-            import win32con
-        except ImportError:
-            return 0
-
+        skip = {self._pet_hwnd} if self._pet_hwnd else set()
         minimized = 0
-
-        def _callback(hwnd, _extra):
-            nonlocal minimized
-            if not win32gui.IsWindowVisible(hwnd):
-                return True
-            if self._is_pet_window(hwnd):
-                return True
-            if self._is_own_console(hwnd):
-                return True
-            title = win32gui.GetWindowText(hwnd)
-            if not title or not title.strip():
-                return True
+        for info in platform_compat.enumerate_windows(skip_hwnds=skip):
+            if not info.title or not info.title.strip():
+                continue
+            if self._is_own_console(info.hwnd):
+                continue
+            if platform_compat.window_is_minimized(info.hwnd):
+                continue
             try:
-                if not win32gui.IsIconic(hwnd):  # not already minimized
-                    win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+                if platform_compat.window_minimize(info.hwnd):
                     minimized += 1
             except Exception:
                 pass
-            return True
-
-        try:
-            win32gui.EnumWindows(_callback, None)
-        except Exception:
-            pass
-
         logger.info("Minimized %d windows.", minimized)
         return minimized
 
     def _is_prominent(self, hwnd: int) -> bool:
         """Check if a window is maximized or covers a significant portion of its monitor."""
         try:
-            import win32gui
-            if win32gui.IsZoomed(hwnd):
+            if platform_compat.window_is_maximized(hwnd):
                 return True
-            rect = win32gui.GetWindowRect(hwnd)
-            w = rect[2] - rect[0]
-            h = rect[3] - rect[1]
+            rect = platform_compat.window_get_rect(hwnd)
+            if rect is None:
+                return False
             mon = self._get_monitor_rect(hwnd)
+            w, h = rect.width, rect.height
             return w > 0 and h > 0 and (w * h) >= (mon.width * mon.height) * 0.4
         except Exception:
             return False
 
     def _find_window_by_title(self, title_substring: str) -> int | None:
         """Find the first visible window whose title contains the substring (case-insensitive)."""
-        try:
-            import win32gui
-        except ImportError:
-            return None
-
         target = title_substring.lower()
-        result = [None]
-
-        def _callback(hwnd: int, _extra) -> bool:
-            if not win32gui.IsWindowVisible(hwnd):
-                return True
-            title = win32gui.GetWindowText(hwnd)
-            if title and target in title.lower():
-                result[0] = hwnd
-                return False  # Stop enumeration
-            return True
-
-        try:
-            win32gui.EnumWindows(_callback, None)
-        except Exception:
-            pass  # EnumWindows raises when callback returns False — that's our "found" signal
-
-        return result[0]
+        for info in platform_compat.enumerate_windows():
+            if info.title and target in info.title.lower():
+                return int(info.hwnd)
+        return None
 
     # ── Parameterized commands ──────────────────────────────────────────────
 
@@ -500,12 +374,8 @@ class DesktopController:
             elif command in ("MINIMIZE", "MINIMIZE_WINDOW"):
                 hwnd = self._get_foreground_hwnd()
                 if hwnd and not self._is_pet_window(hwnd):
-                    try:
-                        import win32gui, win32con
-                        win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+                    if platform_compat.window_minimize(hwnd):
                         logger.info("Minimized foreground window.")
-                    except Exception as exc:
-                        logger.warning("Minimize failed: %s", exc)
             else:
                 logger.warning("Unknown desktop command: %s", command)
         except Exception as exc:
@@ -614,24 +484,12 @@ class DesktopController:
     def _paste_text(self, text: str) -> None:
         """Copy text to clipboard and Ctrl+V into the focused window."""
         try:
-            import win32clipboard
-            win32clipboard.OpenClipboard()
-            try:
-                win32clipboard.EmptyClipboard()
-                win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
-            finally:
-                win32clipboard.CloseClipboard()
-            time.sleep(0.05)
-            self._pyautogui.hotkey("ctrl", "v")
-        except ImportError:
-            # Fallback: use pyperclip or pyautogui.write
-            try:
-                import pyperclip
-                pyperclip.copy(text)
+            if platform_compat.clipboard_set(text):
+                time.sleep(0.05)
                 self._pyautogui.hotkey("ctrl", "v")
-            except ImportError:
-                # Last resort: slow character-by-character
-                self._pyautogui.write(text, interval=0.02)
+                return
+            # Last resort: slow character-by-character
+            self._pyautogui.write(text, interval=0.02)
         except Exception as exc:
             logger.warning("Paste failed: %s — falling back to write()", exc)
             self._pyautogui.write(text[:200], interval=0.02)
@@ -676,20 +534,18 @@ class DesktopController:
 
         # ── 2. Fallback: bare executable name (allowlist-gated) ──
         if app_lower in self._allowed_apps:
-            logger.info("Opening app (Popen fallback): %s", app_lower)
+            resolved = platform_compat.find_app_executable(app_lower) or app_lower
+            logger.info("Opening app (Popen fallback): %s", resolved)
             try:
-                subprocess.Popen([app_lower])
+                subprocess.Popen([resolved])
                 return
             except Exception as exc:
-                logger.warning("Popen fallback failed for %s: %s", app_lower, exc)
+                logger.warning("Popen fallback failed for %s: %s", resolved, exc)
 
-        # ── 3. Last resort: Windows Start Menu search via shell ──
-        try:
-            os.startfile(app_name)
-            logger.info("OPEN: os.startfile('%s') succeeded.", app_name)
+        # ── 3. Last resort: hand the name to the OS shell ──
+        if platform_compat.open_path(app_name):
+            logger.info("OPEN: open_path('%s') succeeded.", app_name)
             return
-        except OSError:
-            pass
 
         logger.warning("OPEN: could not find or launch '%s'.", app_name)
 
@@ -788,7 +644,7 @@ class DesktopController:
         self._pyautogui.scroll(amount)
 
     def _cmd_write_notepad(self, args: list[str]) -> None:
-        """Open a new Notepad window and paste text content into it."""
+        """Open a fresh text editor and paste text content into it."""
         if not self._config.type_enabled:
             logger.info("Type/write disabled by config.")
             return
@@ -806,56 +662,58 @@ class DesktopController:
 
         logger.info("WRITE_NOTEPAD: %d chars", len(text))
 
-        # 1. Launch notepad
-        try:
-            proc = subprocess.Popen(["notepad.exe"])
-        except Exception as exc:
-            logger.warning("Failed to launch notepad: %s", exc)
-            return
-
-        # 2. Wait for the Notepad window to appear and get focus
-        try:
-            import win32gui
-            import win32con
-
-            notepad_hwnd = 0
-            for _ in range(60):  # up to ~3 seconds
-                time.sleep(0.05)
-                fg = win32gui.GetForegroundWindow()
-                try:
-                    cls = win32gui.GetClassName(fg)
-                except Exception:
-                    cls = ""
-                if cls == "Notepad" or "notepad" in cls.lower():
-                    notepad_hwnd = fg
-                    break
-
-            if notepad_hwnd == 0:
-                logger.warning("WRITE_NOTEPAD: Notepad window not found after launch.")
+        # 1. Launch the platform's default text editor with no file (so it
+        # opens a new empty document we can paste into).
+        editor_name = "notepad"
+        if platform_compat.IS_WINDOWS:
+            try:
+                subprocess.Popen(["notepad.exe"])
+            except Exception as exc:
+                logger.warning("Failed to launch notepad: %s", exc)
+                return
+        else:
+            launched = False
+            for cmd in (["gnome-text-editor"], ["gedit"], ["kate"], ["mousepad"], ["xed"], ["pluma"]):
+                from shutil import which as _which
+                if _which(cmd[0]):
+                    try:
+                        subprocess.Popen(cmd)
+                        editor_name = cmd[0]
+                        launched = True
+                        break
+                    except Exception:
+                        continue
+            if not launched:
+                logger.warning("WRITE_NOTEPAD: no graphical text editor found on PATH.")
                 return
 
-            # Give it a moment to finish initializing
-            time.sleep(0.2)
+        # 2. Wait for the editor window to appear and get focus
+        editor_hwnd = 0
+        for _ in range(60):  # up to ~3 seconds
+            time.sleep(0.05)
+            fg = self._get_foreground_hwnd()
+            if not fg:
+                continue
+            cls = (platform_compat.window_get_class(fg) or "").lower()
+            exe = (platform_compat.window_get_exe(fg) or "").lower()
+            if editor_name in cls or editor_name in exe:
+                editor_hwnd = fg
+                break
 
-        except ImportError:
-            # No win32gui — just wait and hope
-            time.sleep(1.0)
+        if editor_hwnd == 0:
+            logger.warning("WRITE_NOTEPAD: editor window not found after launch.")
+            return
+
+        # Give it a moment to finish initializing
+        time.sleep(0.2)
 
         # 3. Paste via clipboard (handles newlines, unicode, and is fast)
         try:
-            import win32clipboard
-
-            win32clipboard.OpenClipboard()
-            try:
-                win32clipboard.EmptyClipboard()
-                win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
-            finally:
-                win32clipboard.CloseClipboard()
-
-            # Ctrl+V to paste
-            self._pyautogui.hotkey("ctrl", "v")
-            logger.info("WRITE_NOTEPAD: pasted %d chars into Notepad", len(text))
-
+            if platform_compat.clipboard_set(text):
+                self._pyautogui.hotkey("ctrl", "v")
+                logger.info("WRITE_NOTEPAD: pasted %d chars into %s", len(text), editor_name)
+            else:
+                logger.warning("WRITE_NOTEPAD clipboard set failed.")
         except Exception as exc:
             logger.warning("WRITE_NOTEPAD clipboard paste failed: %s", exc)
 
@@ -904,69 +762,29 @@ class DesktopController:
             logger.info("SWITCH: matched window is pet window, skipping.")
             return
         try:
-            import win32gui
-            import win32con
-            # Restore if minimized
-            if win32gui.IsIconic(hwnd):
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            win32gui.SetForegroundWindow(hwnd)
-            logger.info("SWITCH: brought %r to foreground (HWND=%d)", title, hwnd)
+            if platform_compat.window_focus(hwnd):
+                logger.info("SWITCH: brought %r to foreground (HWND=%d)", title, hwnd)
+            else:
+                logger.warning("SWITCH: focus failed for HWND=%d", hwnd)
         except Exception as exc:
             logger.warning("SWITCH failed: %s", exc)
 
     # ── Browser focus helpers (used by AFK mischief) ─────────────────────────
 
     _BROWSER_EXE_NAMES = {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "vivaldi.exe"}
+    _BROWSER_BASENAMES = {"chrome", "chromium", "google-chrome", "google-chrome-stable",
+                          "msedge", "edge", "firefox", "firefox-bin", "firefox-esr",
+                          "brave", "brave-browser", "opera", "vivaldi", "vivaldi-bin"}
 
     def focus_browser(self) -> bool:
-        """Find the topmost browser window and bring it to the foreground.
-
-        Returns True if a browser window was found and focused.
-        """
-        try:
-            import win32gui
-            import win32con
-            import win32process
-            import ctypes
-        except ImportError:
-            return False
-
-        found = [None]
-
-        def _callback(hwnd: int, _extra) -> bool:
-            if not win32gui.IsWindowVisible(hwnd):
-                return True
-            try:
-                _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                h = ctypes.windll.kernel32.OpenProcess(0x0410, False, pid)  # PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
-                if h:
-                    buf = ctypes.create_unicode_buffer(260)
-                    size = ctypes.c_ulong(260)
-                    ctypes.windll.kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
-                    ctypes.windll.kernel32.CloseHandle(h)
-                    exe = buf.value.rsplit("\\", 1)[-1].lower()
-                    if exe in self._BROWSER_EXE_NAMES:
-                        found[0] = hwnd
-                        return False
-            except Exception:
-                pass
-            return True
-
-        try:
-            win32gui.EnumWindows(_callback, None)
-        except Exception:
-            pass
-
-        if found[0]:
-            try:
-                hwnd = found[0]
-                if win32gui.IsIconic(hwnd):
-                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                win32gui.SetForegroundWindow(hwnd)
-                logger.debug("Focused browser window (HWND=%d)", hwnd)
-                return True
-            except Exception as exc:
-                logger.debug("Failed to focus browser: %s", exc)
+        """Find the topmost browser window and bring it to the foreground."""
+        for info in platform_compat.enumerate_windows():
+            exe = (info.exe_name or "").lower()
+            normalized = exe[:-4] if exe.endswith(".exe") else exe
+            if exe in self._BROWSER_EXE_NAMES or normalized in self._BROWSER_BASENAMES:
+                if platform_compat.window_focus(info.hwnd):
+                    logger.debug("Focused browser window (HWND=%d)", info.hwnd)
+                    return True
         return False
 
     def move_mouse_to_center(self) -> None:
@@ -994,50 +812,68 @@ class DesktopController:
     def _is_fullscreen_window(hwnd: int) -> bool:
         """Check if a window is fullscreen on its monitor."""
         try:
-            import win32gui
-            from core.monitor_utils import get_monitor_screen_rect_for_hwnd
-            rect = win32gui.GetWindowRect(hwnd)
-            mon = get_monitor_screen_rect_for_hwnd(hwnd)
-            return (rect[0] <= mon.left and rect[1] <= mon.top
-                    and rect[2] >= mon.right and rect[3] >= mon.bottom)
+            rect = platform_compat.window_get_rect(hwnd)
+            if rect is None:
+                return False
+            mon = platform_compat.get_monitor_screen_rect_for_hwnd(hwnd)
+            return (rect.left <= mon.left and rect.top <= mon.top
+                    and rect.right >= mon.right and rect.bottom >= mon.bottom)
         except Exception:
             return False
 
     def alt_tab(self) -> None:
-        """Send Win+D to minimize all windows and show the desktop."""
+        """Show the desktop (minimize all windows)."""
         self._enforce_cooldown()
-        try:
-            import ctypes
-            VK_LWIN = 0x5B
-            VK_D = 0x44
-            KEYEVENTF_KEYUP = 0x0002
-            user32 = ctypes.windll.user32
-            user32.keybd_event(VK_LWIN, 0, 0, 0)
-            user32.keybd_event(VK_D, 0, 0, 0)
-            user32.keybd_event(VK_D, 0, KEYEVENTF_KEYUP, 0)
-            user32.keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0)
-            logger.info("Win+D sent (show desktop / minimize all)")
-        except Exception as exc:
-            logger.warning("alt_tab (Win+D) failed: %s", exc)
+        if platform_compat.IS_WINDOWS:
+            try:
+                import ctypes
+                VK_LWIN = 0x5B
+                VK_D = 0x44
+                KEYEVENTF_KEYUP = 0x0002
+                user32 = ctypes.windll.user32
+                user32.keybd_event(VK_LWIN, 0, 0, 0)
+                user32.keybd_event(VK_D, 0, 0, 0)
+                user32.keybd_event(VK_D, 0, KEYEVENTF_KEYUP, 0)
+                user32.keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0)
+                logger.info("Win+D sent (show desktop / minimize all)")
+            except Exception as exc:
+                logger.warning("alt_tab (Win+D) failed: %s", exc)
+            return
+        # Linux: wmctrl -k on toggles "show desktop"
+        from shutil import which as _which
+        wmctrl = _which("wmctrl")
+        if wmctrl:
+            try:
+                subprocess.run([wmctrl, "-k", "on"], check=False, timeout=2.0)
+                logger.info("wmctrl -k on (show desktop)")
+                return
+            except Exception as exc:
+                logger.warning("alt_tab (wmctrl) failed: %s", exc)
+        # Last-resort fallback: minimize every window via the abstraction
+        self.minimize_all_windows()
 
     def system_beep(self, frequency: int = 1000, duration_ms: int = 500) -> None:
         """Play an annoying system beep."""
+        if platform_compat.IS_WINDOWS:
+            try:
+                import winsound  # type: ignore
+                frequency = max(37, min(frequency, 32767))
+                duration_ms = max(50, min(duration_ms, 3000))
+                logger.info("System beep: %dHz for %dms", frequency, duration_ms)
+                winsound.Beep(frequency, duration_ms)
+            except Exception as exc:
+                logger.warning("system_beep failed: %s", exc)
+            return
+        # Linux: terminal bell through stderr (relies on user's terminal config)
         try:
-            import winsound
-            frequency = max(37, min(frequency, 32767))
-            duration_ms = max(50, min(duration_ms, 3000))
-            logger.info("System beep: %dHz for %dms", frequency, duration_ms)
-            winsound.Beep(frequency, duration_ms)
+            sys.stderr.write("\a")
+            sys.stderr.flush()
+            logger.info("System beep (\\a) emitted")
         except Exception as exc:
             logger.warning("system_beep failed: %s", exc)
 
     def shake_window(self, hwnd: int = 0, duration: float = 5.0, intensity: int = 15) -> None:
         """Rapidly vibrate a window to get the user's attention — like an alarm clock."""
-        try:
-            import win32gui
-        except ImportError:
-            return
-
         if hwnd == 0:
             hwnd = self._get_foreground_hwnd()
         if hwnd == 0 or self._is_pet_window(hwnd) or self._is_own_console(hwnd):
@@ -1047,69 +883,54 @@ class DesktopController:
             return
 
         try:
-            import win32gui
-            rect = win32gui.GetWindowRect(hwnd)
-            orig_x, orig_y = rect[0], rect[1]
-            width = rect[2] - rect[0]
-            height = rect[3] - rect[1]
+            rect = platform_compat.window_get_rect(hwnd)
+            if rect is None:
+                return
+            orig_x, orig_y = rect.left, rect.top
+            width, height = rect.width, rect.height
 
             import random as _rand
             end_time = time.monotonic() + duration
             while time.monotonic() < end_time:
                 dx = _rand.randint(-intensity, intensity)
                 dy = _rand.randint(-intensity, intensity)
-                win32gui.MoveWindow(hwnd, orig_x + dx, orig_y + dy, width, height, True)
+                platform_compat.window_move(hwnd, orig_x + dx, orig_y + dy, width, height)
                 time.sleep(0.03)
 
             # Restore original position
-            win32gui.MoveWindow(hwnd, orig_x, orig_y, width, height, True)
+            platform_compat.window_move(hwnd, orig_x, orig_y, width, height)
             logger.info("Shook window HWND=%d for %.1fs", hwnd, duration)
         except Exception as exc:
             logger.warning("shake_window failed: %s", exc)
 
     def shake_all_windows(self, duration: float = 8.0, intensity: int = 12) -> None:
         """Shake visible windows — earthquake mode for high urgency."""
-        try:
-            import win32gui
-        except ImportError:
-            return
-
-        hwnds_and_rects = []
+        skip = {self._pet_hwnd} if self._pet_hwnd else set()
         fg_hwnd = self._get_foreground_hwnd()
+        hwnds_and_rects: list[tuple[int, "platform_compat.Rect"]] = []
 
-        def _callback(hwnd, _extra):
-            if not win32gui.IsWindowVisible(hwnd):
-                return True
-            if self._is_pet_window(hwnd):
-                return True
-            if self._is_own_console(hwnd):
-                return True
-            title = win32gui.GetWindowText(hwnd)
-            if not title or not title.strip():
-                return True
-            try:
-                if self._is_fullscreen_window(hwnd):
-                    return True  # skip fullscreen windows
-                rect = win32gui.GetWindowRect(hwnd)
-                # Always include the foreground window
-                if hwnd == fg_hwnd:
-                    hwnds_and_rects.append((hwnd, rect))
-                elif win32gui.IsZoomed(hwnd):
-                    hwnds_and_rects.append((hwnd, rect))
-                else:
-                    w = rect[2] - rect[0]
-                    h = rect[3] - rect[1]
-                    mon = self._get_monitor_rect(hwnd)
-                    if w > 0 and h > 0 and (w * h) >= (mon.width * mon.height) * 0.15:
-                        hwnds_and_rects.append((hwnd, rect))
-            except Exception:
-                pass
-            return True
-
-        try:
-            win32gui.EnumWindows(_callback, None)
-        except Exception:
-            pass
+        for info in platform_compat.enumerate_windows(skip_hwnds=skip):
+            if not info.title or not info.title.strip():
+                continue
+            if self._is_own_console(info.hwnd):
+                continue
+            if self._is_fullscreen_window(info.hwnd):
+                continue
+            rect = platform_compat.window_get_rect(info.hwnd)
+            if rect is None:
+                continue
+            include = False
+            if info.hwnd == fg_hwnd:
+                include = True
+            elif platform_compat.window_is_maximized(info.hwnd):
+                include = True
+            else:
+                w, h = rect.width, rect.height
+                mon = self._get_monitor_rect(info.hwnd)
+                if w > 0 and h > 0 and (w * h) >= (mon.width * mon.height) * 0.15:
+                    include = True
+            if include:
+                hwnds_and_rects.append((info.hwnd, rect))
 
         if not hwnds_and_rects:
             return
@@ -1122,9 +943,9 @@ class DesktopController:
                 dy = _rand.randint(-intensity, intensity)
                 for hwnd, rect in hwnds_and_rects:
                     try:
-                        w = rect[2] - rect[0]
-                        h = rect[3] - rect[1]
-                        win32gui.MoveWindow(hwnd, rect[0] + dx, rect[1] + dy, w, h, True)
+                        platform_compat.window_move(
+                            hwnd, rect.left + dx, rect.top + dy, rect.width, rect.height,
+                        )
                     except Exception:
                         pass
                 time.sleep(0.03)
@@ -1132,9 +953,7 @@ class DesktopController:
             # Restore all
             for hwnd, rect in hwnds_and_rects:
                 try:
-                    w = rect[2] - rect[0]
-                    h = rect[3] - rect[1]
-                    win32gui.MoveWindow(hwnd, rect[0], rect[1], w, h, True)
+                    platform_compat.window_move(hwnd, rect.left, rect.top, rect.width, rect.height)
                 except Exception:
                     pass
             logger.info("Shook %d windows for %.1fs", len(hwnds_and_rects), duration)
@@ -1181,40 +1000,50 @@ class DesktopController:
     _installed_apps: list = []  # cached list of (name, launch_path, source, app_id)
 
     def scan_installed_apps(self) -> list:
-        """Scan Steam library, Desktop, and Start Menu for installed apps.
-        Returns list of (name, launch_path, source, app_id) tuples.
+        """Scan installed apps/games. Returns list of (name, launch_path, source, app_id) tuples.
         Thread-safe — stores result in _installed_apps."""
-        apps = []
+        apps: list = []
 
-        # ── Steam games ──────────────────────────────────────────────
-        try:
-            apps.extend(self._scan_steam())
-        except Exception as exc:
-            logger.debug("Steam scan failed: %s", exc)
+        if platform_compat.IS_WINDOWS:
+            # ── Steam games ──────────────────────────────────────────────
+            try:
+                apps.extend(self._scan_steam())
+            except Exception as exc:
+                logger.debug("Steam scan failed: %s", exc)
 
-        # ── Desktop shortcuts ────────────────────────────────────────
-        try:
-            desktop = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
-            apps.extend(self._scan_shortcuts(desktop, "desktop"))
-        except Exception as exc:
-            logger.debug("Desktop shortcut scan failed: %s", exc)
+            # ── Desktop shortcuts ────────────────────────────────────────
+            try:
+                desktop = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+                apps.extend(self._scan_shortcuts(desktop, "desktop"))
+            except Exception as exc:
+                logger.debug("Desktop shortcut scan failed: %s", exc)
 
-        # ── Start Menu shortcuts ─────────────────────────────────────
-        try:
-            # User start menu
-            user_start = os.path.join(
-                os.environ.get("APPDATA", ""),
-                "Microsoft", "Windows", "Start Menu", "Programs",
-            )
-            apps.extend(self._scan_shortcuts(user_start, "start_menu"))
-            # All-users start menu
-            all_start = os.path.join(
-                os.environ.get("PROGRAMDATA", r"C:\ProgramData"),
-                "Microsoft", "Windows", "Start Menu", "Programs",
-            )
-            apps.extend(self._scan_shortcuts(all_start, "start_menu"))
-        except Exception as exc:
-            logger.debug("Start Menu scan failed: %s", exc)
+            # ── Start Menu shortcuts ─────────────────────────────────────
+            try:
+                user_start = os.path.join(
+                    os.environ.get("APPDATA", ""),
+                    "Microsoft", "Windows", "Start Menu", "Programs",
+                )
+                apps.extend(self._scan_shortcuts(user_start, "start_menu"))
+                all_start = os.path.join(
+                    os.environ.get("PROGRAMDATA", r"C:\ProgramData"),
+                    "Microsoft", "Windows", "Start Menu", "Programs",
+                )
+                apps.extend(self._scan_shortcuts(all_start, "start_menu"))
+            except Exception as exc:
+                logger.debug("Start Menu scan failed: %s", exc)
+        else:
+            # ── Linux: .desktop files in standard XDG locations ──────────
+            try:
+                for app in platform_compat.enumerate_installed_apps():
+                    apps.append((app.name, app.exec_cmd, "desktop_file", ""))
+            except Exception as exc:
+                logger.debug("Linux app scan failed: %s", exc)
+            # Steam games on Linux: same VDF format under ~/.steam/ or ~/.local/share/Steam/
+            try:
+                apps.extend(self._scan_steam_linux())
+            except Exception as exc:
+                logger.debug("Steam (Linux) scan failed: %s", exc)
 
         # Deduplicate by name (case-insensitive)
         seen = set()
@@ -1229,6 +1058,57 @@ class DesktopController:
         logger.info("Scanned %d installed apps/games.", len(unique))
         print(f"[Apps] Found {len(unique)} installed apps/games.", flush=True)
         return unique
+
+    @staticmethod
+    def _scan_steam_linux() -> list:
+        """Parse Steam library on Linux (~/.steam/steam, ~/.local/share/Steam)."""
+        import re as _re
+        from pathlib import Path as _Path
+        results = []
+        candidates = [
+            _Path.home() / ".steam" / "steam",
+            _Path.home() / ".local" / "share" / "Steam",
+            _Path.home() / ".var" / "app" / "com.valvesoftware.Steam" / "data" / "Steam",
+        ]
+        steam_root = next((p for p in candidates if p.is_dir()), None)
+        if steam_root is None:
+            return results
+
+        vdf_path = steam_root / "steamapps" / "libraryfolders.vdf"
+        lib_paths = [steam_root / "steamapps"]
+        if vdf_path.is_file():
+            try:
+                content = vdf_path.read_text(encoding="utf-8", errors="replace")
+                for match in _re.finditer(r'"path"\s+"([^"]+)"', content):
+                    p = _Path(match.group(1)) / "steamapps"
+                    if p.is_dir() and p not in lib_paths:
+                        lib_paths.append(p)
+            except Exception:
+                pass
+
+        for lib in lib_paths:
+            try:
+                for fname in os.listdir(lib):
+                    if not fname.startswith("appmanifest_") or not fname.endswith(".acf"):
+                        continue
+                    try:
+                        acf = (lib / fname).read_text(encoding="utf-8", errors="replace")
+                        name_m = _re.search(r'"name"\s+"([^"]+)"', acf)
+                        appid_m = _re.search(r'"appid"\s+"(\d+)"', acf)
+                        if name_m and appid_m:
+                            name = name_m.group(1)
+                            appid = appid_m.group(1)
+                            if any(kw in name.lower() for kw in (
+                                "redistribut", "directx", "vcredist", "proton",
+                                "steamworks", "steam linux", "compatibility",
+                            )):
+                                continue
+                            results.append((name, f"steam://rungameid/{appid}", "steam", appid))
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return results
 
     @staticmethod
     def _scan_steam() -> list:
@@ -1319,7 +1199,7 @@ class DesktopController:
                     results.append((name, os.path.join(root, fname), source, ""))
         return results
 
-    # File extensions that os.startfile is allowed to open.
+    # File extensions that os.startfile is allowed to open on Windows.
     # Blocks scripts (.bat, .cmd, .vbs, .ps1, .wsf, .js) that could execute
     # arbitrary code if a malicious shortcut is placed on the Desktop.
     _SAFE_LAUNCH_EXTS = frozenset({".exe", ".lnk", ".url", ".appref-ms"})
@@ -1337,13 +1217,21 @@ class DesktopController:
                 try:
                     if path.startswith("steam://"):
                         webbrowser.open(path)
-                    else:
-                        # Only allow safe file types — block scripts (.bat, .cmd, .vbs, .ps1)
-                        ext = os.path.splitext(path)[1].lower()
-                        if ext not in self._SAFE_LAUNCH_EXTS:
-                            logger.warning("Blocked unsafe file type for launch_app: %s (%s)", path, ext)
-                            return (False, app_name)
-                        os.startfile(path)
+                        logger.info("Launched app: %s (%s)", app_name, source)
+                        return (True, app_name)
+                    if source == "desktop_file":
+                        # Linux .desktop Exec= command — split into argv
+                        argv = shlex.split(path) if path else [app_name]
+                        subprocess.Popen(argv)
+                        logger.info("Launched app: %s (%s)", app_name, source)
+                        return (True, app_name)
+                    # Windows path — restrict to safe extensions
+                    ext = os.path.splitext(path)[1].lower()
+                    if ext not in self._SAFE_LAUNCH_EXTS:
+                        logger.warning("Blocked unsafe file type for launch_app: %s (%s)", path, ext)
+                        return (False, app_name)
+                    if not platform_compat.open_path(path):
+                        return (False, app_name)
                     logger.info("Launched app: %s (%s)", app_name, source)
                     return (True, app_name)
                 except Exception as exc:

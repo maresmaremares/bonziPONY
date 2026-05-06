@@ -10,11 +10,26 @@ from __future__ import annotations
 import collections
 import difflib
 import logging
+import sys
 import threading
 import time
 from typing import Deque, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_ocr_engine(name: str) -> str:
+    """Resolve an OCR engine name. 'auto' picks the best for the current platform.
+
+    'winocr' is Windows-only and silently falls through to 'pytesseract' on Linux/macOS
+    (logged once so the user knows their config setting was overridden)."""
+    requested = (name or "auto").lower().strip()
+    if requested == "auto":
+        return "winocr" if sys.platform == "win32" else "pytesseract"
+    if requested == "winocr" and sys.platform != "win32":
+        logger.info("OCR engine 'winocr' is Windows-only; using 'pytesseract' instead.")
+        return "pytesseract"
+    return requested
 
 # Scene classification prompts for CLIP zero-shot
 _SCENE_PROMPTS = [
@@ -48,7 +63,7 @@ class WatchMode:
         capture_interval: float = 2.5,
         scene_change_threshold: float = 0.85,
         clip_model_name: str = "openai/clip-vit-base-patch32",
-        ocr_engine: str = "winocr",
+        ocr_engine: str = "auto",
         subtitle_region_pct: float = 0.20,
         use_gpu: bool = False,
     ) -> None:
@@ -56,9 +71,10 @@ class WatchMode:
         self._capture_interval = capture_interval
         self._scene_threshold = scene_change_threshold
         self._clip_model_name = clip_model_name
-        self._ocr_engine = ocr_engine
+        self._ocr_engine = _resolve_ocr_engine(ocr_engine)
         self._subtitle_pct = subtitle_region_pct
         self._use_gpu = use_gpu
+        logger.info("WatchMode OCR engine: %s", self._ocr_engine)
 
         self.enabled = False
         self._running = False
@@ -279,15 +295,31 @@ class WatchMode:
             return None
 
     def _ocr_winocr(self, img) -> Optional[str]:
-        """OCR via Windows built-in OCR (winocr package)."""
-        import asyncio
-        from winocr import recognize_pil
+        """OCR via Windows built-in OCR (winocr package). Windows-only."""
+        try:
+            import asyncio
+            from winocr import recognize_pil  # type: ignore
+        except ImportError:
+            logger.warning("winocr not available — OCR disabled for this frame.")
+            self._ocr_engine = "pytesseract"  # don't keep retrying
+            return None
         result = asyncio.run(recognize_pil(img, lang="en"))
         text = result.text.strip() if result and result.text else ""
         return text if len(text) > 3 else None  # ignore tiny noise
 
     def _ocr_tesseract(self, img) -> Optional[str]:
-        """OCR via pytesseract."""
-        import pytesseract
-        text = pytesseract.image_to_string(img, config="--psm 6").strip()
+        """OCR via pytesseract (needs the `tesseract` binary on PATH)."""
+        try:
+            import pytesseract  # type: ignore
+        except ImportError:
+            logger.warning("pytesseract not installed — OCR disabled for this frame.")
+            return None
+        try:
+            text = pytesseract.image_to_string(img, config="--psm 6").strip()
+        except pytesseract.TesseractNotFoundError:
+            logger.warning("tesseract binary not found on PATH; install 'tesseract-ocr' to enable OCR.")
+            return None
+        except Exception as exc:
+            logger.debug("pytesseract failed: %s", exc)
+            return None
         return text if len(text) > 3 else None

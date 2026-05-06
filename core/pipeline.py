@@ -604,7 +604,7 @@ class Pipeline:
             # Audio context — tell LLM whether this is the user or ambient audio
             user_text = self._build_audio_context(user_text)
 
-            # ALWAYS inject win32gui screen context (free)
+            # ALWAYS inject local screen context (free)
             user_text = self._inject_screen_state(user_text)
 
             user_text = self._maybe_inject_vision(user_text)
@@ -1067,7 +1067,7 @@ class Pipeline:
         return False
 
     def _inject_screen_state(self, user_text: str) -> str:
-        """Always inject win32gui window state — zero API cost."""
+        """Always inject local window state — zero API cost."""
         if self.screen_monitor is None:
             return user_text
         try:

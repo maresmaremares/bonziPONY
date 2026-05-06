@@ -132,7 +132,7 @@ class WatchModeConfig:
     capture_interval: float = 2.5
     scene_change_threshold: float = 0.85
     clip_model: str = "openai/clip-vit-base-patch32"
-    ocr_engine: str = "winocr"
+    ocr_engine: str = "auto"
     subtitle_region_pct: float = 0.20
     use_gpu: bool = False
 
@@ -355,7 +355,7 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
             capture_interval=wm_raw.get("capture_interval", 2.5),
             scene_change_threshold=wm_raw.get("scene_change_threshold", 0.85),
             clip_model=wm_raw.get("clip_model", "openai/clip-vit-base-patch32"),
-            ocr_engine=wm_raw.get("ocr_engine", "winocr"),
+            ocr_engine=wm_raw.get("ocr_engine", "auto"),
             subtitle_region_pct=wm_raw.get("subtitle_region_pct", 0.20),
             use_gpu=wm_raw.get("use_gpu", False),
         ),

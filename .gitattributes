@@ -1,0 +1,36 @@
+# Default: auto-detect text vs binary, normalize to LF in the repo
+* text=auto eol=lf
+
+# Source / config — always LF, even on Windows checkouts
+*.py        text eol=lf
+*.sh        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.md        text eol=lf
+*.ini       text eol=lf
+*.txt       text eol=lf
+*.json      text eol=lf
+*.toml      text eol=lf
+*.cfg       text eol=lf
+
+# Windows scripts — keep CRLF so cmd.exe doesn't choke
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# Binary assets — never normalize
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.wav       binary
+*.mp3       binary
+*.ogg       binary
+*.mp4       binary
+*.zip       binary
+*.exe       binary
+*.dll       binary
+*.pt        binary
+*.bin       binary
+*.safetensors binary
